@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+.venv
+.ruff_cache/
+.mypy_cache
+.coverage
+.pytest_cache
+
+# Environment
+.env
+
+# Claude Code (user-specific)
+.claude/settings.local.json
+
+# OS
+.DS_Store

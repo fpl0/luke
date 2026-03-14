@@ -1,0 +1,79 @@
+[project]
+name = "luke"
+version = "1.0.0"
+description = "A personal assistant that remembers everything, automates anything, and gets smarter over time"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "claude-agent-sdk>=0.1",
+    "aiogram>=3.0",
+    "pydantic-settings>=2.0",
+    "structlog>=24.0",
+    "croniter>=2.0",
+    "pyyaml>=6.0",
+    "Pillow>=10.0",
+    "sqlite-vec>=0.1.6",
+    "fastembed>=0.4",
+    "mlx-whisper>=0.4",
+]
+
+[project.scripts]
+luke = "luke.app:cli"
+
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/luke"]
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.mypy]
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = ["claude_agent_sdk.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["fastembed.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["sqlite_vec.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["mlx_whisper.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["PIL.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+filterwarnings = ["ignore::ResourceWarning"]
+
+[dependency-groups]
+dev = [
+    "mypy>=1.19.1",
+    "ruff>=0.15.6",
+    "types-croniter>=6.0.0.20250809",
+    "types-pyyaml>=6.0.12.20250915",
+]
+test = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "pytest-cov>=6.0",
+]

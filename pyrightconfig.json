@@ -1,0 +1,10 @@
+{
+  "include": ["src", "tests"],
+  "typeCheckingMode": "strict",
+  "reportMissingImports": false,
+  "reportUnknownVariableType": false,
+  "reportUnknownMemberType": false,
+  "reportUnknownArgumentType": false,
+  "reportPrivateUsage": false,
+  "reportMissingTypeStubs": false
+}

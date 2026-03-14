@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(uv run:*)",
+      "Bash(uv add:*)",
+      "Bash(uv sync:*)",
+      "Bash(cat luke.log*)",
+      "Bash(cat luke.err*)",
+      "Bash(tail:*)",
+      "Bash(launchctl:*)",
+      "Bash(mkdir:*)"
+    ]
+  }
+}
