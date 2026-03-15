@@ -411,8 +411,8 @@ class TestProcess:
 
         # Cursor should NOT be advanced
         mock_db.advance_cursor.assert_not_called()
-        # Session should NOT be cleared
-        mock_db.set_session.assert_not_called()
+        # Session IS cleared on every failure (stale session cleanup)
+        mock_db.set_session.assert_called_once_with(chat_id, "")
         # Retry count should be 1
         assert app_mod._retry_counts.get(chat_id) == 1
 
@@ -461,8 +461,8 @@ class TestProcess:
 
         # NOW cursor should advance
         mock_db.advance_cursor.assert_called_once_with(chat_id, 20)
-        # Session should be cleared
-        mock_db.set_session.assert_called_once_with(chat_id, "")
+        # Session cleared twice: once unconditionally, once at max_retries
+        assert mock_db.set_session.call_count == 2
         # Retry count should be cleared
         assert chat_id not in app_mod._retry_counts
 
@@ -625,38 +625,43 @@ class TestSalienceGate:
 
 class TestAcquireLock:
     def test_acquires_lock(self, tmp_settings: Any) -> None:
+        import os
+
         import luke.app as app
 
         tmp_settings.store_dir.mkdir(parents=True, exist_ok=True)
-        old = app._lock_file
+        old = app._lock_fd
         try:
-            app._lock_file = None
+            app._lock_fd = None
             app._acquire_lock()
-            assert app._lock_file is not None
+            assert app._lock_fd is not None
             lock_path = tmp_settings.store_dir / "luke.lock"
             assert lock_path.exists()
         finally:
-            if app._lock_file is not None:
-                app._lock_file.close()
-            app._lock_file = old
+            if app._lock_fd is not None:
+                os.close(app._lock_fd)
+            app._lock_fd = old
 
     def test_second_instance_blocked(self, tmp_settings: Any) -> None:
+        import os
+
         import luke.app as app
 
         tmp_settings.store_dir.mkdir(parents=True, exist_ok=True)
         lock_path = tmp_settings.store_dir / "luke.lock"
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Hold the lock from outside
-        held = lock_path.open("w")
-        fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        # Hold the lock from outside using os.open (matching _acquire_lock)
+        held_fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT)
+        fcntl.flock(held_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
-        old = app._lock_file
+        old = app._lock_fd
         try:
-            app._lock_file = None
+            app._lock_fd = None
             with pytest.raises(SystemExit) as exc_info:
                 app._acquire_lock()
             assert exc_info.value.code == 1
         finally:
-            held.close()
-            app._lock_file = old
+            os.close(held_fd)
+            if app._lock_fd is not None:
+                os.close(app._lock_fd)
+            app._lock_fd = old

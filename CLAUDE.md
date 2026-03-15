@@ -58,10 +58,10 @@ Run commands directly — don't tell the user to run them.
 
 ```bash
 uv run luke              # Run directly
-uv run ruff check src/   # Lint
-uv run ruff format src/  # Format
-uv run mypy --strict src/luke/  # Type check (strict)
-uv run pyright src/      # Pylance/Pyright check (strict)
+uv run ruff check src/ tests/   # Lint
+uv run ruff format src/ tests/  # Format
+uv run mypy --strict src/luke/ tests/  # Type check (strict)
+uv run pyright src/ tests/  # Pylance/Pyright check (strict)
 uv run pytest            # Test
 ```
 
@@ -79,9 +79,9 @@ tail -f ~/.luke/luke.err
 
 ## Type Safety
 
-- **mypy strict** — all 9 files pass `mypy --strict` with zero errors
-- **Pyright strict** — all files pass `pyright src/` with zero errors (Pylance in VS Code)
-- **Always run both** — `uv run mypy --strict src/luke/ && uv run pyright src/`
+- **mypy strict** — all source and test files pass `mypy --strict` with zero errors
+- **Pyright strict** — all source and test files pass with zero errors (Pylance in VS Code)
+- **Always run both** — `uv run mypy --strict src/luke/ tests/ && uv run pyright src/ tests/`
 - **ruff** — lint + format on save via VS Code settings
 - **pydantic plugin** — `plugins = ["pydantic.mypy"]` in pyproject.toml
 - **`from __future__ import annotations`** — all files use deferred evaluation

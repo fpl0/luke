@@ -307,7 +307,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
             # Agent may pass JSON string or newline-separated
             try:
                 opts = json.loads(opts)
-            except (json.JSONDecodeError, ValueError):
+            except json.JSONDecodeError, ValueError:
                 opts = [o.strip() for o in opts.split("\n") if o.strip()]
         await bot.send_poll(
             chat_id=_target(args),
@@ -330,7 +330,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
         if isinstance(buttons, str):
             try:
                 buttons = json.loads(buttons)
-            except (json.JSONDecodeError, ValueError):
+            except json.JSONDecodeError, ValueError:
                 return _ok("Error: buttons must be a JSON list of rows")
         try:
             kb = InlineKeyboardMarkup(
@@ -346,8 +346,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
 
     @tool(
         "reply",
-        "Reply to a specific message by its msg: ID from the prompt. "
-        "Use Telegram HTML formatting.",
+        "Reply to a specific message by its msg: ID from the prompt. Use Telegram HTML formatting.",
         {"chat_id": str, "message_id": int, "text": str},
         annotations=_OPEN_WORLD,
     )

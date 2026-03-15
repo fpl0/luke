@@ -99,11 +99,13 @@ class TestRunTask:
         mock_bot = AsyncMock()
         mock_result = MagicMock()
         mock_result.texts = ["Task output"]
+        mock_result.sent_messages = 0
 
         task = _task(schedule_type="cron")
 
         with (
             patch("luke.scheduler.run_agent", return_value=mock_result) as mock_agent,
+            patch("luke.scheduler.send_long_message", new_callable=AsyncMock) as mock_send,
             patch("luke.scheduler.db") as mock_db,
         ):
             await _run_task(task, mock_bot)
@@ -111,8 +113,8 @@ class TestRunTask:
         mock_agent.assert_called_once()
         mock_db.log_task_run.assert_called_once()
         mock_db.update_task_last_run.assert_called_once()
-        # Should send the output
-        mock_bot.send_message.assert_called()
+        # Should send the output via send_long_message
+        mock_send.assert_called()
 
     async def test_once_task_marked_completed(self) -> None:
         mock_bot = AsyncMock()

@@ -10,9 +10,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(
-        env_file=".env", env_file_encoding="utf-8", extra="ignore"
-    )
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     assistant_name: str = "Luke"
     telegram_bot_token: SecretStr = SecretStr("")
@@ -161,11 +159,13 @@ def _load_dotenv() -> dict[str, str]:
 
 
 # Env vars the claude CLI subprocess needs but that aren't Settings fields
-_PASSTHROUGH_VARS = frozenset({
-    "ANTHROPIC_API_KEY",
-    "CLAUDE_CODE_OAUTH_TOKEN",
-    "ANTHROPIC_AUTH_TOKEN",
-})
+_PASSTHROUGH_VARS = frozenset(
+    {
+        "ANTHROPIC_API_KEY",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "ANTHROPIC_AUTH_TOKEN",
+    }
+)
 
 
 def _export_env(env_vars: dict[str, str]) -> None:
