@@ -1,8 +1,8 @@
 # Luke
 
-A personal Telegram assistant that remembers, researches, builds, decides, and acts — powered by the Claude Agent SDK.
+A personal agent that remembers, researches, builds, decides, and acts — powered by the Claude Agent SDK, talking to you over Telegram.
 
-Heavily inspired by [NanoClaw](https://github.com/qwibitai/nanoclaw). Where NanoClaw is a multi-channel agent platform with container sandboxing, Luke strips the idea down to a single-channel Telegram assistant focused on simplicity. Same philosophy — small enough to understand, designed to be forked and customized — just scoped to one person's Telegram.
+Heavily inspired by [NanoClaw](https://github.com/qwibitai/nanoclaw). Where NanoClaw is a multi-channel agent platform with container sandboxing, Luke strips the idea down to a single-user agent focused on simplicity. Same philosophy — small enough to understand, designed to be forked and customized — just scoped to one person.
 
 ## What Luke Can Do
 
@@ -23,7 +23,7 @@ claude
 
 Then tell Claude: `/setup`
 
-Claude handles everything: Python 3.13, uv, dependencies, BotFather walkthrough, chat ID detection, launchd service installation.
+Claude handles everything: Python 3.14, uv, dependencies, BotFather walkthrough, chat ID detection, launchd service installation.
 
 **Requirements:** macOS + [Claude Code](https://claude.ai/download). Everything else is installed automatically.
 
@@ -61,7 +61,7 @@ luke/memory/
 └── goals/         # Active objectives with deadlines and progress
 ```
 
-Luke manages memory through 7 tools: `remember`, `recall`, `recall_conversation`, `forget`, `connect`, `restore`, and `bulk_memory`. A weekly consolidation task reviews conversations, distills insights, and prunes stale data. Nothing is auto-deleted — old memories persist and remain searchable.
+Luke manages memory through 8 tools: `remember`, `recall`, `recall_conversation`, `forget`, `connect`, `restore`, `bulk_memory`, and `memory_history`. A weekly consolidation task reviews conversations, distills insights, and prunes stale data. Nothing is auto-deleted — old memories persist and remain searchable.
 
 ## Project Structure
 
@@ -72,17 +72,20 @@ luke/
 ├── .env                     # Telegram token + Claude auth (gitignored)
 ├── src/luke/
 │   ├── app.py               # Telegram handlers + agent dispatch
-│   ├── agent.py             # Claude SDK client + 20 MCP tools
+│   ├── agent.py             # Claude SDK client + 24 MCP tools
 │   ├── db.py                # SQLite: messages, sessions, memory FTS5
 │   ├── config.py            # pydantic-settings from .env
 │   ├── scheduler.py         # Cron/interval/once task execution
 │   ├── behaviors.py         # Consolidation, reflection, proactive scan, goal execution
-│   └── media.py             # Image encoding, video frames, whisper transcription
-├── luke/
-│   ├── LUKE.md              # Luke's persona and behavior guide
-│   ├── context.yaml         # User-specific context (gitignored)
-│   └── memory/              # Structured long-term memory (gitignored)
-└── store/                   # SQLite database + logs (gitignored)
+│   ├── media.py             # Image encoding, video frames, whisper transcription
+│   └── templates/
+│       └── LUKE.md          # Default persona template (seeded to LUKE_DIR on first run)
+└── $LUKE_DIR (~/.luke)/     # All runtime data (configurable via .env)
+    ├── LUKE.md              # Agent persona and behavior guide
+    ├── context.yaml         # User-specific context
+    ├── luke.db              # SQLite database
+    ├── memory/              # Structured long-term memory
+    └── workspace/           # Media files, apps, scripts Luke builds
 ```
 
 ## Customization
@@ -91,6 +94,7 @@ No configuration sprawl. If you want different behavior, modify the code. The co
 
 ```
 /setup      — First-time installation and configuration
+/upgrade    — Pull latest code, sync deps, restart service
 /customize  — Add capabilities, change behavior
 /debug      — Troubleshooting and diagnostics
 ```
