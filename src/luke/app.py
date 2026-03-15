@@ -782,7 +782,7 @@ async def main() -> None:
 
 
 def _configure_logging() -> None:
-    """Configure structlog with colored, timestamped console output."""
+    """Configure structlog with timestamped JSON output."""
     import structlog as _structlog
 
     _structlog.configure(
@@ -792,7 +792,7 @@ def _configure_logging() -> None:
             _structlog.processors.StackInfoRenderer(),
             _structlog.dev.set_exc_info,
             _structlog.processors.TimeStamper(fmt="iso"),
-            _structlog.dev.ConsoleRenderer(colors=True),
+            _structlog.processors.JSONRenderer(),
         ],
         wrapper_class=_structlog.stdlib.BoundLogger,
         context_class=dict,
