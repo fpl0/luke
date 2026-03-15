@@ -8,7 +8,7 @@ import os
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "0000000000:AAHfakeTestTokenForUnitTesting1234")
 
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import pytest
 
@@ -18,7 +18,7 @@ from luke.config import settings
 
 def _clear_cached_properties() -> None:
     """Clear cached_property values so they recompute from a new luke_dir."""
-    obj_dict = cast(dict[str, Any], settings.__dict__)
+    obj_dict = vars(settings)
     for prop in ("workspace_dir", "memory_dir", "store_dir", "decay_rates"):
         obj_dict.pop(prop, None)
 

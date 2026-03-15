@@ -820,7 +820,7 @@ def _acquire_lock() -> None:
     file, checks if it's alive, and kills it if it's a stale Luke process.
     This handles orphan processes that survive outside launchd's control.
     """
-    global _lock_fd  # noqa: PLW0603
+    global _lock_fd
     lock_path = settings.store_dir / "luke.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     _lock_fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT)
@@ -842,10 +842,8 @@ def _acquire_lock() -> None:
             print(f"Killed stale Luke process {old_pid}", file=sys.stderr)
             time.sleep(2)
             # Force-kill if still alive
-            try:
+            with contextlib.suppress(ProcessLookupError):
                 os.kill(old_pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
         except ProcessLookupError:
             pass  # already dead
 

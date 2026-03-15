@@ -144,6 +144,7 @@ async def build_prompt(
     chat_id: str = "",
 ) -> str | list[dict[str, Any]]:
     """Build a text or multimodal prompt from pending messages."""
+
     def _fmt(m: db.StoredMessage) -> str:
         reply_ctx = ""
         if m.reply_to and chat_id:

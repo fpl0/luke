@@ -26,6 +26,11 @@ from luke.config import settings
 
 
 class TestSendLongMessage:
+    @pytest.fixture(autouse=True)
+    def _patch_db(self) -> Any:
+        with patch("luke.agent.db.store_message"):
+            yield
+
     @pytest.fixture()
     def mock_bot(self) -> AsyncMock:
         return AsyncMock(spec=Bot)
@@ -60,7 +65,20 @@ class TestSendLongMessage:
 # ---------------------------------------------------------------------------
 
 
+def _mock_sent() -> MagicMock:
+    """Create a mock Telegram message returned by bot.send_message."""
+    msg = MagicMock()
+    msg.message_id = 1
+    msg.date.isoformat.return_value = "2024-01-01T00:00:00"
+    return msg
+
+
 class TestSendChunk:
+    @pytest.fixture(autouse=True)
+    def _patch_db(self) -> Any:
+        with patch("luke.agent.db.store_message"):
+            yield
+
     async def test_html_fallback(self) -> None:
         """When TelegramBadRequest is raised, should retry with parse_mode=None."""
         from aiogram.exceptions import TelegramBadRequest
@@ -70,7 +88,7 @@ class TestSendChunk:
         mock_bot = AsyncMock(spec=Bot)
         mock_bot.send_message.side_effect = [
             TelegramBadRequest(method=MagicMock(), message="Bad HTML"),
-            None,
+            _mock_sent(),
         ]
 
         await _send_chunk(mock_bot, chat_id=123, text="<bad>html")
@@ -87,7 +105,7 @@ class TestSendChunk:
         mock_bot.send_message.side_effect = [
             ConnectionError("network"),
             ConnectionError("network"),
-            None,  # succeeds on 3rd attempt
+            _mock_sent(),
         ]
 
         await _send_chunk(mock_bot, chat_id=123, text="Hello")
@@ -111,8 +129,8 @@ class TestSendChunk:
         from luke.agent import _send_chunk
 
         mock_bot = AsyncMock(spec=Bot)
-        exc = TelegramRetryAfter(method=MagicMock(), message="rate limited", retry_after=0.01)
-        mock_bot.send_message.side_effect = [exc, None]
+        exc = TelegramRetryAfter(method=MagicMock(), message="rate limited", retry_after=1)
+        mock_bot.send_message.side_effect = [exc, _mock_sent()]
 
         await _send_chunk(mock_bot, chat_id=123, text="Hello")
         assert mock_bot.send_message.call_count == 2
@@ -240,6 +258,11 @@ class TestOk:
 class TestBuildTools:
     """Test tool functions by calling _build_tools with mocked SDK."""
 
+    @pytest.fixture(autouse=True)
+    def _patch_db_store(self) -> Any:
+        with patch("luke.agent.db.store_message"):
+            yield
+
     @pytest.fixture()
     def tool_env(self, tmp_path: Path) -> dict[str, Any]:
         """Set up environment for _build_tools testing."""
@@ -258,12 +281,13 @@ class TestBuildTools:
 
         def fake_create_server(**kwargs: Any) -> list[Any]:
             captured_tools.extend(kwargs["tools"])
-            return captured_tools  # type: ignore[return-value]
+            return captured_tools
 
         with (
             patch("luke.agent.tool", fake_tool),
             patch("luke.agent.create_sdk_mcp_server", fake_create_server),
             patch("luke.agent.settings") as mock_settings,
+            patch("luke.agent.db.store_message"),
         ):
             mock_settings.store_dir = store_dir
             mock_settings.luke_dir = tmp_path
