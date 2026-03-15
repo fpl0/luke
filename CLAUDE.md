@@ -16,7 +16,7 @@ Luke is an opinionated agent implementation, not a framework. Every architectura
 
 ## Quick Context
 
-Single Python process: aiogram dispatches Telegram messages → Claude Agent SDK powers the agent → responds via Telegram. In-process MCP server provides 24 tools (Telegram, memory, scheduling, monitoring). SQLite stores everything. Python 3.13+, managed with uv.
+Single Python process: aiogram dispatches Telegram messages → Claude Agent SDK powers the agent → responds via Telegram. In-process MCP server provides 24 tools (Telegram, memory, scheduling, monitoring). SQLite stores everything. Python 3.14+, managed with uv.
 
 ## Key Files
 
