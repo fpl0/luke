@@ -31,7 +31,15 @@ from structlog.stdlib import BoundLogger
 from . import db
 from .agent import _trunc, run_agent, send_long_message
 from .config import settings
-from .db import MemoryResult, ensure_utc, get_graph_neighbors, recall, touch_memories
+from .db import (
+    MEMORY_DIRS,
+    MemoryResult,
+    ensure_utc,
+    get_graph_neighbors,
+    read_frontmatter,
+    recall,
+    touch_memories,
+)
 from .media import build_prompt, extract_frame, transcribe
 from .scheduler import start_scheduler_loop
 
@@ -420,6 +428,49 @@ async def process(chat_id: str) -> None:
         if result.sent_messages == 0:
             for text in result.texts:
                 await send_long_message(bot, chat_id=int(chat_id), text=text)
+
+        # Save conversation state for continuity (non-trivial conversations only)
+        if effort != "low":
+            _fire_and_forget(
+                asyncio.to_thread(_save_conv_state, messages, result.texts)
+            )
+
+
+def _save_conv_state(
+    messages: list[db.StoredMessage],
+    agent_texts: list[str],
+) -> None:
+    """Save conversation-state-latest memory (sync, runs in to_thread)."""
+    user_lines = [f"**User:** {m.content[:200]}" for m in messages[-3:]]
+    agent_line = f"**Luke:** {agent_texts[-1][:300]}" if agent_texts else ""
+    now = datetime.now(UTC).isoformat(timespec="minutes")
+    body = f"**Last exchange:** {now}\n" + "\n".join(user_lines)
+    if agent_line:
+        body += f"\n{agent_line}"
+    # Write memory file
+    import yaml
+
+    type_dir = MEMORY_DIRS["episode"]
+    mem_dir = settings.memory_dir / type_dir
+    mem_dir.mkdir(parents=True, exist_ok=True)
+    path = mem_dir / f"{_CONV_STATE_ID}.md"
+    created = read_frontmatter(path).get("created", now) if path.exists() else now
+    fm = yaml.dump(
+        {
+            "id": _CONV_STATE_ID,
+            "type": "episode",
+            "tags": ["conversation", "state"],
+            "created": created,
+            "updated": now,
+            "links": [],
+        },
+        default_flow_style=False,
+    )
+    path.write_text(f"---\n{fm}---\n\n# Conversation State\n\n{body}\n")
+    db.index_memory(
+        _CONV_STATE_ID, "episode", "Last conversation state", body,
+        tags=["conversation", "state"], importance=0.3,
+    )
 
 
 _background_tasks: set[asyncio.Task[None]] = set()
