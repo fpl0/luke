@@ -73,8 +73,7 @@ async def _run_task(task: TaskRecord, bot: Bot) -> None:
         # preamble tells the agent this fact so it doesn't rely on text output.
         prompt = (
             "[Scheduled task — text output is not delivered to the user. "
-            "Use send_message/reply to communicate.]\n\n"
-            + task["prompt"]
+            "Use send_message/reply to communicate.]\n\n" + task["prompt"]
         )
         result = await asyncio.wait_for(
             run_agent(

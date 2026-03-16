@@ -70,8 +70,10 @@ class TestCachedProperties:
         assert set(rates.keys()) == {"entity", "episode", "procedure", "insight", "goal"}
         assert rates["entity"] == s.decay_rate_entity
 
-    def test_luke_dir_default(self) -> None:
-        s = _make()
+    def test_luke_dir_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Bypass .env file and process env to test the field default
+        monkeypatch.delenv("LUKE_DIR", raising=False)
+        s = _make(_env_file=None)
         assert s.luke_dir == Path.home() / ".luke"
 
     def test_luke_dir_override(self) -> None:
