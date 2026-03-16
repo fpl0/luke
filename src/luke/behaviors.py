@@ -105,7 +105,6 @@ async def run_consolidation(bot: Bot, sem: asyncio.Semaphore) -> None:
             prompt,
             bot,
             sem,
-            model=settings.consolidation_model,
             episodes=episode_ids,
         )
 
@@ -160,7 +159,6 @@ async def run_reflection(bot: Bot, sem: asyncio.Semaphore) -> None:
         prompt,
         bot,
         sem,
-        model=settings.reflection_model,
         memories_reviewed=len(recent),
         messages_reviewed=len(msg_lines),
     )
@@ -234,7 +232,6 @@ async def run_proactive_scan(bot: Bot, sem: asyncio.Semaphore) -> None:
         prompt,
         bot,
         sem,
-        model=settings.proactive_scan_model,
         sections=len(sections),
     )
 
@@ -311,7 +308,6 @@ async def run_deep_work(bot: Bot, sem: asyncio.Semaphore) -> None:
         prompt,
         bot,
         sem,
-        model=settings.deep_work_model,
         max_turns=settings.deep_work_max_turns,
         max_budget_usd=settings.deep_work_max_budget_usd,
         max_sends=1,

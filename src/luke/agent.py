@@ -899,12 +899,16 @@ _ALLOWED_OPUS: list[str] = [*_BUILTINS_ALL, "mcp__luke__*"]
 
 
 def _allowed_tools_for_model(model: str) -> list[str]:
-    """Return the allowed_tools list scoped to the model tier."""
-    if model == "haiku":
-        return _ALLOWED_HAIKU
-    if model == "sonnet":
-        return _ALLOWED_SONNET
-    # opus and everything else: full access
+    """Return the allowed_tools list scoped to the model tier.
+
+    NOTE: Model routing is disabled — always returns opus tools.
+    Tier lists preserved for future re-enablement.
+    """
+    # TODO: re-enable when sonnet resume crash + memory-aware boost are fixed
+    # if model == "haiku":
+    #     return _ALLOWED_HAIKU
+    # if model == "sonnet":
+    #     return _ALLOWED_SONNET
     return _ALLOWED_OPUS
 
 
@@ -960,7 +964,7 @@ async def run_agent(
     allowed = _allowed_tools_for_model(effective_model)
 
     # Fallback model must differ from main model (SDK requirement)
-    fallback = settings.agent_fallback_model
+    fallback: str | None = settings.agent_fallback_model
     if fallback == effective_model:
         fallback = None
 

@@ -301,9 +301,8 @@ class TestRunDeepWork:
             await run_deep_work(AsyncMock(), _SEM)
 
         mock_agent.assert_called_once()
-        # Verify model and budget overrides
+        # Verify budget overrides (model routing disabled — no model param)
         call_kwargs = mock_agent.call_args.kwargs
-        assert call_kwargs["model"] == tmp_settings.deep_work_model
         assert call_kwargs["max_turns"] == tmp_settings.deep_work_max_turns
         assert call_kwargs["max_sends"] == 1
 
