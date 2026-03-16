@@ -51,8 +51,15 @@ class TestOnce:
 
 
 class TestCron:
-    def test_due_first_run(self) -> None:
+    def test_not_due_immediately_after_creation(self) -> None:
         task = _task(schedule_type="cron", schedule_value="*/5 * * * *", last_run=None)
+        assert _is_due(task, datetime.now(UTC)) is False
+
+    def test_due_first_run_after_window(self) -> None:
+        created = (datetime.now(UTC) - timedelta(minutes=10)).isoformat()
+        task = _task(
+            schedule_type="cron", schedule_value="*/5 * * * *", last_run=None, created_at=created
+        )
         assert _is_due(task, datetime.now(UTC)) is True
 
     def test_due_after_next_fire(self) -> None:
@@ -68,8 +75,15 @@ class TestCron:
 
 
 class TestInterval:
-    def test_due_first_run(self) -> None:
+    def test_not_due_immediately_after_creation(self) -> None:
         task = _task(schedule_type="interval", schedule_value="60000", last_run=None)
+        assert _is_due(task, datetime.now(UTC)) is False
+
+    def test_due_first_run_after_interval(self) -> None:
+        created = (datetime.now(UTC) - timedelta(seconds=120)).isoformat()
+        task = _task(
+            schedule_type="interval", schedule_value="60000", last_run=None, created_at=created
+        )
         assert _is_due(task, datetime.now(UTC)) is True
 
     def test_due_after_elapsed(self) -> None:
