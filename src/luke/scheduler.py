@@ -34,15 +34,20 @@ def _is_due(task: TaskRecord, now: datetime) -> bool:
 
     if stype == "cron":
         if not last_run:
-            return True
-        last = ensure_utc(datetime.fromisoformat(last_run))
+            # Use task creation time as anchor so we wait for the next window
+            last = ensure_utc(datetime.fromisoformat(task["created_at"]))
+        else:
+            last = ensure_utc(datetime.fromisoformat(last_run))
         next_run: datetime = ensure_utc(croniter(sval, last).get_next(datetime))
         return now >= next_run
 
     if stype == "interval":
         interval_ms = int(sval)
         if not last_run:
-            return True
+            # Use task creation time as anchor so we wait for the first interval
+            last = ensure_utc(datetime.fromisoformat(task["created_at"]))
+            elapsed_ms = (now - last).total_seconds() * 1000
+            return elapsed_ms >= interval_ms
         last = ensure_utc(datetime.fromisoformat(last_run))
         elapsed_ms = (now - last).total_seconds() * 1000
         return elapsed_ms >= interval_ms
