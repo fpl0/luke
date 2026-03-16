@@ -36,23 +36,39 @@ If either fails, warn the user — the upgrade may be broken. Don't proceed to r
 
 ## 4. Apply Schema Migrations
 
-Luke uses `CREATE TABLE IF NOT EXISTS` so new tables are auto-created on restart. But new columns on existing tables need explicit migration.
+Luke uses `CREATE TABLE IF NOT EXISTS` so new tables are auto-created on restart. But new columns on existing tables, changed indexes, or new virtual table columns need explicit migration.
 
-Check if any ALTER TABLE statements are needed by reading `db.py` for migration markers:
-
-```bash
-grep -n "ALTER TABLE\|-- migration" src/luke/db.py
-```
-
-If migrations are found, run them against the database:
+**Do NOT just grep for migration markers.** Actively compare the schema definition in `db.py` against the live database:
 
 ```bash
 source .env 2>/dev/null
 LUKE_DIR="${LUKE_DIR:-$HOME/.luke}"
-sqlite3 "$LUKE_DIR/luke.db" < <migration_sql>
+
+# Extract expected schema from code
+grep -A2 "CREATE TABLE\|CREATE INDEX\|CREATE VIRTUAL" src/luke/db.py
+
+# Get live schema
+sqlite3 "$LUKE_DIR/luke.db" ".schema"
+
+# Compare columns for each table
+for table in messages memory_meta memory_links tasks task_logs sessions cursors behavior_state memory_history cost_log reaction_feedback; do
+    sqlite3 "$LUKE_DIR/luke.db" "PRAGMA table_info($table);" 2>/dev/null
+done
 ```
 
-If no migrations are found, this step is a no-op — `init()` on restart handles new tables/indexes.
+Compare the code's `_SCHEMA` string against the live DB output. Look for:
+- **New columns** in existing tables → generate `ALTER TABLE ... ADD COLUMN` statements
+- **New indexes** → generate `CREATE INDEX IF NOT EXISTS` statements
+- **Changed column defaults** → may need UPDATE statements for existing rows
+- **New tables** → handled automatically by `init()` on restart (no action needed)
+
+If migrations are needed, build and run them:
+
+```bash
+sqlite3 "$LUKE_DIR/luke.db" "<migration SQL>"
+```
+
+If the live schema matches the code, this step is a no-op.
 
 ## 5. Update LUKE.md Persona
 
