@@ -31,7 +31,7 @@ from structlog.stdlib import BoundLogger
 from . import db
 from .agent import _trunc, run_agent, send_long_message
 from .config import settings
-from .db import MemoryResult, get_graph_neighbors, recall, touch_memories
+from .db import MemoryResult, ensure_utc, get_graph_neighbors, recall, touch_memories
 from .media import build_prompt, extract_frame, transcribe
 from .scheduler import start_scheduler_loop
 
@@ -49,6 +49,10 @@ _active: dict[str, asyncio.Lock] = {}
 _notified_unregistered: set[str] = set()
 _last_error: dict[str, float] = {}  # chat_id → monotonic timestamp
 _retry_counts: dict[str, int] = {}  # chat_id → consecutive failure count
+
+# Model routing: one-way ratchet within a session (never downgrade mid-conversation)
+_MODEL_RANK: dict[str, int] = {"haiku": 0, "sonnet": 1, "opus": 2}
+_session_models: dict[str, str] = {}  # chat_id → highest model used in session
 
 
 _TRIVIAL_WORDS = frozenset(
@@ -97,8 +101,8 @@ _COMPLEX_KEYWORDS: frozenset[str] = frozenset(
 
 def _classify_effort(
     prompt: str | list[dict[str, Any]],
-) -> tuple[Literal["low", "medium", "high", "max"], ThinkingConfig]:
-    """Classify message complexity to scale thinking effort dynamically."""
+) -> tuple[Literal["low", "medium", "high", "max"], ThinkingConfig, str]:
+    """Classify message complexity and select model tier dynamically."""
     if isinstance(prompt, str):
         text = prompt
         has_media = False
@@ -111,7 +115,7 @@ def _classify_effort(
 
     # Trivial: short, no questions, no media
     if word_count < 15 and not has_question and not has_media:
-        return "low", ThinkingConfigDisabled(type="disabled")
+        return "low", ThinkingConfigDisabled(type="disabled"), settings.model_low
 
     # Complex: long messages, multiple questions, media, code blocks
     text_lower = text.lower()
@@ -123,10 +127,11 @@ def _classify_effort(
         or any(kw in text_lower for kw in _COMPLEX_KEYWORDS)
     )
     if is_complex:
-        return "high", ThinkingConfigEnabled(type="enabled", budget_tokens=16_000)
+        thinking_cfg = ThinkingConfigEnabled(type="enabled", budget_tokens=16_000)
+        return "high", thinking_cfg, settings.model_high
 
     # Normal: everything else
-    return "medium", ThinkingConfigAdaptive(type="adaptive")
+    return "medium", ThinkingConfigAdaptive(type="adaptive"), settings.model_medium
 
 
 # ---------------------------------------------------------------------------
@@ -157,8 +162,55 @@ def _should_send_error(chat_id: str) -> bool:
     return True
 
 
-async def _auto_recall(combined_text: str, chat_id: str) -> str:
-    """Run memory recall + graph augmentation and return formatted context."""
+_CONV_STATE_ID = "conversation-state-latest"
+_STALE_HOURS = 24.0
+_COST_ANOMALY_MIN = 2.0  # minimum cost to trigger anomaly check
+_COST_ANOMALY_MULTIPLIER = 3  # times rolling average
+
+
+def _load_conv_state() -> tuple[str, str | None]:
+    """Read conversation state body and timestamp (sync, for use in to_thread)."""
+    body = db.read_memory_body("episode", _CONV_STATE_ID, settings.recall_content_limit)
+    updated = db.get_memory_updated(_CONV_STATE_ID) if body else None
+    return body, updated
+
+
+async def _get_conversation_state(chat_id: str) -> str:
+    """Load conversation state for continuity injection.
+
+    Returns formatted context string (empty if nothing to inject).
+    Falls back to recent message synthesis if no saved state exists.
+    """
+    body, updated = await asyncio.to_thread(_load_conv_state)
+    if body:
+        if updated:
+            try:
+                ts = ensure_utc(datetime.fromisoformat(updated))
+                hours_ago = (datetime.now(UTC) - ts).total_seconds() / 3600
+                if hours_ago > _STALE_HOURS:
+                    body = (
+                        f"[Last conversation was {int(hours_ago)}h ago "
+                        f"— context may be outdated]\n{body}"
+                    )
+            except ValueError:
+                pass
+        return f"<conversation-state>\n{body}\n</conversation-state>\n"
+
+    # Fallback: synthesize from recent messages
+    recent = await asyncio.to_thread(db.get_recent_messages, chat_id, limit=10)
+    if not recent:
+        return ""
+    lines = [f"{m['sender_name']}: {m['content'][:100]}" for m in recent]
+    ctx = "\n".join(lines)
+    return (
+        "<conversation-state>\n"
+        "[Recent conversation context (no saved state available)]\n"
+        f"{ctx}\n</conversation-state>\n"
+    )
+
+
+async def _auto_recall(combined_text: str, chat_id: str) -> tuple[str, list[MemoryResult]]:
+    """Run memory recall + graph augmentation. Returns (formatted_context, raw_memories)."""
     recall_start = time.monotonic()
     # Runs in thread — embedding inference is CPU-bound
     memories = await asyncio.to_thread(
@@ -180,7 +232,7 @@ async def _auto_recall(combined_text: str, chat_id: str) -> str:
             if n["id"] not in seen:
                 memories.append(n)
                 seen.add(n["id"])
-        memory_context = _format_memory_context(memories)
+        memory_context = await asyncio.to_thread(_format_memory_context, memories)
         # Speculative touch: non-critical bookkeeping, fire-and-forget
         _fire_and_forget(asyncio.to_thread(touch_memories, list(seen), useful=False))
     recall_ms = round((time.monotonic() - recall_start) * 1000)
@@ -192,7 +244,7 @@ async def _auto_recall(combined_text: str, chat_id: str) -> str:
         count=len(all_ids),
         ids=all_ids,
     )
-    return memory_context
+    return memory_context, memories
 
 
 async def process(chat_id: str) -> None:
@@ -217,20 +269,39 @@ async def process(chat_id: str) -> None:
         if not messages:
             return
 
-        # Run build_prompt and memory recall concurrently — they're independent
+        # Run build_prompt, memory recall, and conversation state concurrently
         combined_text = " ".join(m.content for m in messages)
+        recalled_memories: list[MemoryResult] = []
         if _needs_recall(combined_text):
-            prompt, memory_context = await asyncio.gather(
+            prompt, (memory_context, recalled_memories), conv_state = await asyncio.gather(
                 build_prompt(messages, chat_id),
                 _auto_recall(combined_text, chat_id),
+                _get_conversation_state(chat_id),
             )
+            # Prepend conversation state before recalled memories for priority
+            memory_context = conv_state + memory_context
         else:
             prompt = await build_prompt(messages, chat_id)
             memory_context = ""
 
         # Classify effort BEFORE memory injection so injected context
         # doesn't inflate word count and skew the complexity heuristic.
-        effort, thinking = _classify_effort(prompt)
+        effort, thinking, model = _classify_effort(prompt)
+
+        # Memory-aware routing boost: goal/procedure context ⇒ at least sonnet
+        if (
+            recalled_memories
+            and any(m.get("type") in ("goal", "procedure") for m in recalled_memories)
+            and _MODEL_RANK.get(model, 0) < _MODEL_RANK.get(settings.model_medium, 0)
+        ):
+            model = settings.model_medium
+
+        # Session-aware ratchet: never downgrade within an active session
+        session_id = db.get_session(chat_id)
+        if session_id:
+            prev = _session_models.get(chat_id)
+            if prev and _MODEL_RANK.get(prev, 0) > _MODEL_RANK.get(model, 0):
+                model = prev
 
         if memory_context:
             log.info("memories_injected", chat=chat_id)
@@ -251,6 +322,7 @@ async def process(chat_id: str) -> None:
             messages=len(messages),
             prompt_chars=prompt_chars,
             effort=effort,
+            model=model,
         )
         agent_start_mono = time.monotonic()
         try:
@@ -259,8 +331,9 @@ async def process(chat_id: str) -> None:
                     run_agent(
                         chat_id=chat_id,
                         prompt=prompt,
-                        session_id=db.get_session(chat_id),
+                        session_id=session_id,
                         bot=bot,
+                        model=model,
                         effort=effort,
                         thinking=thinking,
                     ),
@@ -272,13 +345,13 @@ async def process(chat_id: str) -> None:
                 log.error("agent_timeout", chat_id=chat_id, timeout=settings.agent_timeout)
             else:
                 log.exception("agent_failed", chat_id=chat_id)
-            # Clear stale session so retries start fresh
+            # Clear stale session + model ratchet so retries start fresh
             db.set_session(chat_id, "")
+            _session_models.pop(chat_id, None)
             count = _retry_counts.get(chat_id, 0) + 1
             _retry_counts[chat_id] = count
             if count >= settings.max_retries:
                 log.error("max_retries_exhausted", chat_id=chat_id, retries=count)
-                db.set_session(chat_id, "")
                 db.advance_cursor(chat_id, messages[-1].id)
                 _retry_counts.pop(chat_id, None)
                 if _should_send_error(chat_id):
@@ -318,8 +391,30 @@ async def process(chat_id: str) -> None:
             db.advance_cursor(chat_id, messages[-1].id)
         _retry_counts.pop(chat_id, None)
 
+        # Session loss detection
+        if session_id and result.session_id != session_id:
+            log.warning(
+                "session_changed",
+                chat_id=chat_id,
+                old=session_id[:8],
+                new=result.session_id[:8] if result.session_id else "none",
+            )
+
+        # Cost anomaly detection
+        if result.cost_usd > _COST_ANOMALY_MIN:
+            avg = db.get_rolling_avg_cost(days=7)
+            if avg > 0 and result.cost_usd > avg * _COST_ANOMALY_MULTIPLIER:
+                log.warning(
+                    "cost_anomaly",
+                    chat_id=chat_id,
+                    cost=result.cost_usd,
+                    rolling_avg=round(avg, 4),
+                )
+
         if result.session_id:
             db.set_session(chat_id, result.session_id)
+        # Update model ratchet after successful run
+        _session_models[chat_id] = model
 
         # Only send result text if the agent didn't already message via MCP tools
         if result.sent_messages == 0:

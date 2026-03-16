@@ -6,11 +6,11 @@ Luke is a personal Telegram agent. Single Python process, no frameworks.
 Telegram message
   → aiogram handler → store in SQLite → dispatch background task
     → process(): fetch pending → inject memories → classify effort
-      → run_agent(): Claude SDK + 24 MCP tools + sub-agents
+      → run_agent(): Claude SDK + 27 MCP tools + model routing + sub-agents
         → advance cursor → send responses
 ```
 
-A scheduler loop runs alongside, ticking every 60 seconds — hourly maintenance, daily consolidation and proactive scans, 12-hour goal execution, weekly reflection.
+A scheduler loop runs alongside, ticking every 60 seconds — hourly maintenance, daily consolidation and proactive scans, 8-hour deep work sessions (autonomous goal execution), weekly reflection.
 
 ## Design Decisions
 
@@ -20,9 +20,9 @@ A scheduler loop runs alongside, ticking every 60 seconds — hourly maintenance
 
 - **[Memory](memory.md)** — Five types as markdown files. Indexed with FTS5 + semantic embeddings. Hybrid retrieval via Reciprocal Rank Fusion. Composite scoring. Adaptive forgetting with spaced repetition.
 
-- **[Agent](agent.md)** — Claude Agent SDK with MCP tools, four hooks, dynamic effort classification, three sub-agents, two-layer system prompt.
+- **[Agent](agent.md)** — Claude Agent SDK with MCP tools, four hooks, smart model routing (haiku/sonnet/opus), three sub-agents, conversation continuity, self-monitoring.
 
-- **[Autonomous Behaviors](autonomous-behaviors.md)** — Four agent invocations on timers: consolidation, reflection, proactive scan, goal execution.
+- **[Autonomous Behaviors](autonomous-behaviors.md)** — Four agent invocations on timers: consolidation, reflection, proactive scan, deep work (autonomous goal execution).
 
 - **[Concurrency](concurrency.md)** — Per-chat locks, global semaphore, process lock. Thread-local SQLite with atomic batches. Retry with backoff. Graceful shutdown.
 

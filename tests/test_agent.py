@@ -28,7 +28,11 @@ from luke.config import settings
 class TestSendLongMessage:
     @pytest.fixture(autouse=True)
     def _patch_db(self) -> Any:
-        with patch("luke.agent.db.store_message"):
+        with (
+            patch("luke.agent.db.store_message"),
+            patch("luke.agent.db.is_duplicate_outbound", return_value=False),
+            patch("luke.agent.db.log_outbound"),
+        ):
             yield
 
     @pytest.fixture()
@@ -260,7 +264,11 @@ class TestBuildTools:
 
     @pytest.fixture(autouse=True)
     def _patch_db_store(self) -> Any:
-        with patch("luke.agent.db.store_message"):
+        with (
+            patch("luke.agent.db.store_message"),
+            patch("luke.agent.db.is_duplicate_outbound", return_value=False),
+            patch("luke.agent.db.log_outbound"),
+        ):
             yield
 
     @pytest.fixture()
@@ -463,3 +471,14 @@ class TestBuildTools:
             }
         )
         assert "Error" in result["content"][0]["text"]
+
+    def test_all_mcp_tool_names_matches_registered(self, tool_env: dict[str, Any]) -> None:
+        """_ALL_MCP_TOOL_NAMES must match the tools actually registered in _build_tools."""
+        from luke.agent import _ALL_MCP_TOOL_NAMES
+
+        registered = set(tool_env["tools"].keys())
+        declared = set(_ALL_MCP_TOOL_NAMES)
+        assert declared == registered, (
+            f"Mismatch: in _ALL_MCP_TOOL_NAMES but not registered: {declared - registered}, "
+            f"registered but not in _ALL_MCP_TOOL_NAMES: {registered - declared}"
+        )

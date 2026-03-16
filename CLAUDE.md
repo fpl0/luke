@@ -16,7 +16,7 @@ Luke is an opinionated agent implementation, not a framework. Every architectura
 
 ## Quick Context
 
-Single Python process: aiogram dispatches Telegram messages → Claude Agent SDK powers the agent → responds via Telegram. In-process MCP server provides 24 tools (Telegram, memory, scheduling, monitoring). SQLite stores everything. Python 3.14+, managed with uv.
+Single Python process: aiogram dispatches Telegram messages → Claude Agent SDK powers the agent → responds via Telegram. In-process MCP server provides 27 tools (Telegram, memory, scheduling, monitoring). Smart model routing selects haiku/sonnet/opus per message based on complexity. SQLite stores everything. Python 3.14+, managed with uv.
 
 ## Key Files
 
@@ -25,11 +25,11 @@ Single Python process: aiogram dispatches Telegram messages → Claude Agent SDK
 | File | Purpose |
 |------|---------|
 | `src/luke/app.py` | Orchestrator: Telegram handlers, `_store` helper, `process` + `_dispatch`, main loop |
-| `src/luke/agent.py` | Claude SDK client + 24 MCP tools (Telegram, memory, scheduling, monitoring) |
+| `src/luke/agent.py` | Claude SDK client + 27 MCP tools (Telegram, memory, scheduling, monitoring) + model routing |
 | `src/luke/db.py` | SQLite: messages, sessions, tasks, memory index (FTS5) |
 | `src/luke/config.py` | Settings from `.env` via pydantic-settings (`SecretStr` for token) |
 | `src/luke/scheduler.py` | Cron/interval/once task execution + hourly maintenance |
-| `src/luke/behaviors.py` | Autonomous behaviors: consolidation, reflection, proactive scan, goal execution |
+| `src/luke/behaviors.py` | Autonomous behaviors: consolidation, reflection, proactive scan, deep work |
 | `src/luke/media.py` | Image encoding, video frames, whisper transcription, multimodal prompt building |
 | `src/luke/__main__.py` | Entry point: `python -m luke` |
 
@@ -40,7 +40,7 @@ Single Python process: aiogram dispatches Telegram messages → Claude Agent SDK
 | `LUKE.md` | Agent persona and behavior (system prompt) |
 | `luke.db` | SQLite database (messages, sessions, tasks, memory index) |
 | `memory/` | Markdown memory files with YAML frontmatter |
-| `workspace/` | Media files, apps, scripts Luke builds |
+| `workspace/` | Media files, apps, scripts Luke builds, deep work plans (`plans/`) |
 | `context.yaml` | User-specific context (name, timezone) |
 
 ## Skills
@@ -92,7 +92,7 @@ tail -f ~/.luke/luke.err
 - **No containers** — Claude Agent SDK with Docker Sandboxes for tool isolation
 - **No polling** — aiogram event-driven dispatch via long-polling
 - **No abstractions** — module-level handlers, direct bot calls
-- **Concurrency** — `asyncio.Lock` per chat + `asyncio.Semaphore` global limit (default: 5); behaviors acquire the same semaphore to prevent API overload during wake storms
+- **Concurrency** — `asyncio.Lock` per chat + `asyncio.Semaphore` global limit (default: 8); `_behavior_sem` (max: 3) caps concurrent behaviors, guaranteeing ≥5 slots for user messages; deep work runs as a background `asyncio.Task` (non-blocking)
 - **Memory** — Hybrid FTS5 + semantic (fastembed) search, relationship graph with multi-hop traversal, composite scoring (relevance × importance × recency × access), adaptive forgetting, auto-injection, and periodic consolidation
 - **Cursor model** — messages accumulate, agent processes all pending as one batch
 - **Startup replay** — on restart, pending messages from before crash are dispatched immediately
@@ -101,7 +101,8 @@ tail -f ~/.luke/luke.err
 
 ## Security
 
-- **Path traversal** — Telegram filenames sanitized with `Path(...).name`; memory IDs sanitized with `re.sub(r"[^\w-]", "_", ...)`; memory types validated against allowlist
+- **Path traversal** — Telegram filenames sanitized with `Path(...).name`; memory IDs sanitized via `sanitize_memory_id()` in db.py; memory types validated against allowlist
+- **Duplicate messages** — `send_long_message()` checks SHA-256 content hash against `outbound_log` table (5-min window) before sending; hourly cleanup prunes old entries
 - **FTS5 injection** — `recall()` catches `sqlite3.OperationalError` from malformed MATCH queries
 - **Schedule validation** — `create_task()` validates type is `cron|interval|once`, validates cron with `croniter.is_valid()`, validates interval is integer
 - **Bot token** — `SecretStr` in pydantic, `.get_secret_value()` only at `Bot()` construction
@@ -129,15 +130,20 @@ Docs live in `docs/` and explain design decisions, architecture, and behavior in
 - **Add new docs** when introducing significant new functionality or architectural concepts that warrant explanation beyond code comments
 - Docs are for *why* and *how it works* — not API reference (the code is small enough to read directly)
 
-## Tools (24 MCP tools in `agent.py`)
+## Tools (27 MCP tools in `agent.py`)
 
-**Telegram (14):** send_message, send_photo, send_document, send_voice, send_video, send_location, send_poll, send_buttons, reply, forward, react, edit_message, delete_message, pin
+**Telegram (15):** send_message, send_photo, send_document, send_voice, send_video, send_location, send_poll, send_buttons, reply, forward, react, get_reactions, edit_message, delete_message, pin
 
 **Memory (8):** remember, recall, recall_conversation, forget, connect, restore, bulk_memory, memory_history
 
-**Scheduling (1):** schedule_task
+**Scheduling (3):** schedule_task, list_tasks, delete_task
 
 **Monitoring (1):** get_cost_report
+
+**Tool scoping by model tier:**
+- **Haiku** — send_message, reply, react, remember, recall, recall_conversation (+ Read, Glob, Grep builtins only)
+- **Sonnet** — all except schedule_task, bulk_memory (+ all builtins)
+- **Opus** — everything
 
 **Plus all Claude Code built-in tools:** Bash, Read, Write, Edit, Glob, Grep, WebSearch, WebFetch, Agent teams, TodoWrite, etc.
 
@@ -156,7 +162,7 @@ Key behaviors:
 - **Utility tracking** — distinguishes intentional access (agent tools) from speculative (auto-injection); utility rate modulates access score to penalize frequently-surfaced-but-unused memories
 - **Multi-hop graph** — BFS up to depth 2 with exponential weight decay per hop; Hebbian co-access strengthening evolves link weights over time
 - **Adaptive forgetting** — hourly type-aware importance decay modulated by access count (spaced repetition)
-- **Auto-injection** — `process()` recalls relevant memories + 1-hop graph neighbors, with salience gating and query-aware caching
+- **Auto-injection** — `process()` recalls relevant memories + 1-hop graph neighbors concurrently with prompt building, plus conversation state injection for continuity
 - **Conflict detection** — entity updates detect and report changes; history recorded in `memory_history` table
 - **Consolidation** — daily scheduler task clusters related episodes (≥2 shared tags) and synthesizes insights via agent
 - **Self-healing** — `sync_memory_index()` on startup detects unindexed files and indexes them (with embeddings)
@@ -171,15 +177,19 @@ Messages table stores `sender_name`, `sender_id` (Telegram user ID), `msg_id` (T
 ## Scheduler
 
 The scheduler loop runs every 60 seconds (configurable via `SCHEDULER_INTERVAL`). It:
-1. Runs hourly maintenance: archived FTS cleanup + adaptive importance decay + stale session cleanup
-2. Collects due behaviors and runs them **in parallel** via `asyncio.gather()`:
-   - Daily: consolidation (episodes → insights) + proactive scan
-   - Every 12h: autonomous goal execution
+1. Runs hourly maintenance: archived FTS cleanup + adaptive importance decay + stale session cleanup + outbound log pruning
+2. Collects due maintenance behaviors and runs them **in parallel** via `asyncio.gather()`:
+   - Daily: consolidation (episodes → insights) + proactive scan (can take lightweight goal actions)
    - Weekly: reflection + FTS pruning
-3. Fetches active tasks (excludes completed `once` tasks at SQL level)
-4. Checks due-ness via `_is_due()` (handles cron, interval, once with timezone-aware datetimes)
-5. Deduplicates — won't fire a task that's still running from a previous tick
-6. Persists behavior timestamps to DB (`behavior_state` table) — survives restarts
+3. Launches deep work as a **background task** (non-blocking, budget-limited to `daily_deep_work_budget_usd`):
+   - Every 8h: autonomous multi-step goal execution with plan-before-execute pattern
+   - Plans stored in `$LUKE_DIR/workspace/plans/{goal_id}.md` with status tracking
+   - Rate-limited to 1 outbound message per session
+4. Fetches active tasks (excludes completed `once` tasks at SQL level)
+5. Checks due-ness via `_is_due()` (handles cron, interval, once with timezone-aware datetimes)
+6. Deduplicates — won't fire a task that's still running from a previous tick
+7. Persists behavior timestamps to DB (`behavior_state` table) — survives restarts
+8. Alerts user after 3 consecutive task failures
 
 ## Data Separation
 

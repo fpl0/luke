@@ -8,7 +8,7 @@ Luke runs with `bypassPermissions`. All security comes from validation at the bo
 
 **Telegram filenames** — `Path(...).name` strips all directory components from user-supplied filenames.
 
-**Memory IDs** — regex strips everything except `[a-zA-Z0-9_-]`.
+**Memory IDs** — `sanitize_memory_id()` in db.py strips everything except `[a-zA-Z0-9_-]`.
 
 ## FTS5 Injection
 
@@ -32,15 +32,26 @@ All queries use `?` placeholders. One f-string in `recall()` interpolates hardco
 
 ## Rate Limiting
 
-PreToolUse hook counts outbound Telegram sends per agent run (10 send-related tools tracked). Blocks after `max_sends_per_run` (default: 20). Counter resets per invocation.
+PreToolUse hook counts outbound Telegram sends per agent run. Blocks after `max_sends_per_run` (default: 20, overridable per invocation). Deep work sessions use `max_sends=1`. Counter resets per invocation.
+
+## Duplicate Message Detection
+
+`send_long_message()` computes a SHA-256 content hash and checks the `outbound_log` table for recent matches (5-minute window). Duplicates are blocked with a warning log. The outbound log is pruned hourly (24h retention).
+
+## Self-Monitoring
+
+- **Task failure alerting** — scheduler alerts user via Telegram after 3 consecutive failures of the same task
+- **Cost anomaly detection** — logs warning when a single run exceeds 3x the 7-day per-run average (and >$2)
+- **Session loss detection** — logs warning when session ID changes unexpectedly between runs
 
 ## Budget Limits
 
-| | User Messages | Behaviors |
-|---|---|---|
-| Max turns | 200 | 75 |
-| Max budget | $5.00 | $1.00 |
-| Timeout | 30 min | 30 min |
+| | User Messages | Maintenance Behaviors | Deep Work |
+|---|---|---|---|
+| Max turns | 200 | 75 | 300 |
+| Max budget | $5.00 | $1.00 | $3.00/session, $60/day |
+| Max sends | 20 | 20 | 1 |
+| Timeout | 30 min | 30 min | 30 min |
 
 `asyncio.wait_for()` hard-kills the agent on timeout.
 

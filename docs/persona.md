@@ -79,7 +79,7 @@ The [Stop hook](agent.md) reinforces this at session end.
 
 ## Goals
 
-Goals are memories with structured content: status, progress percentage, deadline, and sub-goals. The persona instructs proactive goal creation. The [scheduler](autonomous-behaviors.md) executes goals every 12 hours. Flow: user mentions wanting something → agent creates goal → scheduler advances it.
+Goals are memories with structured content: status, progress percentage, deadline, and sub-goals. The persona instructs proactive goal creation. The [scheduler](autonomous-behaviors.md) runs deep work sessions every 8 hours with plan-before-execute pattern. Flow: user mentions wanting something → agent creates goal → deep work creates a plan in `workspace/plans/` → executes steps autonomously.
 
 ## Proactive Behavior
 

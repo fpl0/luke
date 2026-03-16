@@ -14,7 +14,7 @@ from structlog.stdlib import BoundLogger
 from . import db
 from .agent import AgentResult, run_agent
 from .config import settings
-from .db import read_memory_body
+from .db import read_memory_body, sanitize_memory_id
 
 log: BoundLogger = structlog.get_logger()
 
@@ -22,7 +22,16 @@ _LOG_PREVIEW = 200
 
 
 async def _run_behavior(
-    name: str, prompt: str, bot: Bot, sem: asyncio.Semaphore, **log_fields: Any
+    name: str,
+    prompt: str,
+    bot: Bot,
+    sem: asyncio.Semaphore,
+    *,
+    model: str | None = None,
+    max_turns: int | None = None,
+    max_budget_usd: float | None = None,
+    max_sends: int | None = None,
+    **log_fields: Any,
 ) -> AgentResult | None:
     """Run an agent behavior with standard timeout, logging, and error handling."""
     chat_id = settings.chat_id
@@ -37,8 +46,14 @@ async def _run_behavior(
                     prompt=prompt,
                     session_id=None,
                     bot=bot,
-                    max_turns=settings.behavior_max_turns,
-                    max_budget_usd=settings.behavior_max_budget_usd,
+                    model=model,
+                    max_turns=max_turns if max_turns is not None else settings.behavior_max_turns,
+                    max_budget_usd=(
+                        max_budget_usd
+                        if max_budget_usd is not None
+                        else settings.behavior_max_budget_usd
+                    ),
+                    max_sends=max_sends,
                     effort="high",
                 ),
                 timeout=settings.agent_timeout,
@@ -85,7 +100,14 @@ async def run_consolidation(bot: Bot, sem: asyncio.Semaphore) -> None:
             "2. Connect the new insight to relevant entities\n"
             "3. Archive redundant episodes with 'forget'\n\n" + "\n---\n".join(contents)
         )
-        await _run_behavior("consolidation", prompt, bot, sem, episodes=episode_ids)
+        await _run_behavior(
+            "consolidation",
+            prompt,
+            bot,
+            sem,
+            model=settings.consolidation_model,
+            episodes=episode_ids,
+        )
 
 
 async def run_reflection(bot: Bot, sem: asyncio.Semaphore) -> None:
@@ -138,6 +160,7 @@ async def run_reflection(bot: Bot, sem: asyncio.Semaphore) -> None:
         prompt,
         bot,
         sem,
+        model=settings.reflection_model,
         memories_reviewed=len(recent),
         messages_reviewed=len(msg_lines),
     )
@@ -198,16 +221,33 @@ async def run_proactive_scan(bot: Bot, sem: asyncio.Semaphore) -> None:
         "- A recurring pattern suggesting the user will need something soon\n"
         "- An unresolved item from a recent conversation\n"
         "- A follow-up you promised but haven't delivered\n\n"
-        "If nothing warrants a message, do nothing. Don't message just to check in.\n\n"
-        + "\n\n".join(sections)
+        "If action is needed and you can do it autonomously (research, schedule, write):\n"
+        "- Take ONE concrete step\n"
+        "- Save an episode of what you did\n"
+        "- Update the goal memory with progress\n\n"
+        "Reserve messaging the user for things that genuinely need their input.\n"
+        "If nothing warrants action or a message, do nothing.\n\n" + "\n\n".join(sections)
     )
 
-    await _run_behavior("proactive_scan", prompt, bot, sem, sections=len(sections))
+    await _run_behavior(
+        "proactive_scan",
+        prompt,
+        bot,
+        sem,
+        model=settings.proactive_scan_model,
+        sections=len(sections),
+    )
 
 
-async def run_goal_execution(bot: Bot, sem: asyncio.Semaphore) -> None:
-    """Autonomously advance active goals — execute ONE concrete next step per goal."""
+async def run_deep_work(bot: Bot, sem: asyncio.Semaphore) -> None:
+    """Autonomous goal loop: sustained multi-step work on active goals."""
     if not settings.chat_id:
+        return
+
+    # Budget gate: skip if daily autonomous spend is exhausted
+    daily_cost = db.get_daily_deep_work_cost()
+    if daily_cost >= settings.daily_deep_work_budget_usd:
+        log.info("deep_work_budget_exhausted", daily_cost=daily_cost)
         return
 
     goals = db.recall(mem_type="goal", limit=10)
@@ -223,27 +263,57 @@ async def run_goal_execution(bot: Bot, sem: asyncio.Semaphore) -> None:
     if not goal_sections:
         return
 
+    # Check for existing work plans
+    plans_dir = settings.workspace_dir / "plans"
+    plans_dir.mkdir(parents=True, exist_ok=True)
+    plan_status: list[str] = []
+    for g in goals:
+        plan_path = plans_dir / f"{sanitize_memory_id(g['id'])}.md"
+        if plan_path.exists():
+            plan_status.append(f"[{g['id']}]: plan exists at workspace/plans/{plan_path.name}")
+
+    remaining = settings.daily_deep_work_budget_usd - daily_cost
+    now_str = datetime.now(UTC).isoformat(timespec="minutes")
+
     prompt = (
-        "Goal execution task. You have active goals to work on. "
-        "Pick the highest-priority goal and execute ONE concrete next step:\n"
-        "- If it requires research, search the web\n"
-        "- If it requires code or files, write them\n"
-        "- If it requires the user's input and the goal is BLOCKED without it, "
-        "message them with a specific question\n"
-        "- If it requires scheduling, create reminders or tasks\n"
-        "- If you can make progress autonomously, do it\n\n"
-        "IMPORTANT: Do NOT send check-in messages, status updates, briefings, "
-        "or any messages that belong to scheduled tasks (morning briefing, "
-        "midday check-in, evening check-in, reminders). Those are handled by "
-        "their own cron jobs. Only message if the goal is truly blocked and "
-        "requires input, or you discovered something urgent. When in doubt, "
-        "do the work silently and update the goal memory.\n\n"
-        "After acting:\n"
-        "1. Save an episode documenting what you did and what you learned\n"
-        "2. Update the goal memory with new progress and status\n"
-        "3. If a follow-up action is needed, schedule it\n\n"
-        "Do NOT try to complete the entire goal at once. One step at a time.\n"
-        "If no goal needs attention right now, do nothing.\n\n" + "\n\n".join(goal_sections)
+        f"Deep work session. Current time: {now_str}. "
+        f"Daily budget remaining: ${remaining:.2f}.\n\n"
+        "Active goals (priority order):\n"
+        + "\n\n".join(goal_sections)
+        + ("\n\nExisting work plans:\n" + "\n".join(plan_status) if plan_status else "")
+        + "\n\n"
+        "Phase 1 — PLAN (do this first):\n"
+        "1. Pick the highest-priority goal\n"
+        "2. Check if a work plan exists at workspace/plans/{goal_id}.md\n"
+        "3. If no plan exists, create one: 3-5 concrete steps, status: in_progress\n"
+        "4. If a plan exists and status is in_progress, pick up where you left off\n"
+        "5. If a plan exists and status is blocked, check if the blocker is resolved\n\n"
+        "Phase 2 — EXECUTE:\n"
+        "6. Work through unchecked steps in order\n"
+        "7. After each step, self-check: 'Am I making progress or going in circles?'\n"
+        "   - If stuck for 2+ attempts on the same step, mark the plan as blocked\n"
+        "8. After each meaningful step, update the plan file:\n"
+        "   - Check off completed step\n"
+        "   - Add progress note with timestamp\n"
+        "   - Update steps_completed count and last_updated\n"
+        "   - Update the goal memory with new progress %\n\n"
+        "Phase 3 — WRAP UP:\n"
+        "9. If the goal is complete: update plan status to completed, update goal memory\n"
+        "10. If blocked: update plan status to blocked, note what you need\n"
+        "11. Save a summary episode (deep-work-log) of what was accomplished\n\n"
+        "You may send at most ONE message to the user per session — only if truly blocked.\n"
+        "Prefer updating the plan's Blockers section over messaging.\n"
+        "You have full tool access: web search, code, files, memory.\n"
     )
 
-    await _run_behavior("goal_execution", prompt, bot, sem, goals_reviewed=len(goals))
+    await _run_behavior(
+        "deep_work",
+        prompt,
+        bot,
+        sem,
+        model=settings.deep_work_model,
+        max_turns=settings.deep_work_max_turns,
+        max_budget_usd=settings.deep_work_max_budget_usd,
+        max_sends=1,
+        goals_reviewed=len(goals),
+    )

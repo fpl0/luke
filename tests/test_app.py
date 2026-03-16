@@ -461,8 +461,8 @@ class TestProcess:
 
         # NOW cursor should advance
         mock_db.advance_cursor.assert_called_once_with(chat_id, 20)
-        # Session cleared twice: once unconditionally, once at max_retries
-        assert mock_db.set_session.call_count == 2
+        # Session cleared once (unconditionally on error)
+        mock_db.set_session.assert_called_once_with(chat_id, "")
         # Retry count should be cleared
         assert chat_id not in app_mod._retry_counts
 
@@ -484,6 +484,10 @@ class TestProcess:
         mock_result = MagicMock()
         mock_result.texts = ["response"]
         mock_result.session_id = "sess-123"
+        mock_result.cost_usd = 0.01
+        mock_result.num_turns = 1
+        mock_result.duration_api_ms = 100
+        mock_result.sent_messages = 0
 
         with (
             patch("luke.app.db") as mock_db,
