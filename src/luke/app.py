@@ -50,8 +50,6 @@ _notified_unregistered: set[str] = set()
 _last_error: dict[str, float] = {}  # chat_id → monotonic timestamp
 _retry_counts: dict[str, int] = {}  # chat_id → consecutive failure count
 
-# Recall cache: (memories, formatted_context, monotonic_time, query_hash)
-_recall_cache: tuple[list[MemoryResult], str, float, int] | None = None
 
 _TRIVIAL_WORDS = frozenset(
     {
@@ -90,12 +88,6 @@ def _needs_recall(text: str) -> bool:
         return False
     words = stripped.lower().split()
     return not (len(words) <= 2 and all(w.strip("!?.,:") in _TRIVIAL_WORDS for w in words))
-
-
-def invalidate_recall_cache() -> None:
-    """Clear the recall cache."""
-    global _recall_cache
-    _recall_cache = None
 
 
 _COMPLEX_KEYWORDS: frozenset[str] = frozenset(
@@ -165,9 +157,46 @@ def _should_send_error(chat_id: str) -> bool:
     return True
 
 
+async def _auto_recall(combined_text: str, chat_id: str) -> str:
+    """Run memory recall + graph augmentation and return formatted context."""
+    recall_start = time.monotonic()
+    # Runs in thread — embedding inference is CPU-bound
+    memories = await asyncio.to_thread(
+        recall,
+        query=combined_text,
+        limit=settings.auto_recall_limit,
+    )
+    memory_context = ""
+    seen: set[str] = set()
+    if memories:
+        mem_ids = [m["id"] for m in memories]
+        neighbors = await asyncio.to_thread(
+            get_graph_neighbors,
+            mem_ids,
+            limit=3,
+        )
+        seen = set(mem_ids)
+        for n in neighbors:
+            if n["id"] not in seen:
+                memories.append(n)
+                seen.add(n["id"])
+        memory_context = _format_memory_context(memories)
+        # Speculative touch: non-critical bookkeeping, fire-and-forget
+        _fire_and_forget(asyncio.to_thread(touch_memories, list(seen), useful=False))
+    recall_ms = round((time.monotonic() - recall_start) * 1000)
+    all_ids = list(seen)
+    log.info(
+        "recall_done",
+        chat_id=chat_id,
+        duration_ms=recall_ms,
+        count=len(all_ids),
+        ids=all_ids,
+    )
+    return memory_context
+
+
 async def process(chat_id: str) -> None:
     """Process all pending messages for a chat."""
-    global _recall_cache
     lock = _active.setdefault(chat_id, asyncio.Lock())
 
     async with lock:
@@ -188,58 +217,16 @@ async def process(chat_id: str) -> None:
         if not messages:
             return
 
-        prompt: str | list[dict[str, Any]] = await build_prompt(messages, chat_id)
-
-        # Auto memory injection — proactively surface relevant memories
+        # Run build_prompt and memory recall concurrently — they're independent
         combined_text = " ".join(m.content for m in messages)
-        memory_context = ""
-
         if _needs_recall(combined_text):
-            recall_start = time.monotonic()
-            now_mono = recall_start
-            cache_hit = False
-            query_hash = hash(combined_text)
-            if (
-                _recall_cache
-                and (now_mono - _recall_cache[2]) < settings.auto_recall_cache_ttl
-                and _recall_cache[3] == query_hash
-            ):
-                memory_context = _recall_cache[1]
-                cache_hit = True
-            else:
-                # Runs in thread — embedding inference is CPU-bound
-                memories = await asyncio.to_thread(
-                    recall,
-                    query=combined_text,
-                    limit=settings.auto_recall_limit,
-                )
-                # Graph augmentation: expand 1-hop from recalled memories
-                if memories:
-                    mem_ids = [m["id"] for m in memories]
-                    neighbors = await asyncio.to_thread(
-                        get_graph_neighbors,
-                        mem_ids,
-                        limit=3,
-                    )
-                    seen = set(mem_ids)
-                    for n in neighbors:
-                        if n["id"] not in seen:
-                            memories.append(n)
-                            seen.add(n["id"])
-                    memory_context = _format_memory_context(memories)
-                    # Speculative touch: track auto-injection access
-                    await asyncio.to_thread(touch_memories, list(seen), useful=False)
-                _recall_cache = (memories, memory_context, now_mono, query_hash)
-            recall_ms = round((time.monotonic() - recall_start) * 1000)
-            recalled_ids = [m["id"] for m in (_recall_cache[0] if _recall_cache else [])]
-            log.info(
-                "recall_done",
-                chat_id=chat_id,
-                cache_hit=cache_hit,
-                duration_ms=recall_ms,
-                count=len(recalled_ids),
-                ids=recalled_ids,
+            prompt, memory_context = await asyncio.gather(
+                build_prompt(messages, chat_id),
+                _auto_recall(combined_text, chat_id),
             )
+        else:
+            prompt = await build_prompt(messages, chat_id)
+            memory_context = ""
 
         # Classify effort BEFORE memory injection so injected context
         # doesn't inflate word count and skew the complexity heuristic.
@@ -347,6 +334,13 @@ def _on_task_done(task: asyncio.Task[None]) -> None:
     _background_tasks.discard(task)
     if not task.cancelled() and (exc := task.exception()):
         log.error("process() failed", exc_info=exc)
+
+
+def _fire_and_forget(coro: Awaitable[None]) -> None:
+    """Schedule a coroutine as a background task without awaiting it."""
+    task: asyncio.Task[None] = asyncio.ensure_future(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
 
 
 def _dispatch(chat_id: str) -> None:

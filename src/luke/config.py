@@ -29,8 +29,6 @@ class Settings(BaseSettings):
 
     # Auto-recall injection
     auto_recall_limit: int = 5
-    auto_recall_cache_ttl: float = 300.0  # 5 min cache for embedding search
-
     # Composite scoring weights (must sum to 1.0)
     score_weight_relevance: float = 0.4
     score_weight_importance: float = 0.25

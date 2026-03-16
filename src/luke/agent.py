@@ -541,10 +541,6 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
         # Linking is a graph-write, not retrieval — track access but not utility
         if links:
             db.touch_memories(links, useful=False)
-        # Invalidate recall cache so next message gets fresh results
-        from .app import invalidate_recall_cache
-
-        invalidate_recall_cache()
         status = f"Remembered: {mem_id}"
         if change_note:
             status += change_note
@@ -583,9 +579,6 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
     )
     async def mem_forget(args: dict[str, Any]) -> dict[str, Any]:
         db.archive_memory(args["id"])
-        from .app import invalidate_recall_cache
-
-        invalidate_recall_cache()
         return _ok(f"Archived: {args['id']}")
 
     @tool(
@@ -635,9 +628,6 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
     async def mem_restore(args: dict[str, Any]) -> dict[str, Any]:
         restored = db.restore_memory(args["id"])
         if restored:
-            from .app import invalidate_recall_cache
-
-            invalidate_recall_cache()
             return _ok(f"Restored: {args['id']}")
         return _ok(f"Not found or not archived: {args['id']}")
 
@@ -675,9 +665,6 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
                 db.archive_memory(mid)
         else:
             return _ok(f"Unknown action: {action}")
-        from .app import invalidate_recall_cache
-
-        invalidate_recall_cache()
         return _ok(f"{action}: {len(ids)} memories updated")
 
     # --- Memory history (1 tool) ---

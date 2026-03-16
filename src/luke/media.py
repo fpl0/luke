@@ -191,16 +191,30 @@ async def build_prompt(
         return full_text
     skip_indices = set(range(max(0, len(all_matches) - settings.max_images_per_prompt)))
 
+    # Phase 1: collect images to encode
+    to_encode: list[tuple[int, Path]] = []
+    for match_idx, match in enumerate(all_matches):
+        if match_idx not in skip_indices:
+            to_encode.append((match_idx, Path(match.group(2))))
+
+    # Phase 2: encode all images in parallel (PIL releases the GIL)
+    encode_results: dict[int, dict[str, Any] | None] = {}
+    if to_encode:
+        results = await asyncio.gather(
+            *[asyncio.to_thread(encode_image, path) for _, path in to_encode]
+        )
+        for (idx, _), result in zip(to_encode, results, strict=True):
+            encode_results[idx] = result
+
+    # Phase 3: build blocks in order using pre-computed results
     pos = 0
     for match_idx, match in enumerate(all_matches):
         # Add text before this match
         if match.start() > pos:
             blocks.append({"type": "text", "text": full_text[pos : match.start()]})
 
-        media_path = Path(match.group(2))
-
         if match_idx not in skip_indices:
-            image_block = await asyncio.to_thread(encode_image, media_path)
+            image_block = encode_results.get(match_idx)
             if image_block:
                 blocks.append(image_block)
                 image_count += 1

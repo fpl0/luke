@@ -398,7 +398,7 @@ class TestProcess:
             mock_settings.chat_id = chat_id
             mock_settings.max_retries = 3
             mock_settings.agent_timeout = 10
-            mock_settings.auto_recall_cache_ttl = 0
+
             mock_settings.auto_recall_limit = 5
             mock_settings.max_concurrent = 5
             mock_settings.error_cooldown = 0
@@ -448,7 +448,7 @@ class TestProcess:
             mock_settings.chat_id = chat_id
             mock_settings.max_retries = 3
             mock_settings.agent_timeout = 10
-            mock_settings.auto_recall_cache_ttl = 0
+
             mock_settings.auto_recall_limit = 5
             mock_settings.max_concurrent = 5
             mock_settings.error_cooldown = 0
@@ -495,7 +495,7 @@ class TestProcess:
         ):
             mock_settings.chat_id = chat_id
             mock_settings.agent_timeout = 10
-            mock_settings.auto_recall_cache_ttl = 0
+
             mock_settings.auto_recall_limit = 5
             mock_settings.max_concurrent = 5
             mock_db.get_pending_messages.return_value = [msg]
@@ -553,38 +553,6 @@ class TestStartupReplay:
                     mock_dispatch(mock_settings.chat_id)
 
         mock_dispatch.assert_not_called()
-
-
-# ---------------------------------------------------------------------------
-# Recall cache
-# ---------------------------------------------------------------------------
-
-
-class TestRecallCache:
-    def test_invalidate_clears_cache(self) -> None:
-        import luke.app as app_mod
-        from luke.app import invalidate_recall_cache
-
-        app_mod._recall_cache = ([], "", time.monotonic(), 0)
-        invalidate_recall_cache()
-        assert app_mod._recall_cache is None
-
-    def test_invalidate_when_empty_no_error(self) -> None:
-        import luke.app as app_mod
-        from luke.app import invalidate_recall_cache
-
-        app_mod._recall_cache = None
-        invalidate_recall_cache()  # should not raise
-        assert app_mod._recall_cache is None
-
-    def test_cache_includes_query_hash(self) -> None:
-        """Cache tuple should include query hash as 4th element."""
-        import luke.app as app_mod
-
-        query_hash = hash("test query")
-        app_mod._recall_cache = ([], "context", time.monotonic(), query_hash)
-        assert app_mod._recall_cache is not None
-        assert app_mod._recall_cache[3] == query_hash
 
 
 # ---------------------------------------------------------------------------
