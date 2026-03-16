@@ -20,6 +20,19 @@ from .db import TaskRecord, ensure_utc
 
 log: BoundLogger = structlog.get_logger()
 
+# Cap concurrent behaviors to avoid starving message processing.
+# With max_concurrent=5 for the main semaphore, limiting behaviors to 2
+# guarantees at least 3 slots remain available for user messages.
+_behavior_sem = asyncio.Semaphore(2)
+
+
+async def _limit_behavior(
+    cap: asyncio.Semaphore, coro: Coroutine[object, object, None]
+) -> None:
+    """Run a behavior coroutine under a concurrency limit."""
+    async with cap:
+        await coro
+
 
 def _is_due(task: TaskRecord, now: datetime) -> bool:
     """Check if a task should run now."""
@@ -196,7 +209,8 @@ async def start_scheduler_loop(
             log.info("behaviors_start", behaviors=names)
             coros = [coro for _, coro in behavior_coros]
             results: list[None | BaseException] = await asyncio.gather(
-                *coros, return_exceptions=True
+                *[_limit_behavior(_behavior_sem, c) for c in coros],
+                return_exceptions=True,
             )
             now_iso = datetime.now(UTC).isoformat()
             with db.batch():

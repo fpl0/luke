@@ -707,8 +707,9 @@ def _semantic_search(
     """KNN search using sqlite-vec — native C distance computation."""
     db = _db()
     query_blob = struct.pack(f"{len(query_embedding)}f", *query_embedding)
-    # vec0 KNN: auxiliary columns can be SELECTed but not filtered in WHERE
-    fetch_limit = limit * 4
+    # vec0 KNN: auxiliary columns can be SELECTed but not filtered in WHERE.
+    # Over-fetch 4x when type-filtered (more rows eliminated), 2x otherwise.
+    fetch_limit = limit * (4 if mem_type else 2)
     knn_rows = db.execute(
         "SELECT memory_id, distance FROM memory_vec WHERE embedding MATCH ? AND k = ?",
         (query_blob, fetch_limit),
@@ -730,7 +731,8 @@ def _semantic_search(
         params.append(mem_type)
 
     meta_rows = db.execute(
-        f"""SELECT m.id, m.type, f.title
+        f"""SELECT m.id, m.type, f.title,
+                   m.importance, m.access_count, m.useful_count, m.updated
             FROM memory_meta m
             JOIN memory_fts f ON m.id = f.id
             WHERE m.id IN ({mid_placeholders}) AND {filter_clause}""",
@@ -741,7 +743,16 @@ def _semantic_search(
     for r in meta_rows:
         dist = mid_dist.get(r["id"], 0.0)
         similarity = 1.0 / (1.0 + dist)
-        scored.append({"id": r["id"], "type": r["type"], "title": r["title"], "score": similarity})
+        scored.append({
+            "id": r["id"],
+            "type": r["type"],
+            "title": r["title"],
+            "score": similarity,
+            "importance": r["importance"],
+            "access_count": r["access_count"],
+            "useful_count": r["useful_count"],
+            "updated": r["updated"],
+        })
     scored.sort(key=lambda x: x["score"], reverse=True)
     return scored[:limit]
 
@@ -996,7 +1007,8 @@ def recall(
             type_clause = " AND m.type = ?" if mem_type else ""
             type_params: tuple[str, ...] = (mem_type,) if mem_type else ()
             rows = db.execute(
-                f"""SELECT f.id, f.type, f.title, rank
+                f"""SELECT f.id, f.type, f.title, rank,
+                           m.importance, m.access_count, m.useful_count, m.updated
                     FROM memory_fts f
                     JOIN memory_meta m ON f.id = m.id
                     WHERE memory_fts MATCH ? AND m.status = 'active'
@@ -1016,6 +1028,10 @@ def recall(
                 "type": r["type"],
                 "title": r["title"],
                 "score": -r["rank"] / max_score,
+                "importance": r["importance"],
+                "access_count": r["access_count"],
+                "useful_count": r["useful_count"],
+                "updated": r["updated"],
             }
 
     # --- Strategy 2: Semantic search (embedding-based) ---
@@ -1063,7 +1079,8 @@ def recall(
             params.append(mem_type)
 
         rows = db.execute(
-            f"""SELECT m.id, m.type, f.title
+            f"""SELECT m.id, m.type, f.title,
+                       m.importance, m.access_count, m.useful_count, m.updated
                 FROM memory_meta m
                 JOIN memory_fts f ON m.id = f.id
                 WHERE {" AND ".join(conditions)}{priv_clause}
@@ -1078,6 +1095,10 @@ def recall(
                     "type": r["type"],
                     "title": r["title"],
                     "score": 0.0,
+                    "importance": r["importance"],
+                    "access_count": r["access_count"],
+                    "useful_count": r["useful_count"],
+                    "updated": r["updated"],
                 }
 
     # --- Strategy 4: Multi-hop graph traversal (BFS, depth up to graph_max_depth) ---
@@ -1086,27 +1107,31 @@ def recall(
         frontier = [related_to]
         for depth in range(settings.graph_max_depth):
             hop_weight = settings.graph_decay_per_hop ** (depth + 1)
+            neighbors = _get_neighbors_batch(db, frontier)
             next_frontier: list[str] = []
-            for node in frontier:
-                neighbors = _get_neighbors(db, node)
-                for n in neighbors:
-                    if n["id"] not in visited:
-                        visited.add(n["id"])
-                        next_frontier.append(n["id"])
-                        if n["id"] not in results:
-                            results[n["id"]] = {
-                                "id": n["id"],
-                                "type": n["type"],
-                                "title": n["title"],
-                                "score": n["weight"] * hop_weight,
-                                "relationship": n["relationship"],
-                            }
+            for n in neighbors:
+                if n["id"] not in visited:
+                    visited.add(n["id"])
+                    next_frontier.append(n["id"])
+                    if n["id"] not in results:
+                        results[n["id"]] = {
+                            "id": n["id"],
+                            "type": n["type"],
+                            "title": n["title"],
+                            "score": n["weight"] * hop_weight,
+                            "relationship": n["relationship"],
+                            "importance": n["importance"],
+                            "access_count": n["access_count"],
+                            "useful_count": n["useful_count"],
+                            "updated": n["updated"],
+                        }
             frontier = next_frontier
 
     # --- Type filter (when only type is specified, no query/temporal/graph) ---
     if mem_type and not query and not after and not before and not related_to:
         rows = db.execute(
-            f"""SELECT m.id, m.type, f.title
+            f"""SELECT m.id, m.type, f.title,
+                       m.importance, m.access_count, m.useful_count, m.updated
                 FROM memory_meta m
                 JOIN memory_fts f ON m.id = f.id
                 WHERE m.type = ? AND m.status = 'active'{priv_clause}
@@ -1120,6 +1145,10 @@ def recall(
                 "type": r["type"],
                 "title": r["title"],
                 "score": 0.0,
+                "importance": r["importance"],
+                "access_count": r["access_count"],
+                "useful_count": r["useful_count"],
+                "updated": r["updated"],
             }
 
     # Apply type filter to combined results
@@ -1133,21 +1162,28 @@ def recall(
     return cast(list[MemoryResult], ranked)
 
 
-def _get_neighbors(db: sqlite3.Connection, node_id: str) -> list[dict[str, Any]]:
-    """Get bidirectional graph neighbors of a memory node."""
+def _get_neighbors_batch(
+    db: sqlite3.Connection, node_ids: list[str]
+) -> list[dict[str, Any]]:
+    """Get bidirectional graph neighbors of multiple memory nodes in one query."""
+    if not node_ids:
+        return []
+    ph = ",".join("?" for _ in node_ids)
     rows = db.execute(
-        """SELECT ml.to_id AS id, m.type, f.title, ml.relationship, ml.weight
-           FROM memory_links ml
-           JOIN memory_meta m ON ml.to_id = m.id
-           JOIN memory_fts f ON ml.to_id = f.id
-           WHERE ml.from_id = ? AND m.status = 'active'
-           UNION
-           SELECT ml.from_id AS id, m.type, f.title, ml.relationship, ml.weight
-           FROM memory_links ml
-           JOIN memory_meta m ON ml.from_id = m.id
-           JOIN memory_fts f ON ml.from_id = f.id
-           WHERE ml.to_id = ? AND m.status = 'active'""",
-        (node_id, node_id),
+        f"""SELECT ml.to_id AS id, m.type, f.title, ml.relationship, ml.weight,
+                   m.importance, m.access_count, m.useful_count, m.updated
+            FROM memory_links ml
+            JOIN memory_meta m ON ml.to_id = m.id
+            JOIN memory_fts f ON ml.to_id = f.id
+            WHERE ml.from_id IN ({ph}) AND m.status = 'active'
+            UNION
+            SELECT ml.from_id AS id, m.type, f.title, ml.relationship, ml.weight,
+                   m.importance, m.access_count, m.useful_count, m.updated
+            FROM memory_links ml
+            JOIN memory_meta m ON ml.from_id = m.id
+            JOIN memory_fts f ON ml.from_id = f.id
+            WHERE ml.to_id IN ({ph}) AND m.status = 'active'""",
+        (*node_ids, *node_ids),
     ).fetchall()
     return [dict(r) for r in rows]
 
@@ -1162,18 +1198,13 @@ def _recency_score(updated_iso: str) -> float:
 
 
 def _apply_composite_scores(results: dict[str, dict[str, Any]]) -> None:
-    """Apply composite scoring (relevance * importance * recency * access) in place."""
+    """Apply composite scoring (relevance * importance * recency * access) in place.
+
+    Metadata (importance, access_count, useful_count, updated) is expected to be
+    pre-fetched in each entry dict by the query strategies in recall().
+    """
     if not results:
         return
-    conn = _db()
-    ids = list(results.keys())
-    placeholders = ",".join("?" for _ in ids)
-    meta_rows = conn.execute(
-        f"""SELECT id, importance, access_count, useful_count, updated
-            FROM memory_meta WHERE id IN ({placeholders})""",
-        ids,
-    ).fetchall()
-    meta_map: dict[str, sqlite3.Row] = {r["id"]: r for r in meta_rows}
 
     # Loop-invariant constants
     context_denom = 1.0 - settings.score_weight_relevance
@@ -1182,13 +1213,12 @@ def _apply_composite_scores(results: dict[str, dict[str, Any]]) -> None:
     w_rec = settings.score_weight_recency
     w_acc = settings.score_weight_access
 
-    for mem_id, entry in results.items():
-        meta = meta_map.get(mem_id)
+    for entry in results.values():
         relevance = entry.get("score", 0)
-        importance = min(meta["importance"], 1.0) if meta else 1.0
-        access_count: int = meta["access_count"] if meta else 0
-        useful_count: int = meta["useful_count"] if meta else 0
-        updated: str = meta["updated"] if meta else ""
+        importance: float = min(entry["importance"], 1.0)
+        access_count: int = entry["access_count"]
+        useful_count: int = entry["useful_count"]
+        updated: str = entry["updated"]
         recency = _recency_score(updated)
         access_score = math.log(1 + access_count) / log_101  # ~1.0 at 100 accesses
         # Utility modulation: penalize memories that get accessed but never used
