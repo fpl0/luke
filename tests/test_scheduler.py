@@ -52,7 +52,16 @@ class TestOnce:
 
 class TestCron:
     def test_not_due_immediately_after_creation(self) -> None:
+        """New cron task must NOT fire on the same tick it was created."""
         task = _task(schedule_type="cron", schedule_value="*/5 * * * *", last_run=None)
+        assert _is_due(task, datetime.now(UTC)) is False
+
+    def test_not_due_seconds_after_creation(self) -> None:
+        """Even a few seconds after creation, still before next cron window."""
+        created = (datetime.now(UTC) - timedelta(seconds=5)).isoformat()
+        task = _task(
+            schedule_type="cron", schedule_value="0 * * * *", last_run=None, created_at=created
+        )
         assert _is_due(task, datetime.now(UTC)) is False
 
     def test_due_first_run_after_window(self) -> None:
@@ -73,10 +82,62 @@ class TestCron:
         task = _task(schedule_type="cron", schedule_value="0 * * * *", last_run=last)
         assert _is_due(task, datetime.now(UTC)) is False
 
+    def test_restart_preserves_last_run(self) -> None:
+        """After restart, cron uses persisted last_run — not restart time."""
+        # Task ran 10 min ago (before restart), cron is every 5 min → due now
+        last = (datetime.now(UTC) - timedelta(minutes=10)).isoformat()
+        task = _task(schedule_type="cron", schedule_value="*/5 * * * *", last_run=last)
+        assert _is_due(task, datetime.now(UTC)) is True
+
+    def test_restart_not_due_if_recently_ran(self) -> None:
+        """After restart, cron that ran recently should NOT fire again."""
+        last = (datetime.now(UTC) - timedelta(seconds=30)).isoformat()
+        task = _task(schedule_type="cron", schedule_value="*/5 * * * *", last_run=last)
+        assert _is_due(task, datetime.now(UTC)) is False
+
+    def test_restart_never_ran_but_within_first_window(self) -> None:
+        """After restart, task created 2 min ago with hourly cron — still not due."""
+        created = (datetime.now(UTC) - timedelta(minutes=2)).isoformat()
+        task = _task(
+            schedule_type="cron", schedule_value="0 * * * *", last_run=None, created_at=created
+        )
+        assert _is_due(task, datetime.now(UTC)) is False
+
+    def test_restart_never_ran_past_first_window(self) -> None:
+        """After restart, task created 10 min ago with 5-min cron, never ran — due."""
+        created = (datetime.now(UTC) - timedelta(minutes=10)).isoformat()
+        task = _task(
+            schedule_type="cron", schedule_value="*/5 * * * *", last_run=None, created_at=created
+        )
+        assert _is_due(task, datetime.now(UTC)) is True
+
+    def test_every_3_hours_not_due_immediately(self) -> None:
+        """Regression: 'every 3 hours' cron must not fire right after creation."""
+        task = _task(schedule_type="cron", schedule_value="0 */3 * * *", last_run=None)
+        # Check within 1 second of creation
+        assert _is_due(task, datetime.now(UTC)) is False
+
+    def test_every_3_hours_due_after_window(self) -> None:
+        """Every 3 hours cron fires after the first window passes."""
+        created = (datetime.now(UTC) - timedelta(hours=4)).isoformat()
+        task = _task(
+            schedule_type="cron", schedule_value="0 */3 * * *", last_run=None, created_at=created
+        )
+        assert _is_due(task, datetime.now(UTC)) is True
+
 
 class TestInterval:
     def test_not_due_immediately_after_creation(self) -> None:
+        """New interval task must NOT fire on the same tick it was created."""
         task = _task(schedule_type="interval", schedule_value="60000", last_run=None)
+        assert _is_due(task, datetime.now(UTC)) is False
+
+    def test_not_due_seconds_after_creation(self) -> None:
+        """5 seconds after creation, 60s interval — not due."""
+        created = (datetime.now(UTC) - timedelta(seconds=5)).isoformat()
+        task = _task(
+            schedule_type="interval", schedule_value="60000", last_run=None, created_at=created
+        )
         assert _is_due(task, datetime.now(UTC)) is False
 
     def test_due_first_run_after_interval(self) -> None:
@@ -95,6 +156,35 @@ class TestInterval:
         last = (datetime.now(UTC) - timedelta(seconds=10)).isoformat()
         task = _task(schedule_type="interval", schedule_value="60000", last_run=last)
         assert _is_due(task, datetime.now(UTC)) is False
+
+    def test_restart_preserves_last_run(self) -> None:
+        """After restart, interval uses persisted last_run — timer continues."""
+        # Ran 2 min ago, interval is 1 min → due
+        last = (datetime.now(UTC) - timedelta(seconds=120)).isoformat()
+        task = _task(schedule_type="interval", schedule_value="60000", last_run=last)
+        assert _is_due(task, datetime.now(UTC)) is True
+
+    def test_restart_not_due_if_recently_ran(self) -> None:
+        """After restart, interval that ran recently should NOT fire again."""
+        last = (datetime.now(UTC) - timedelta(seconds=10)).isoformat()
+        task = _task(schedule_type="interval", schedule_value="60000", last_run=last)
+        assert _is_due(task, datetime.now(UTC)) is False
+
+    def test_restart_never_ran_timer_continues_from_creation(self) -> None:
+        """After restart, interval task created 30s ago with 60s interval — not due yet."""
+        created = (datetime.now(UTC) - timedelta(seconds=30)).isoformat()
+        task = _task(
+            schedule_type="interval", schedule_value="60000", last_run=None, created_at=created
+        )
+        assert _is_due(task, datetime.now(UTC)) is False
+
+    def test_restart_never_ran_past_interval(self) -> None:
+        """After restart, interval task created 90s ago with 60s interval — due."""
+        created = (datetime.now(UTC) - timedelta(seconds=90)).isoformat()
+        task = _task(
+            schedule_type="interval", schedule_value="60000", last_run=None, created_at=created
+        )
+        assert _is_due(task, datetime.now(UTC)) is True
 
 
 class TestUnknownType:
