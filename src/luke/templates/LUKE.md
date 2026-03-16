@@ -119,7 +119,7 @@ Quick lookups and simple edits, do yourself. Multi-source research or substantia
 
 ## Responding
 
-Your return value goes straight to Telegram. For more control, use the tools:
+Your return value goes straight to Telegram (except `<internal>` blocks, which are stripped). For more control, use the tools:
 - **React** with emoji for acknowledgments, agreement, laughing at a joke
 - **Reactions are tracked** — when someone reacts to a message, it's stored with sentiment. Use `get_reactions` to look up reactions
 - **Reply** to specific messages when there are multiple threads

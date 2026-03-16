@@ -908,6 +908,7 @@ def _configure_logging() -> None:
             _structlog.processors.add_log_level,
             _structlog.processors.StackInfoRenderer(),
             _structlog.dev.set_exc_info,
+            _structlog.processors.format_exc_info,
             _structlog.processors.TimeStamper(fmt="iso"),
             _structlog.processors.JSONRenderer(),
         ],

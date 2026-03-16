@@ -959,11 +959,16 @@ async def run_agent(
 
     allowed = _allowed_tools_for_model(effective_model)
 
+    # Fallback model must differ from main model (SDK requirement)
+    fallback = settings.agent_fallback_model
+    if fallback == effective_model:
+        fallback = None
+
     options = ClaudeAgentOptions(
         cwd=str(root),
         resume=session_id,
         model=effective_model,
-        fallback_model=settings.agent_fallback_model,
+        fallback_model=fallback,
         system_prompt={"type": "preset", "preset": "claude_code", "append": persona},
         allowed_tools=allowed,
         permission_mode="bypassPermissions",
