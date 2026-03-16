@@ -299,13 +299,13 @@ class TestSessionCleanup:
         )
         test_db._db().commit()
         cleaned = test_db.cleanup_stale_sessions(3600.0)
-        assert cleaned == 1
+        assert cleaned == ["999"]
         assert test_db.get_session("999") is None
 
     def test_cleanup_keeps_fresh_sessions(self, test_db: Any) -> None:
         test_db.set_session("100", "fresh-session")
         cleaned = test_db.cleanup_stale_sessions(3600.0)
-        assert cleaned == 0
+        assert cleaned == []
         assert test_db.get_session("100") == "fresh-session"
 
     def test_set_session_records_timestamp(self, test_db: Any) -> None:
@@ -372,6 +372,94 @@ class TestReactionFeedback:
             .fetchone()["cnt"]
         )
         assert count == 1
+
+    def test_get_reactions_basic(self, test_db: Any) -> None:
+        test_db.store_reaction_feedback(
+            chat_id="100",
+            msg_id=42,
+            sender_id="1",
+            emoji="\U0001f44d",
+            timestamp="2024-01-01T00:00:00",
+        )
+        results = test_db.get_reactions("100")
+        assert len(results) == 1
+        assert results[0]["emoji"] == "\U0001f44d"
+        assert results[0]["sentiment"] == "positive"
+
+    def test_get_reactions_with_message_join(self, test_db: Any) -> None:
+        test_db.store_message(
+            chat_id="100",
+            sender_name="Alice",
+            sender_id="1",
+            message_id=42,
+            content="Hello world",
+            timestamp="2024-01-01T00:00:00",
+        )
+        test_db.store_reaction_feedback(
+            chat_id="100",
+            msg_id=42,
+            sender_id="1",
+            emoji="\U0001f44d",
+            timestamp="2024-01-01T00:01:00",
+        )
+        results = test_db.get_reactions("100")
+        assert results[0]["msg_sender"] == "Alice"
+        assert "Hello world" in results[0]["msg_preview"]
+
+    def test_get_reactions_filter_sentiment(self, test_db: Any) -> None:
+        test_db.store_reaction_feedback(
+            chat_id="100",
+            msg_id=1,
+            sender_id="1",
+            emoji="\U0001f44d",
+            timestamp="2024-01-01T00:00:00",
+        )
+        test_db.store_reaction_feedback(
+            chat_id="100",
+            msg_id=2,
+            sender_id="1",
+            emoji="\U0001f44e",
+            timestamp="2024-01-01T00:01:00",
+        )
+        pos = test_db.get_reactions("100", sentiment="positive")
+        assert len(pos) == 1
+        neg = test_db.get_reactions("100", sentiment="negative")
+        assert len(neg) == 1
+
+    def test_get_reactions_filter_msg_id(self, test_db: Any) -> None:
+        test_db.store_reaction_feedback(
+            chat_id="100",
+            msg_id=42,
+            sender_id="1",
+            emoji="\U0001f44d",
+            timestamp="2024-01-01T00:00:00",
+        )
+        test_db.store_reaction_feedback(
+            chat_id="100",
+            msg_id=99,
+            sender_id="1",
+            emoji="\U0001f525",
+            timestamp="2024-01-01T00:01:00",
+        )
+        results = test_db.get_reactions("100", msg_id=42)
+        assert len(results) == 1
+        assert results[0]["msg_id"] == 42
+
+    def test_get_reactions_empty(self, test_db: Any) -> None:
+        results = test_db.get_reactions("100")
+        assert results == []
+
+    def test_get_reactions_limit(self, test_db: Any) -> None:
+        for i in range(5):
+            test_db.store_reaction_feedback(
+                chat_id="100",
+                msg_id=i,
+                sender_id="1",
+                emoji="\U0001f44d",
+                timestamp=f"2024-01-0{i + 1}T00:00:00",
+            )
+        results = test_db.get_reactions("100", limit=3)
+        assert len(results) == 3
 
 
 # ---------------------------------------------------------------------------

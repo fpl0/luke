@@ -27,7 +27,7 @@ class TestValidation:
     def test_valid_defaults(self) -> None:
         s = _make()
         assert s.assistant_name == "Luke"
-        assert s.max_concurrent == 5
+        assert s.max_concurrent == 8
 
     def test_missing_token_raises(self) -> None:
         with pytest.raises(ValidationError, match="missing"):

@@ -15,20 +15,20 @@ class Settings(BaseSettings):
     assistant_name: str = "Luke"
     telegram_bot_token: SecretStr = SecretStr("")
     chat_id: str = ""
-    max_concurrent: int = 5
+    max_concurrent: int = 8
     scheduler_interval: float = 60.0
-    recall_content_limit: int = 2000
+    recall_content_limit: int = 3000
     luke_dir: Path = Path.home() / ".luke"  # user-configurable via LUKE_DIR env var
 
     # Timeouts
-    transcription_timeout: float = 300.0  # max seconds for audio transcription
+    transcription_timeout: float = 180.0  # max seconds for audio transcription
     ffmpeg_timeout: float = 30.0  # max seconds for frame extraction
 
     # Media processing
     max_images_per_prompt: int = 5  # max images sent to Claude per turn
 
     # Auto-recall injection
-    auto_recall_limit: int = 5
+    auto_recall_limit: int = 8
     # Composite scoring weights (must sum to 1.0)
     score_weight_relevance: float = 0.4
     score_weight_importance: float = 0.25
@@ -50,7 +50,7 @@ class Settings(BaseSettings):
     decay_rate_goal: float = 0.9997
 
     # Consolidation
-    consolidation_interval: float = 86400.0  # daily (seconds)
+    consolidation_interval: float = 43200.0  # twice daily (seconds)
     consolidation_min_cluster: int = 2
 
     # FTS retention
@@ -58,19 +58,34 @@ class Settings(BaseSettings):
 
     # Reflection + proactive scan + goal execution
     reflection_interval: float = 604800.0  # weekly (seconds)
-    proactive_scan_interval: float = 86400.0  # daily (seconds)
-    goal_execution_interval: float = 43200.0  # every 12 hours (seconds)
+    proactive_scan_interval: float = 21600.0  # every 6 hours (seconds)
+    # Autonomous goal loop (replaces goal_execution)
+    deep_work_interval: float = 14400.0  # 4h between sessions
+    deep_work_max_turns: int = 500
+    deep_work_max_budget_usd: float = 10.0  # per-session cap
+    daily_deep_work_budget_usd: float = 120.0  # daily autonomous spend cap
+    deep_work_model: str = "opus"
 
     # Agent processing
     agent_timeout: float = 1800.0  # max seconds per agent run (30 min)
     max_retries: int = 3  # max agent failures before skipping messages
     agent_max_turns: int = 200  # safety net: 3-5x a complex task
     agent_max_budget_usd: float = 5.0  # cost ceiling per invocation
-    behavior_max_turns: int = 75  # behaviors are focused single-purpose tasks
-    behavior_max_budget_usd: float = 1.0
+    behavior_max_turns: int = 100  # behaviors are focused single-purpose tasks
+    behavior_max_budget_usd: float = 1.5
     agent_model: str = "opus"
     agent_fallback_model: str = "sonnet"
     max_sends_per_run: int = 20  # rate-limit outbound Telegram messages per agent run
+
+    # Model routing per effort level
+    model_low: str = "haiku"  # trivial messages (acks, short replies)
+    model_medium: str = "sonnet"  # casual conversation, simple questions
+    model_high: str = "opus"  # deep reasoning, research, multi-step
+
+    # Behavior model routing
+    consolidation_model: str = "sonnet"
+    reflection_model: str = "sonnet"
+    proactive_scan_model: str = "sonnet"
 
     # Telegram retry
     telegram_send_retries: int = 3
@@ -82,7 +97,7 @@ class Settings(BaseSettings):
     # Maintenance
     cleanup_interval: float = 3600.0  # FTS cleanup + importance decay (seconds)
     error_cooldown: float = 30.0  # min seconds between error messages per chat
-    db_busy_timeout: int = 5000  # SQLite busy_timeout in ms
+    db_busy_timeout: int = 10000  # SQLite busy_timeout in ms
 
     # Graph traversal
     graph_max_depth: int = 2

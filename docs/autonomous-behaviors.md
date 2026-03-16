@@ -1,6 +1,6 @@
 # Autonomous Behaviors
 
-Four agent invocations run on timers, independent of user messages. Each has a specific prompt, budget limit, and purpose.
+Four agent invocations run on timers, independent of user messages. Each has a specific prompt, budget limit, and purpose. Models are routed per behavior via config settings.
 
 ## Scheduler
 
@@ -11,13 +11,16 @@ tick
   ├── Hourly maintenance (no agent invocation)
   │     ├── FTS cleanup — remove archived entries from search index
   │     ├── Importance decay — apply type-specific forgetting rates
-  │     └── Session cleanup — remove stale sessions
+  │     ├── Session cleanup — remove stale sessions + model ratchet
+  │     └── Outbound log pruning — remove dedup entries older than 24h
   │
-  ├── Collect due behaviors → run in parallel (asyncio.gather)
+  ├── Collect due maintenance behaviors → run in parallel (asyncio.gather)
   │     ├── Consolidation (daily)
-  │     ├── Proactive scan (daily)
-  │     ├── Goal execution (every 12h)
+  │     ├── Proactive scan (daily) — can also take lightweight goal actions
   │     └── Reflection (weekly) + FTS pruning
+  │
+  ├── Launch deep work as background task (asyncio.create_task, non-blocking)
+  │     └── Deep work (every 8h, budget-limited) — autonomous goal execution
   │
   └── Check user-created tasks (cron / interval / once)
 ```
@@ -40,31 +43,41 @@ Reviews the past 7 days of memories (up to 20) and last 50 messages. Prompts the
 
 ## Proactive Scan
 
-**Interval:** daily
+**Interval:** daily | **Model:** `settings.proactive_scan_model` (sonnet)
 
-Reviews active goals, recent insights, and 14 days of conversation summaries. The agent decides whether to message the user about approaching deadlines, stale goals, unresolved items, or undelivered follow-ups.
+Reviews active goals, recent insights, and 14 days of conversation summaries (capped at 500 messages). The agent decides whether to message the user or take autonomous action.
 
-Key constraint: the prompt explicitly says *"If nothing warrants a message, do nothing. Don't message just to check in."*
+Can now take lightweight goal actions (research, schedule, write) in addition to messaging. Key constraint: *"Reserve messaging the user for things that genuinely need their input. If nothing warrants action or a message, do nothing."*
 
-## Goal Execution
+## Deep Work
 
-**Interval:** every 12 hours
+**Interval:** every 8 hours | **Model:** `settings.deep_work_model` (opus) | **Replaces:** goal execution
 
-Picks the highest-priority active goal and executes one concrete step — research, code, a question to the user, or a scheduled follow-up. After acting, the agent documents what it did (episode), updates the goal memory with progress, and schedules follow-up if needed.
+Autonomous multi-step goal execution with plan-before-execute pattern:
 
-The "one step" constraint caps budget usage per cycle and keeps progress incremental.
+1. **Plan** — picks highest-priority goal, creates/resumes a work plan at `workspace/plans/{goal_id}.md`
+2. **Execute** — works through steps with self-reflection ("Am I making progress?"), updates plan after each step
+3. **Wrap up** — saves summary episode, marks plan completed/blocked
+
+Key differences from the old goal execution:
+- **Multi-step** — executes as many steps as budget allows, not just one
+- **Plan persistence** — plans survive crashes; next session resumes from saved plan
+- **Budget-limited** — per-session cap (`deep_work_max_budget_usd`) + daily cap (`daily_deep_work_budget_usd`)
+- **Background task** — runs via `asyncio.create_task()`, doesn't block the scheduler loop
+- **Rate-limited** — max 1 outbound message per session (prefer updating plan's Blockers section)
 
 ## Budget
 
-All behaviors run through `_run_behavior()`, which acquires the same global semaphore as message processing and enforces lower limits:
+All behaviors run through `_run_behavior()`, which acquires the behavior semaphore (max 2 concurrent) and the global semaphore, enforcing limits:
 
-| | User Messages | Behaviors |
-|---|---|---|
-| Max turns | 200 | 75 |
-| Max budget | $5.00 | $1.00 |
-| Timeout | 30 min | 30 min |
+| | User Messages | Maintenance Behaviors | Deep Work |
+|---|---|---|---|
+| Max turns | 200 | 75 | 300 |
+| Max budget | $5.00 | $1.00 | $3.00/session, $60/day |
+| Max sends | 20 | 20 | 1 |
+| Timeout | 30 min | 30 min | 30 min |
 
-When multiple behaviors are due, they run via `asyncio.gather()`. Only successful behaviors have their timestamps updated — failures retry on the next tick.
+Maintenance behaviors run via `asyncio.gather()` (awaited). Deep work runs as a background task (non-blocking). Only successful behaviors have their timestamps updated — failures retry on the next tick.
 
 ## User Tasks
 

@@ -241,12 +241,14 @@ class TestRunTask:
             patch("luke.scheduler.run_agent", side_effect=RuntimeError("agent failed")),
             patch("luke.scheduler.db") as mock_db,
         ):
+            mock_db.increment_task_failures.return_value = 1
             await _run_task(task, mock_bot)
 
         mock_db.log_task_run.assert_called_once()
         # Check result is "error"
         assert mock_db.log_task_run.call_args[0][3] == "error"
         mock_db.update_task_last_run.assert_called_once()
+        mock_db.increment_task_failures.assert_called_once()
 
     async def test_failed_once_task_marked_completed(self) -> None:
         mock_bot = AsyncMock()
@@ -257,6 +259,7 @@ class TestRunTask:
             patch("luke.scheduler.run_agent", side_effect=RuntimeError("boom")),
             patch("luke.scheduler.db") as mock_db,
         ):
+            mock_db.increment_task_failures.return_value = 1
             await _run_task(task, mock_bot)
 
         mock_db.update_task_status.assert_called_once_with("test-id", "completed")
@@ -296,7 +299,7 @@ class TestSchedulerLoop:
             mock_settings.consolidation_interval = 999999
             mock_settings.reflection_interval = 999999
             mock_settings.proactive_scan_interval = 999999
-            mock_settings.goal_execution_interval = 999999
+            mock_settings.deep_work_interval = 999999
             mock_db.get_due_tasks.return_value = []
             mock_db.get_behavior_last_run.return_value = None
 

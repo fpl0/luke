@@ -70,6 +70,11 @@ MEMORY_DIRS: dict[str, str] = {
 _DIR_TO_TYPE: dict[str, str] = {v: k for k, v in MEMORY_DIRS.items()}
 
 
+def sanitize_memory_id(raw_id: str) -> str:
+    """Sanitize a memory ID for filesystem and index use."""
+    return re.sub(r"[^\w-]", "_", raw_id).strip("_-")
+
+
 class StoredMessage(BaseModel):
     id: int
     sender_name: str
@@ -136,6 +141,12 @@ def read_memory_body(mem_type: str, mem_id: str, limit: int = 2000) -> str:
         return strip_frontmatter(path.read_text())[:limit]
     except FileNotFoundError:
         return ""
+
+
+def get_memory_updated(mem_id: str) -> str | None:
+    """Return the 'updated' ISO timestamp for a memory, or None if not found."""
+    row = _db().execute("SELECT updated FROM memory_meta WHERE id = ?", (mem_id,)).fetchone()
+    return str(row["updated"]) if row else None
 
 
 def read_frontmatter(path: Path) -> dict[str, Any]:
@@ -315,6 +326,14 @@ CREATE TABLE IF NOT EXISTS cost_log (
     timestamp       TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_cost_ts ON cost_log(timestamp);
+
+CREATE TABLE IF NOT EXISTS outbound_log (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id      TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    timestamp    TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_outbound_hash ON outbound_log(chat_id, content_hash);
 """
 
 
@@ -325,9 +344,12 @@ def _vec_rowid(mem_id: str) -> int:
 
 
 def init() -> None:
-    """Create tables (including sqlite-vec virtual table)."""
+    """Create tables (including sqlite-vec virtual table) and run migrations."""
     db = _db()
     db.executescript(_SCHEMA)
+    # Migration: add consecutive_failures column to tasks table
+    with contextlib.suppress(sqlite3.OperationalError):
+        db.execute("ALTER TABLE tasks ADD COLUMN consecutive_failures INTEGER NOT NULL DEFAULT 0")
     db.commit()
 
 
@@ -469,6 +491,45 @@ def store_reaction_feedback(
     _commit(conn)
 
 
+def get_reactions(
+    chat_id: str,
+    *,
+    msg_id: int | None = None,
+    sender_id: str | None = None,
+    sentiment: str | None = None,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    """Query stored reactions with optional filters. Returns newest first."""
+    clauses = ["r.chat_id = ?"]
+    params: list[Any] = [chat_id]
+    if msg_id is not None:
+        clauses.append("r.msg_id = ?")
+        params.append(msg_id)
+    if sender_id is not None:
+        clauses.append("r.sender_id = ?")
+        params.append(sender_id)
+    if sentiment is not None:
+        clauses.append("r.sentiment = ?")
+        params.append(sentiment)
+    where = " AND ".join(clauses)
+    params.append(limit)
+    rows = (
+        _db()
+        .execute(
+            f"""SELECT r.msg_id, r.sender_id, r.emoji, r.sentiment, r.timestamp,
+                       m.sender AS msg_sender, SUBSTR(m.content, 1, 120) AS msg_preview
+                FROM reaction_feedback r
+                LEFT JOIN messages m ON m.chat_id = r.chat_id AND m.msg_id = r.msg_id
+                WHERE {where}
+                ORDER BY r.timestamp DESC
+                LIMIT ?""",
+            params,
+        )
+        .fetchall()
+    )
+    return [dict(r) for r in rows]
+
+
 def get_message_summaries(chat_id: str, days: int = 14) -> list[dict[str, Any]]:
     """Group messages by date for the last N days. Returns date + previews."""
     cutoff = (datetime.now(UTC) - timedelta(days=days)).isoformat()
@@ -477,7 +538,8 @@ def get_message_summaries(chat_id: str, days: int = 14) -> list[dict[str, Any]]:
         .execute(
             """SELECT DATE(ts) AS date, sender AS sender_name,
                   SUBSTR(content, 1, 120) AS preview
-           FROM messages WHERE chat_id = ? AND ts >= ? ORDER BY ts""",
+           FROM messages WHERE chat_id = ? AND ts >= ?
+           ORDER BY ts DESC LIMIT 500""",
             (chat_id, cutoff),
         )
         .fetchall()
@@ -515,16 +577,16 @@ def clear_sessions() -> None:
     _commit(conn)
 
 
-def cleanup_stale_sessions(timeout_seconds: float) -> int:
-    """Remove sessions not updated within timeout_seconds. Returns count."""
+def cleanup_stale_sessions(timeout_seconds: float) -> list[str]:
+    """Remove sessions not updated within timeout_seconds. Returns cleaned chat IDs."""
     cutoff = (datetime.now(UTC) - timedelta(seconds=timeout_seconds)).isoformat()
     conn = _db()
-    cur = conn.execute(
-        "DELETE FROM sessions WHERE updated_at < ? AND updated_at != ''",
+    rows = conn.execute(
+        "DELETE FROM sessions WHERE updated_at < ? AND updated_at != '' RETURNING chat_id",
         (cutoff,),
-    )
+    ).fetchall()
     _commit(conn)
-    return cur.rowcount
+    return [str(r[0]) for r in rows]
 
 
 # ---------------------------------------------------------------------------
@@ -743,16 +805,18 @@ def _semantic_search(
     for r in meta_rows:
         dist = mid_dist.get(r["id"], 0.0)
         similarity = 1.0 / (1.0 + dist)
-        scored.append({
-            "id": r["id"],
-            "type": r["type"],
-            "title": r["title"],
-            "score": similarity,
-            "importance": r["importance"],
-            "access_count": r["access_count"],
-            "useful_count": r["useful_count"],
-            "updated": r["updated"],
-        })
+        scored.append(
+            {
+                "id": r["id"],
+                "type": r["type"],
+                "title": r["title"],
+                "score": similarity,
+                "importance": r["importance"],
+                "access_count": r["access_count"],
+                "useful_count": r["useful_count"],
+                "updated": r["updated"],
+            }
+        )
     scored.sort(key=lambda x: x["score"], reverse=True)
     return scored[:limit]
 
@@ -1162,9 +1226,7 @@ def recall(
     return cast(list[MemoryResult], ranked)
 
 
-def _get_neighbors_batch(
-    db: sqlite3.Connection, node_ids: list[str]
-) -> list[dict[str, Any]]:
+def _get_neighbors_batch(db: sqlite3.Connection, node_ids: list[str]) -> list[dict[str, Any]]:
     """Get bidirectional graph neighbors of multiple memory nodes in one query."""
     if not node_ids:
         return []
@@ -1553,3 +1615,101 @@ def get_cost_report(period: str = "month") -> str:
             lines.append(f"    {d['day']}: ${d['total']:.4f}")
 
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Outbound message dedup
+# ---------------------------------------------------------------------------
+
+
+def log_outbound(chat_id: str, content_hash: str) -> None:
+    """Record an outbound message hash for dedup detection."""
+    db = _db()
+    db.execute(
+        "INSERT INTO outbound_log (chat_id, content_hash) VALUES (?, ?)",
+        (chat_id, content_hash),
+    )
+    _commit(db)
+
+
+def is_duplicate_outbound(chat_id: str, content_hash: str, window_seconds: int = 300) -> bool:
+    """Check if the same content hash was sent recently."""
+    row = (
+        _db()
+        .execute(
+            "SELECT 1 FROM outbound_log "
+            "WHERE chat_id = ? AND content_hash = ? "
+            "AND timestamp >= datetime('now', ?)",
+            (chat_id, content_hash, f"-{window_seconds} seconds"),
+        )
+        .fetchone()
+    )
+    return row is not None
+
+
+def cleanup_outbound_log(retention_hours: int = 24) -> int:
+    """Remove outbound log entries older than retention period."""
+    db = _db()
+    cur = db.execute(
+        "DELETE FROM outbound_log WHERE timestamp < datetime('now', ?)",
+        (f"-{retention_hours} hours",),
+    )
+    _commit(db)
+    return cur.rowcount
+
+
+# ---------------------------------------------------------------------------
+# Task failure tracking
+# ---------------------------------------------------------------------------
+
+
+def increment_task_failures(task_id: str) -> int:
+    """Increment consecutive failure count and return the new value."""
+    conn = _db()
+    row = conn.execute(
+        "UPDATE tasks SET consecutive_failures = consecutive_failures + 1 "
+        "WHERE id = ? RETURNING consecutive_failures",
+        (task_id,),
+    ).fetchone()
+    _commit(conn)
+    return int(row[0]) if row else 0
+
+
+def reset_task_failures(task_id: str) -> None:
+    """Reset consecutive failure count to 0."""
+    db = _db()
+    db.execute("UPDATE tasks SET consecutive_failures = 0 WHERE id = ?", (task_id,))
+    _commit(db)
+
+
+# ---------------------------------------------------------------------------
+# Cost anomaly detection
+# ---------------------------------------------------------------------------
+
+
+def get_rolling_avg_cost(days: int = 7) -> float:
+    """Average cost per run over the last N days."""
+    row = (
+        _db()
+        .execute(
+            "SELECT COALESCE(AVG(cost_usd), 0) AS avg_per_run "
+            "FROM cost_log WHERE timestamp >= datetime('now', ?)",
+            (f"-{days} days",),
+        )
+        .fetchone()
+    )
+    return float(row["avg_per_run"]) if row else 0.0
+
+
+def get_daily_deep_work_cost() -> float:
+    """Sum of deep work behavior costs today."""
+    row = (
+        _db()
+        .execute(
+            "SELECT COALESCE(SUM(cost_usd), 0) AS total "
+            "FROM cost_log WHERE source = 'behavior:deep_work' "
+            "AND timestamp >= date('now')",
+        )
+        .fetchone()
+    )
+    return float(row["total"]) if row else 0.0

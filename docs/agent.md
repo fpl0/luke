@@ -8,11 +8,11 @@ Tools are built per invocation in a closure that captures `chat_id` and `bot`, s
 
 ### Categories
 
-**Telegram (14)** — `send_message`, `send_photo`, `send_document`, `send_voice`, `send_video`, `send_location`, `send_poll`, `send_buttons`, `reply`, `forward`, `react`, `edit_message`, `delete_message`, `pin`
+**Telegram (15)** — `send_message`, `send_photo`, `send_document`, `send_voice`, `send_video`, `send_location`, `send_poll`, `send_buttons`, `reply`, `forward`, `react`, `get_reactions`, `edit_message`, `delete_message`, `pin`
 
 **Memory (8)** — `remember`, `recall`, `recall_conversation`, `forget`, `connect`, `restore`, `bulk_memory`, `memory_history`
 
-**Scheduling (1)** — `schedule_task` (cron, interval, once)
+**Scheduling (3)** — `schedule_task`, `list_tasks`, `delete_task`
 
 **Monitoring (1)** — `get_cost_report` (usage stats by period)
 
@@ -26,23 +26,31 @@ Tools are built per invocation in a closure that captures `chat_id` and `bot`, s
 
 Four hooks customize agent behavior at lifecycle points:
 
-**Stop** — When the session ends, prompts the agent to persist what it learned: new entities, episodes, insights, goals, and scheduled follow-ups. Without this hook, learned information is lost when the session ends.
+**Stop** — When the session ends, prompts the agent to persist what it learned: new entities, episodes, insights, goals, scheduled follow-ups, and a `conversation-state-latest` episode for continuity (topic, mood, unresolved items). Without this hook, learned information is lost when the session ends.
 
-**PreToolUse** — Counts outbound Telegram sends per run and blocks after a threshold (default: 20). Counter is per-invocation.
+**PreToolUse** — Counts outbound Telegram sends per run and blocks after a threshold (default: 20, overridable per invocation via `max_sends`). Counter is per-invocation. Deep work sessions use `max_sends=1`.
 
 **PreCompact** — When the SDK trims context, instructs the agent to preserve memory IDs, pending actions, active goals, and relationship links in the compaction summary.
 
 **Notification** — Logs SDK notifications to structlog.
 
-## Effort Classification
+## Smart Model Routing
 
-`_classify_effort()` categorizes messages before the agent runs:
+`_classify_effort()` categorizes messages and selects the model tier:
 
-- **Low** (<15 words, no questions, no media) → thinking disabled
-- **High** (>150 words, multiple questions, media, code blocks, complex keywords) → extended thinking (16K token budget)
-- **Medium** (everything else) → adaptive thinking
+| Effort | Model | Thinking | Use Case |
+|--------|-------|----------|----------|
+| Low | `settings.model_low` (haiku) | disabled | <15 words, no questions, no media |
+| Medium | `settings.model_medium` (sonnet) | adaptive | casual conversation, simple questions |
+| High | `settings.model_high` (opus) | enabled (16K budget) | deep reasoning, research, multi-step |
 
 Runs *before* memory injection so injected context doesn't skew the heuristic.
+
+**Post-classification boosts:**
+- **Memory-aware boost** — if recalled memories include goals or procedures, model is bumped to at least sonnet
+- **Session ratchet** — once a conversation escalates to a higher model, it stays there for the session (resets on session timeout or error)
+
+**Tool scoping** — each tier sees a different tool set. Haiku gets only basic send/recall tools. Sonnet gets most tools (excluding `schedule_task`, `bulk_memory`). Opus gets full access.
 
 ## Sub-Agents
 
@@ -69,10 +77,25 @@ Two layers:
 
 See [persona](persona.md).
 
+## Conversation Continuity
+
+Each conversation starts with auto-injected context for continuity:
+
+1. **Conversation state** — the Stop hook saves a `conversation-state-latest` episode. On the next message, `_get_conversation_state()` loads it (with staleness marking if >24h old).
+2. **Fallback** — if no saved state exists, synthesizes context from the last 10 messages (no LLM call, just formatting).
+3. **Concurrent loading** — conversation state, memory recall, and prompt building all run concurrently via `asyncio.gather()`.
+
+## Self-Monitoring
+
+- **Duplicate detection** — `send_long_message()` checks SHA-256 hash against `outbound_log` table before sending (5-min window)
+- **Task failure alerting** — scheduler alerts user after 3 consecutive task failures
+- **Cost anomaly detection** — logs warning when a single run exceeds 3x the 7-day per-run average (and >$2)
+- **Session loss detection** — logs warning when session ID changes unexpectedly
+
 ## Key Configuration
 
-The `ClaudeAgentOptions` passed to the SDK include: model with fallback, explicit allowed tool list (Claude Code built-ins + `mcp__luke__*` wildcard), `bypassPermissions` mode, project + user setting sources, dynamic thinking config, turn and budget limits, file checkpointing, and Docker sandbox.
+The `ClaudeAgentOptions` passed to the SDK include: model (selected per-message via routing), fallback model, tier-scoped `allowed_tools` list, `bypassPermissions` mode, project + user setting sources, dynamic thinking config, turn and budget limits, file checkpointing, and Docker sandbox.
 
 ## Message Chunking
 
-`send_long_message()` splits responses at Telegram's 4096-character limit, preferring newline boundaries. Each chunk retries with exponential backoff and falls back to plaintext on HTML parse failure.
+`send_long_message()` splits responses at Telegram's 4096-character limit, preferring newline boundaries. Each chunk retries with exponential backoff and falls back to plaintext on HTML parse failure. Duplicate messages are blocked via content hash.

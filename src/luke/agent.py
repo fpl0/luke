@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
 from collections.abc import AsyncIterator
@@ -47,7 +48,7 @@ from structlog.stdlib import BoundLogger
 
 from . import db
 from .config import settings
-from .db import MEMORY_DIRS, read_frontmatter, read_memory_body
+from .db import MEMORY_DIRS, read_frontmatter, read_memory_body, sanitize_memory_id
 
 log: BoundLogger = structlog.get_logger()
 
@@ -118,6 +119,11 @@ async def _send_chunk(bot: Bot, chat_id: int, text: str, **kwargs: Any) -> None:
 
 async def send_long_message(bot: Bot, chat_id: int, text: str, **kwargs: Any) -> None:
     """Send a message, splitting into chunks if it exceeds Telegram's 4096 char limit."""
+    # Duplicate detection: skip if same content was sent recently
+    content_hash = hashlib.sha256(text.encode()).hexdigest()[:16]
+    if db.is_duplicate_outbound(str(chat_id), content_hash):
+        log.warning("duplicate_message_blocked", chat=chat_id, text=_trunc(text))
+        return
     log.info("msg_out", chat=chat_id, text=_trunc(text))
     while text:
         if len(text) <= _TG_MAX_MSG_LEN:
@@ -131,6 +137,7 @@ async def send_long_message(bot: Bot, chat_id: int, text: str, **kwargs: Any) ->
             cut = max_len
         await _send_chunk(bot, chat_id=chat_id, text=text[:cut] + "\n…", **kwargs)
         text = text[cut:].lstrip("\n")
+    db.log_outbound(str(chat_id), content_hash)
 
 
 _VALID_MEMORY_TYPES: frozenset[str] = frozenset(MEMORY_DIRS)
@@ -173,7 +180,7 @@ class AgentResult:
 
 
 def _build_tools(chat_id: str, bot: Bot) -> Any:
-    """Create the in-process MCP server with all 24 tools."""
+    """Create the in-process MCP server with all 25 tools."""
     root = settings.luke_dir
 
     # Allowed roots for file-sending tools (prevents arbitrary path access)
@@ -203,8 +210,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
 
     @tool(
         "send_message",
-        "Send a text message. Auto-splits if >4096 chars. "
-        "Use Telegram HTML (<b>, <i>, <code>, <pre>), NOT markdown.",
+        "Send text. HTML tags (<b>,<i>,<code>,<pre>), NOT markdown. Auto-splits at 4096.",
         {"chat_id": str, "text": str, "silent": bool},
         annotations=_OPEN_WORLD,
     )
@@ -219,7 +225,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
 
     @tool(
         "send_photo",
-        "Send a photo from a local file path",
+        "Send photo from local path",
         {"chat_id": str, "path": str, "caption": str},
         annotations=_OPEN_WORLD,
     )
@@ -236,7 +242,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
 
     @tool(
         "send_document",
-        "Send a file/document",
+        "Send file/document from local path",
         {"chat_id": str, "path": str, "caption": str},
         annotations=_OPEN_WORLD,
     )
@@ -253,7 +259,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
 
     @tool(
         "send_voice",
-        "Send a voice message from a local .ogg file",
+        "Send voice from local .ogg file",
         {"chat_id": str, "path": str},
         annotations=_OPEN_WORLD,
     )
@@ -266,7 +272,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
 
     @tool(
         "send_video",
-        "Send a video file",
+        "Send video from local path",
         {"chat_id": str, "path": str, "caption": str},
         annotations=_OPEN_WORLD,
     )
@@ -283,7 +289,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
 
     @tool(
         "send_location",
-        "Send a GPS location",
+        "Send GPS location",
         {"chat_id": str, "latitude": float, "longitude": float},
         annotations=_OPEN_WORLD,
     )
@@ -297,7 +303,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
 
     @tool(
         "send_poll",
-        "Create a poll in a chat. options: list of strings, e.g. ['Yes', 'No']",
+        "Create poll. options: list of strings e.g. ['Yes','No']",
         {"chat_id": str, "question": str, "options": list, "is_anonymous": bool},
         annotations=_OPEN_WORLD,
     )
@@ -319,9 +325,8 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
 
     @tool(
         "send_buttons",
-        "Send a message with inline keyboard buttons. "
-        "buttons: list of rows, each row a list of {text, data} objects. "
-        "When pressed, you receive '[Button pressed: data]' as a new message.",
+        "Send message with inline buttons. buttons: rows of [{text,data}]. "
+        "Pressed button sends '[Button pressed: data]' as new message.",
         {"chat_id": str, "text": str, "buttons": list},
         annotations=_OPEN_WORLD,
     )
@@ -346,7 +351,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
 
     @tool(
         "reply",
-        "Reply to a specific message by its msg: ID from the prompt. Use Telegram HTML formatting.",
+        "Reply to msg:{id} from prompt. HTML tags, NOT markdown.",
         {"chat_id": str, "message_id": str, "text": str},
         annotations=_OPEN_WORLD,
     )
@@ -361,7 +366,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
 
     @tool(
         "forward",
-        "Forward a message to another chat",
+        "Forward message to another chat",
         {"from_chat_id": str, "to_chat_id": str, "message_id": str},
         annotations=_OPEN_WORLD,
     )
@@ -377,7 +382,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
 
     @tool(
         "react",
-        "React to a message with an emoji",
+        "React with emoji",
         {"chat_id": str, "message_id": str, "emoji": str},
         annotations=_OPEN_WORLD,
     )
@@ -390,8 +395,37 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
         return _ok("Reacted")
 
     @tool(
+        "get_reactions",
+        "Query emoji reactions received on messages. "
+        "Filter by msg_id, sender_id, or sentiment (positive/negative/neutral). "
+        "Returns newest first with message previews.",
+        {"msg_id": int, "sender_id": str, "sentiment": str, "limit": int},
+        annotations=_READ_ONLY,
+    )
+    async def t_get_reactions(args: dict[str, Any]) -> dict[str, Any]:
+        reactions = db.get_reactions(
+            chat_id,
+            msg_id=args.get("msg_id"),
+            sender_id=args.get("sender_id"),
+            sentiment=args.get("sentiment"),
+            limit=args.get("limit", 20),
+        )
+        if not reactions:
+            return _ok("No reactions found")
+        lines: list[str] = []
+        for r in reactions:
+            preview = r.get("msg_preview") or "(message not found)"
+            sender = r.get("msg_sender") or "?"
+            lines.append(
+                f"{r['emoji']} ({r['sentiment']}) on msg:{r['msg_id']} "
+                f"from {sender}: {preview} "
+                f"— reacted by {r['sender_id']} at {r['timestamp']}"
+            )
+        return _ok("\n".join(lines))
+
+    @tool(
         "edit_message",
-        "Edit a previously sent message. Use Telegram HTML formatting.",
+        "Edit sent message. HTML tags, NOT markdown.",
         {"chat_id": str, "message_id": str, "text": str},
         annotations=_DESTRUCTIVE,
     )
@@ -405,7 +439,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
 
     @tool(
         "delete_message",
-        "Delete a message",
+        "Delete message",
         {"chat_id": str, "message_id": str},
         annotations=_DESTRUCTIVE,
     )
@@ -415,7 +449,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
 
     @tool(
         "pin",
-        "Pin a message in a chat",
+        "Pin message",
         {"chat_id": str, "message_id": str},
         annotations=_OPEN_WORLD,
     )
@@ -427,8 +461,8 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
 
     @tool(
         "schedule_task",
-        "Schedule a recurring or one-time task. schedule_type: 'cron', 'interval', or 'once'. "
-        "schedule_value: cron expression, milliseconds, or ISO timestamp.",
+        "Schedule task. type: cron|interval|once. "
+        "value: cron expr, milliseconds, or ISO timestamp.",
         {"prompt": str, "schedule_type": str, "schedule_value": str},
         annotations=_OPEN_WORLD,
     )
@@ -446,7 +480,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
 
     @tool(
         "list_tasks",
-        "List all scheduled tasks.",
+        "List scheduled tasks",
         {},
         annotations=_OPEN_WORLD,
     )
@@ -464,7 +498,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
 
     @tool(
         "delete_task",
-        "Delete a scheduled task by ID.",
+        "Delete scheduled task by ID",
         {"task_id": str},
         annotations=_OPEN_WORLD,
     )
@@ -477,9 +511,8 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
 
     @tool(
         "remember",
-        "Save a memory. type: 'entity' | 'episode' | 'procedure' | 'insight' | 'goal'. "
-        "importance: 0.1-2.0 (default 1.0). Higher = decays slower. "
-        "Returns change summary if updating an existing entity.",
+        "Save memory. type: entity|episode|procedure|insight|goal. "
+        "importance: 0.1-2.0 (default 1.0). Returns change summary on entity update.",
         {
             "id": str,
             "type": str,
@@ -494,7 +527,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
         mem_type: str = args["type"]
         if mem_type not in _VALID_MEMORY_TYPES:
             return _ok(f"Invalid type: {mem_type}")
-        mem_id = re.sub(r"[^\w-]", "_", args["id"]).strip("_-")
+        mem_id = sanitize_memory_id(args["id"])
         if not mem_id:
             return _ok("Error: id must contain at least one alphanumeric character")
         title = args["title"].replace("\n", " ").replace("\r", " ")
@@ -548,8 +581,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
 
     @tool(
         "recall",
-        "Search memories. Combine: query, type, after/before, related_to. "
-        "Uses hybrid FTS + semantic search with intelligent ranking.",
+        "Search memories. Combine: query, type, after/before, related_to.",
         {"query": str, "type": str, "after": str, "before": str, "related_to": str},
         annotations=_READ_ONLY,
     )
@@ -573,7 +605,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
 
     @tool(
         "forget",
-        "Archive a memory (keeps file, removes from active index)",
+        "Archive memory (keeps file, removes from index)",
         {"id": str},
         annotations=_DESTRUCTIVE,
     )
@@ -583,8 +615,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
 
     @tool(
         "recall_conversation",
-        "Retrieve all memories from a time window chronologically. "
-        "Useful for 'what happened last Tuesday?' queries.",
+        "Retrieve memories from a time window chronologically.",
         {"after": str, "before": str},
         annotations=_READ_ONLY,
     )
@@ -606,7 +637,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
 
     @tool(
         "connect",
-        "Link two memories with a named relationship",
+        "Link two memories with a relationship",
         {"from_id": str, "to_id": str, "relationship": str},
     )
     async def mem_link(args: dict[str, Any]) -> dict[str, Any]:
@@ -622,7 +653,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
 
     @tool(
         "restore",
-        "Restore a previously archived memory back to active status",
+        "Restore archived memory to active",
         {"id": str},
     )
     async def mem_restore(args: dict[str, Any]) -> dict[str, Any]:
@@ -633,9 +664,8 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
 
     @tool(
         "bulk_memory",
-        "Bulk operations on memories. action: 'retag' | 'relink' | 'archive'. "
-        "ids: list of memory IDs. tags: new tags (for retag). "
-        "link_to: target ID, relationship: link name (for relink).",
+        "Bulk ops on memories. action: retag|relink|archive. "
+        "ids: memory IDs. tags (retag), link_to+relationship (relink).",
         {
             "action": str,
             "ids": list,
@@ -671,7 +701,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
 
     @tool(
         "memory_history",
-        "View change history for a memory (entity updates, content changes over time)",
+        "View change history for a memory",
         {"id": str},
         annotations=_READ_ONLY,
     )
@@ -689,7 +719,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
 
     @tool(
         "get_cost_report",
-        "Get cost and usage statistics. period: 'today' | 'week' | 'month' | 'all'",
+        "Cost/usage stats. period: today|week|month|all",
         {"period": str},
         annotations=_READ_ONLY,
     )
@@ -712,6 +742,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
             t_reply,
             t_fwd,
             t_react,
+            t_get_reactions,
             t_edit,
             t_del,
             t_pin,
@@ -750,7 +781,10 @@ async def _stop_hook(
             "what approaches you considered, why you chose your solution, what worked or didn't.\n"
             "4. Did you notice a pattern or preference? Save an insight.\n"
             "5. Is there anything pending that needs follow-up? Schedule a reminder.\n"
-            "6. Did the user mention wanting to achieve something? Create or update a goal."
+            "6. Did the user mention wanting to achieve something? Create or update a goal.\n"
+            "7. Save a 'conversation-state-latest' episode: what you discussed, "
+            "user's mood/energy, anything unresolved or promised, what's likely to "
+            "come up next. Keep under 200 words. Overwrite the previous one if it exists."
         )
     }
 
@@ -788,6 +822,93 @@ async def _notification_hook(
 
 
 # ---------------------------------------------------------------------------
+# Tool scoping per model tier
+# ---------------------------------------------------------------------------
+
+_BUILTINS_ALL: list[str] = [
+    "Bash",
+    "Read",
+    "Write",
+    "Edit",
+    "Glob",
+    "Grep",
+    "WebSearch",
+    "WebFetch",
+    "Task",
+    "TaskOutput",
+    "TaskStop",
+    "TeamCreate",
+    "TeamDelete",
+    "SendMessage",
+    "TodoWrite",
+    "ToolSearch",
+    "Skill",
+    "NotebookEdit",
+]
+
+_BUILTINS_HAIKU: list[str] = ["Read", "Glob", "Grep"]
+
+# All bare tool names (no prefix) — must match tools in _build_tools().
+# Validated by test_all_mcp_tool_names_matches_registered.
+_ALL_MCP_TOOL_NAMES: list[str] = [
+    "send_message",
+    "send_photo",
+    "send_document",
+    "send_voice",
+    "send_video",
+    "send_location",
+    "send_poll",
+    "send_buttons",
+    "reply",
+    "forward",
+    "react",
+    "get_reactions",
+    "edit_message",
+    "delete_message",
+    "pin",
+    "schedule_task",
+    "list_tasks",
+    "delete_task",
+    "remember",
+    "recall",
+    "recall_conversation",
+    "forget",
+    "connect",
+    "restore",
+    "bulk_memory",
+    "memory_history",
+    "get_cost_report",
+]
+
+_MCP_TOOLS_HAIKU: frozenset[str] = frozenset(
+    {"send_message", "reply", "react", "remember", "recall", "recall_conversation"}
+)
+_MCP_TOOLS_SONNET_EXCLUDE: frozenset[str] = frozenset({"schedule_task", "bulk_memory"})
+
+
+def _mcp(name: str) -> str:
+    return f"mcp__luke__{name}"
+
+
+# Pre-computed per-tier tool lists (inputs are module-level constants)
+_ALLOWED_HAIKU: list[str] = _BUILTINS_HAIKU + [_mcp(n) for n in _MCP_TOOLS_HAIKU]
+_ALLOWED_SONNET: list[str] = _BUILTINS_ALL + [
+    _mcp(n) for n in _ALL_MCP_TOOL_NAMES if n not in _MCP_TOOLS_SONNET_EXCLUDE
+]
+_ALLOWED_OPUS: list[str] = [*_BUILTINS_ALL, "mcp__luke__*"]
+
+
+def _allowed_tools_for_model(model: str) -> list[str]:
+    """Return the allowed_tools list scoped to the model tier."""
+    if model == "haiku":
+        return _ALLOWED_HAIKU
+    if model == "sonnet":
+        return _ALLOWED_SONNET
+    # opus and everything else: full access
+    return _ALLOWED_OPUS
+
+
+# ---------------------------------------------------------------------------
 # Run agent
 # ---------------------------------------------------------------------------
 
@@ -798,12 +919,15 @@ async def run_agent(
     prompt: str | list[dict[str, Any]],
     session_id: str | None,
     bot: Bot,
+    model: str | None = None,
     max_turns: int | None = None,
     max_budget_usd: float | None = None,
+    max_sends: int | None = None,
     effort: Literal["low", "medium", "high", "max"] | None = None,
     thinking: ThinkingConfig | None = None,
 ) -> AgentResult:
     root = settings.luke_dir
+    effective_model = model or settings.agent_model
 
     # Load LUKE.md persona (separate from project CLAUDE.md which is dev instructions)
     persona_path = root / "LUKE.md"
@@ -811,6 +935,7 @@ async def run_agent(
 
     # Per-run send rate-limit counter (closed over by PreToolUse hook)
     send_count = {"n": 0}
+    effective_max_sends = max_sends if max_sends is not None else settings.max_sends_per_run
 
     async def _pre_tool_hook(
         input_data: PreToolUseHookInput,
@@ -821,7 +946,7 @@ async def run_agent(
         log.info("tool_use", tool=tool_name, input=_trunc(str(input_data["tool_input"])))
         if tool_name in _SEND_TOOLS:
             send_count["n"] += 1
-            if send_count["n"] > settings.max_sends_per_run:
+            if send_count["n"] > effective_max_sends:
                 return {"decision": "block", "reason": "Rate limit: too many outbound messages"}
         return {}
 
@@ -832,33 +957,15 @@ async def run_agent(
         "Notification": [HookMatcher(hooks=[cast(HookCallback, _notification_hook)])],
     }
 
+    allowed = _allowed_tools_for_model(effective_model)
+
     options = ClaudeAgentOptions(
         cwd=str(root),
         resume=session_id,
-        model=settings.agent_model,
+        model=effective_model,
         fallback_model=settings.agent_fallback_model,
         system_prompt={"type": "preset", "preset": "claude_code", "append": persona},
-        allowed_tools=[
-            "Bash",
-            "Read",
-            "Write",
-            "Edit",
-            "Glob",
-            "Grep",
-            "WebSearch",
-            "WebFetch",
-            "Task",
-            "TaskOutput",
-            "TaskStop",
-            "TeamCreate",
-            "TeamDelete",
-            "SendMessage",
-            "TodoWrite",
-            "ToolSearch",
-            "Skill",
-            "NotebookEdit",
-            "mcp__luke__*",
-        ],
+        allowed_tools=allowed,
         permission_mode="bypassPermissions",
         setting_sources=["project", "user"],
         mcp_servers={

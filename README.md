@@ -10,7 +10,7 @@ Heavily inspired by [NanoClaw](https://github.com/qwibitai/nanoclaw). Where Nano
 - **Execute code** — Python, shell, anything via Claude Code's sandboxed Bash
 - **Browse the web** — search, fetch pages, extract data
 - **Research** — spawn sub-agents that search in parallel, synthesize findings
-- **Automate** — scheduled tasks via cron, interval, or one-time triggers
+- **Automate** — scheduled tasks via cron, interval, or one-time triggers; autonomous deep work on goals
 - **Remember** — structured long-term memory with FTS5 search, relationship graphs, and temporal queries
 - **Communicate** — photos, documents, voice, video, polls, inline keyboards, reactions, location sharing
 
@@ -29,14 +29,14 @@ Claude handles everything: Python 3.14, uv, dependencies, BotFather walkthrough,
 
 ## Architecture
 
-Single Python process: [aiogram](https://docs.aiogram.dev/) dispatches Telegram messages → Claude Agent SDK powers the agent → responds via Telegram. An in-process MCP server exposes 24 tools. SQLite stores everything.
+Single Python process: [aiogram](https://docs.aiogram.dev/) dispatches Telegram messages → Claude Agent SDK powers the agent → responds via Telegram. An in-process MCP server exposes 27 tools. Smart model routing selects haiku/sonnet/opus per message. SQLite stores everything.
 
 ```
 Telegram → aiogram dispatcher → Claude Agent SDK → responds
                                        │
                          ┌─────────────┼─────────────┐
                          │             │             │
-                    24 MCP tools   Built-in tools  Sub-agents
+                    27 MCP tools   Built-in tools  Sub-agents
                     (Telegram,     (Bash, Web,     (parallel
                      memory,       files, etc.)    research)
                      scheduling)
@@ -72,11 +72,11 @@ luke/
 ├── .env                     # Telegram token + Claude auth (gitignored)
 ├── src/luke/
 │   ├── app.py               # Telegram handlers + agent dispatch
-│   ├── agent.py             # Claude SDK client + 24 MCP tools
+│   ├── agent.py             # Claude SDK client + 27 MCP tools + model routing
 │   ├── db.py                # SQLite: messages, sessions, memory FTS5
 │   ├── config.py            # pydantic-settings from .env
 │   ├── scheduler.py         # Cron/interval/once task execution
-│   ├── behaviors.py         # Consolidation, reflection, proactive scan, goal execution
+│   ├── behaviors.py         # Consolidation, reflection, proactive scan, deep work
 │   ├── media.py             # Image encoding, video frames, whisper transcription
 │   └── templates/
 │       └── LUKE.md          # Default persona template (seeded to LUKE_DIR on first run)

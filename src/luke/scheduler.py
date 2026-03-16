@@ -14,21 +14,22 @@ from structlog.stdlib import BoundLogger
 
 from . import db
 from .agent import run_agent
-from .behaviors import run_consolidation, run_goal_execution, run_proactive_scan, run_reflection
+from .behaviors import run_consolidation, run_deep_work, run_proactive_scan, run_reflection
 from .config import settings
 from .db import TaskRecord, ensure_utc
 
 log: BoundLogger = structlog.get_logger()
 
+# Track long-running deep work task across scheduler ticks
+_deep_work_task: asyncio.Task[None] | None = None
+
 # Cap concurrent behaviors to avoid starving message processing.
-# With max_concurrent=5 for the main semaphore, limiting behaviors to 2
-# guarantees at least 3 slots remain available for user messages.
-_behavior_sem = asyncio.Semaphore(2)
+# With max_concurrent=8 for the main semaphore, limiting behaviors to 3
+# guarantees at least 5 slots remain available for user messages.
+_behavior_sem = asyncio.Semaphore(3)
 
 
-async def _limit_behavior(
-    cap: asyncio.Semaphore, coro: Coroutine[object, object, None]
-) -> None:
+async def _limit_behavior(cap: asyncio.Semaphore, coro: Coroutine[object, object, None]) -> None:
     """Run a behavior coroutine under a concurrency limit."""
     async with cap:
         await coro
@@ -100,6 +101,7 @@ async def _run_task(task: TaskRecord, bot: Bot) -> None:
 
         finished = datetime.now(UTC).isoformat()
         db.log_task_run(task_id, started, finished, "ok")
+        db.reset_task_failures(task_id)
         log.info(
             "task_done",
             task_id=task_id,
@@ -115,6 +117,15 @@ async def _run_task(task: TaskRecord, bot: Bot) -> None:
         finished = datetime.now(UTC).isoformat()
         db.log_task_run(task_id, started, finished, "error")
         log.exception("Task failed", task_id=task_id)
+        count = db.increment_task_failures(task_id)
+        if count >= 3:
+            try:
+                await bot.send_message(
+                    chat_id=int(settings.chat_id),
+                    text=f"⚠️ Task '{task['prompt'][:50]}' has failed {count} times in a row.",
+                )
+            except Exception:
+                log.exception("Failed to send task failure alert")
         # Mark failed once-tasks as completed to prevent retry storms
         if task["schedule_type"] == "once":
             db.update_task_status(task_id, "completed")
@@ -133,6 +144,7 @@ async def start_scheduler_loop(
 
     If *shutdown* is provided, the loop exits when the event is set.
     """
+    global _deep_work_task
     log.info("Scheduler started", interval=settings.scheduler_interval)
     now_mono = time.monotonic()
     now_wall = datetime.now(UTC)
@@ -150,7 +162,7 @@ async def start_scheduler_loop(
     last_consolidation = _load_offset("consolidation", settings.consolidation_interval)
     last_reflection = _load_offset("reflection", settings.reflection_interval)
     last_proactive = _load_offset("proactive_scan", settings.proactive_scan_interval)
-    last_goal_exec = _load_offset("goal_execution", settings.goal_execution_interval)
+    last_deep_work = _load_offset("deep_work", settings.deep_work_interval)
 
     while not (shutdown and shutdown.is_set()):
         # Use wait with timeout so we wake up promptly on shutdown
@@ -169,56 +181,77 @@ async def start_scheduler_loop(
             last_cleanup = now_mono
             db.cleanup_archived_fts()
             updated = db.decay_importance(settings.decay_rates)
-            cleaned = db.cleanup_stale_sessions(settings.session_timeout)
+            cleaned_ids = db.cleanup_stale_sessions(settings.session_timeout)
+            # Clear model ratchet only for the specific expired sessions
+            if cleaned_ids:
+                from .app import _session_models
+
+                for cid in cleaned_ids:
+                    _session_models.pop(cid, None)
             pruned_logs = db.cleanup_task_logs()
+            pruned_outbound = db.cleanup_outbound_log()
             db.set_behavior_last_run("cleanup", datetime.now(UTC).isoformat())
             log.info(
                 "hourly_maintenance",
                 decayed=updated,
-                sessions_cleaned=cleaned,
+                sessions_cleaned=len(cleaned_ids),
                 task_logs_pruned=pruned_logs,
+                outbound_pruned=pruned_outbound,
             )
 
-        # Collect due behaviors and run in parallel
-        behavior_coros: list[tuple[str, Coroutine[object, object, None]]] = []
+        # Step 1: Collect and run due maintenance behaviors (short-lived, awaited)
+        maintenance_coros: list[tuple[str, Coroutine[object, object, None]]] = []
 
         if now_mono - last_consolidation >= settings.consolidation_interval:
             last_consolidation = now_mono
-            behavior_coros.append(("consolidation", run_consolidation(bot, sem)))
+            maintenance_coros.append(("consolidation", run_consolidation(bot, sem)))
 
         if now_mono - last_proactive >= settings.proactive_scan_interval:
             last_proactive = now_mono
-            behavior_coros.append(("proactive_scan", run_proactive_scan(bot, sem)))
-
-        if now_mono - last_goal_exec >= settings.goal_execution_interval:
-            last_goal_exec = now_mono
-            behavior_coros.append(("goal_execution", run_goal_execution(bot, sem)))
+            maintenance_coros.append(("proactive_scan", run_proactive_scan(bot, sem)))
 
         if now_mono - last_reflection >= settings.reflection_interval:
             last_reflection = now_mono
-            behavior_coros.append(("reflection", run_reflection(bot, sem)))
+            maintenance_coros.append(("reflection", run_reflection(bot, sem)))
             # Weekly FTS pruning (alongside reflection — not urgent)
             pruned = db.prune_old_fts_entries(settings.fts_retention_days)
             if pruned:
                 log.info("fts_pruned", count=pruned)
 
-        if behavior_coros:
-            names = [name for name, _ in behavior_coros]
+        if maintenance_coros:
+            names = [name for name, _ in maintenance_coros]
             if len(names) > 1:
                 log.warning("multiple_behaviors_due", count=len(names), behaviors=names)
             log.info("behaviors_start", behaviors=names)
-            coros = [coro for _, coro in behavior_coros]
+            coros = [coro for _, coro in maintenance_coros]
             results: list[None | BaseException] = await asyncio.gather(
                 *[_limit_behavior(_behavior_sem, c) for c in coros],
                 return_exceptions=True,
             )
             now_iso = datetime.now(UTC).isoformat()
             with db.batch():
-                for (name, _), result in zip(behavior_coros, results, strict=True):
+                for (name, _), result in zip(maintenance_coros, results, strict=True):
                     if isinstance(result, BaseException):
                         log.exception(f"{name}_error", exc_info=result)
                     else:
                         db.set_behavior_last_run(name, now_iso)
+
+        # Step 2: Launch deep work as background task (long-lived, NOT awaited)
+        deep_work_running = _deep_work_task is not None and not _deep_work_task.done()
+        if not deep_work_running and now_mono - last_deep_work >= settings.deep_work_interval:
+            last_deep_work = now_mono
+            db.set_behavior_last_run("deep_work", datetime.now(UTC).isoformat())
+            _deep_work_task = asyncio.create_task(
+                _limit_behavior(_behavior_sem, run_deep_work(bot, sem))
+            )
+
+            def _on_deep_work_done(fut: asyncio.Task[None]) -> None:
+                exc = fut.exception() if not fut.cancelled() else None
+                if exc:
+                    log.exception("deep_work_task_error", exc_info=exc)
+
+            _deep_work_task.add_done_callback(_on_deep_work_done)
+            log.info("deep_work_launched")
 
         try:
             now = datetime.now(UTC)

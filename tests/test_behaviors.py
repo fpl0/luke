@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -240,31 +241,48 @@ class TestRunProactiveScan:
 
 
 # ---------------------------------------------------------------------------
-# run_goal_execution
+# run_deep_work
 # ---------------------------------------------------------------------------
 
 
-class TestRunGoalExecution:
+class TestRunDeepWork:
     async def test_no_chat_id(self) -> None:
-        from luke.behaviors import run_goal_execution
+        from luke.behaviors import run_deep_work
 
         with patch("luke.behaviors.settings") as mock_settings:
             mock_settings.chat_id = ""
-            await run_goal_execution(AsyncMock(), _SEM)
+            await run_deep_work(AsyncMock(), _SEM)
+
+    async def test_budget_exhausted(self) -> None:
+        from luke.behaviors import run_deep_work
+
+        with (
+            patch("luke.behaviors.db") as mock_db,
+            patch("luke.behaviors.settings") as mock_settings,
+            patch("luke.behaviors.run_agent", new_callable=AsyncMock) as mock_agent,
+        ):
+            mock_settings.chat_id = "12345"
+            mock_settings.daily_deep_work_budget_usd = 10.0
+            mock_db.get_daily_deep_work_cost.return_value = 15.0
+            await run_deep_work(AsyncMock(), _SEM)
+
+        mock_agent.assert_not_called()
 
     async def test_no_goals(self) -> None:
-        from luke.behaviors import run_goal_execution
+        from luke.behaviors import run_deep_work
 
         with (
             patch("luke.behaviors.db") as mock_db,
             patch("luke.behaviors.settings") as mock_settings,
         ):
             mock_settings.chat_id = "12345"
+            mock_settings.daily_deep_work_budget_usd = 60.0
+            mock_db.get_daily_deep_work_cost.return_value = 0.0
             mock_db.recall.return_value = []
-            await run_goal_execution(AsyncMock(), _SEM)
+            await run_deep_work(AsyncMock(), _SEM)
 
     async def test_with_goals(self, tmp_settings: Any) -> None:
-        from luke.behaviors import run_goal_execution
+        from luke.behaviors import run_deep_work
 
         (tmp_settings.memory_dir / "goals").mkdir(parents=True, exist_ok=True)
         (tmp_settings.memory_dir / "goals" / "g1.md").write_text(
@@ -277,14 +295,20 @@ class TestRunGoalExecution:
             patch("luke.behaviors.db") as mock_db,
             patch("luke.behaviors.run_agent", new_callable=AsyncMock) as mock_agent,
         ):
+            mock_db.get_daily_deep_work_cost.return_value = 0.0
             mock_db.recall.return_value = goals
             mock_agent.return_value = MagicMock(texts=[])
-            await run_goal_execution(AsyncMock(), _SEM)
+            await run_deep_work(AsyncMock(), _SEM)
 
         mock_agent.assert_called_once()
+        # Verify model and budget overrides
+        call_kwargs = mock_agent.call_args.kwargs
+        assert call_kwargs["model"] == tmp_settings.deep_work_model
+        assert call_kwargs["max_turns"] == tmp_settings.deep_work_max_turns
+        assert call_kwargs["max_sends"] == 1
 
     async def test_agent_exception_handled(self) -> None:
-        from luke.behaviors import run_goal_execution
+        from luke.behaviors import run_deep_work
 
         with (
             patch("luke.behaviors.db") as mock_db,
@@ -294,13 +318,19 @@ class TestRunGoalExecution:
         ):
             mock_settings.chat_id = "12345"
             mock_settings.agent_timeout = 10
+            mock_settings.daily_deep_work_budget_usd = 60.0
+            mock_settings.deep_work_model = "opus"
+            mock_settings.deep_work_max_turns = 300
+            mock_settings.deep_work_max_budget_usd = 3.0
+            mock_settings.workspace_dir = Path("/tmp/test_workspace")
+            mock_db.get_daily_deep_work_cost.return_value = 0.0
             mock_db.recall.return_value = [
                 {"id": "g1", "type": "goal", "title": "G1", "score": 1.0}
             ]
-            await run_goal_execution(AsyncMock(), _SEM)
+            await run_deep_work(AsyncMock(), _SEM)
 
     async def test_empty_goal_bodies_skips(self) -> None:
-        from luke.behaviors import run_goal_execution
+        from luke.behaviors import run_deep_work
 
         with (
             patch("luke.behaviors.db") as mock_db,
@@ -310,9 +340,12 @@ class TestRunGoalExecution:
         ):
             mock_settings.chat_id = "12345"
             mock_settings.agent_timeout = 10
+            mock_settings.daily_deep_work_budget_usd = 60.0
+            mock_settings.workspace_dir = Path("/tmp/test_workspace")
+            mock_db.get_daily_deep_work_cost.return_value = 0.0
             mock_db.recall.return_value = [
                 {"id": "g1", "type": "goal", "title": "G1", "score": 1.0}
             ]
-            await run_goal_execution(AsyncMock(), _SEM)
+            await run_deep_work(AsyncMock(), _SEM)
 
         mock_agent.assert_not_called()
