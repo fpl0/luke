@@ -824,7 +824,8 @@ async def run_agent(
 
     # Date grounding: inject current day/time so agent always knows what day it is
     now_dt = datetime.now(UTC)
-    date_context = f"\n# Current Date & Time\nIt is {now_dt.strftime('%A, %B %d, %Y at %H:%M UTC')}.\n"
+    day_str = now_dt.strftime("%A, %B %d, %Y at %H:%M UTC")
+    date_context = f"\n# Current Date & Time\nIt is {day_str}.\n"
     persona = date_context + persona
 
     # Per-run send rate-limit counter (closed over by PreToolUse hook)

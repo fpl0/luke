@@ -486,7 +486,10 @@ async def on_restart(msg: types.Message) -> None:
     # Use launchctl kickstart to bypass launchd's throttle interval
     uid = os.getuid()
     await asyncio.create_subprocess_exec(
-        "launchctl", "kickstart", "-k", f"gui/{uid}/com.luke",
+        "launchctl",
+        "kickstart",
+        "-k",
+        f"gui/{uid}/com.luke",
     )
 
 
