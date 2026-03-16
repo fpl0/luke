@@ -19,7 +19,7 @@ import structlog
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.types import ReactionTypeEmoji
+from aiogram.types import BotCommand, ReactionTypeEmoji
 from claude_agent_sdk.types import (
     ThinkingConfig,
     ThinkingConfigAdaptive,
@@ -474,6 +474,22 @@ def _format_memory_context(memories: list[MemoryResult]) -> str:
 # ---------------------------------------------------------------------------
 
 
+@dp.message(F.text.startswith("/restart"))
+async def on_restart(msg: types.Message) -> None:
+    if not msg.from_user:
+        return
+    chat_id = str(msg.chat.id)
+    if settings.chat_id and chat_id != settings.chat_id:
+        return
+    log.info("restart_requested", chat_id=chat_id, user=msg.from_user.full_name)
+    await bot.send_message(int(chat_id), "Restarting... 🔄")
+    # Use launchctl kickstart to bypass launchd's throttle interval
+    uid = os.getuid()
+    await asyncio.create_subprocess_exec(
+        "launchctl", "kickstart", "-k", f"gui/{uid}/com.luke",
+    )
+
+
 @dp.message(F.text.startswith("/start"))
 async def on_start(msg: types.Message) -> None:
     if not msg.from_user:
@@ -742,6 +758,15 @@ async def main() -> None:
     log.info("starting", phase="memory_sync")
     await asyncio.to_thread(db.sync_memory_index)
     log.info("started", chat_id=settings.chat_id)
+
+    await bot.set_my_commands(
+        [
+            BotCommand(command="cost", description="Show cost & usage stats"),
+            BotCommand(command="tasks", description="List scheduled tasks"),
+            BotCommand(command="recall", description="Search memories"),
+            BotCommand(command="restart", description="Restart Luke"),
+        ]
+    )
 
     await _notify_main("Back online.")
 

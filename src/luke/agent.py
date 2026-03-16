@@ -423,7 +423,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
         await bot.pin_chat_message(chat_id=_target(args), message_id=args["message_id"])
         return _ok("Pinned")
 
-    # --- Scheduling (1 tool) ---
+    # --- Scheduling (3 tools) ---
 
     @tool(
         "schedule_task",
@@ -443,6 +443,35 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
         except ValueError as exc:
             return _ok(f"Error: {exc}")
         return _ok(f"Scheduled: {task_id}")
+
+    @tool(
+        "list_tasks",
+        "List all scheduled tasks.",
+        {},
+        annotations=_OPEN_WORLD,
+    )
+    async def list_tasks_tool(args: dict[str, Any]) -> dict[str, Any]:
+        tasks = db.list_tasks(chat_id)
+        if not tasks:
+            return _ok("No scheduled tasks.")
+        lines = []
+        for t in tasks:
+            lines.append(
+                f"[{t['id']}] {t['schedule_type']}={t['schedule_value']} "
+                f"status={t['status']} prompt={t['prompt'][:80]}"
+            )
+        return _ok("\n".join(lines))
+
+    @tool(
+        "delete_task",
+        "Delete a scheduled task by ID.",
+        {"task_id": str},
+        annotations=_OPEN_WORLD,
+    )
+    async def delete_task_tool(args: dict[str, Any]) -> dict[str, Any]:
+        if db.delete_task(args["task_id"]):
+            return _ok(f"Deleted task {args['task_id']}")
+        return _ok(f"Task {args['task_id']} not found")
 
     # --- Memory (8 tools) ---
 
@@ -700,6 +729,8 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
             t_del,
             t_pin,
             sched,
+            list_tasks_tool,
+            delete_task_tool,
             mem_save,
             mem_recall,
             mem_recall_conv,
@@ -790,6 +821,11 @@ async def run_agent(
     # Load LUKE.md persona (separate from project CLAUDE.md which is dev instructions)
     persona_path = root / "LUKE.md"
     persona = persona_path.read_text() if persona_path.exists() else ""
+
+    # Date grounding: inject current day/time so agent always knows what day it is
+    now_dt = datetime.now(UTC)
+    date_context = f"\n# Current Date & Time\nIt is {now_dt.strftime('%A, %B %d, %Y at %H:%M UTC')}.\n"
+    persona = date_context + persona
 
     # Per-run send rate-limit counter (closed over by PreToolUse hook)
     send_count = {"n": 0}
