@@ -616,6 +616,26 @@ def update_task_status(task_id: str, status: str) -> None:
     _commit(db)
 
 
+def list_tasks(chat_id: str) -> list[TaskRecord]:
+    rows = (
+        _db()
+        .execute(
+            "SELECT * FROM tasks WHERE chat_id = ? ORDER BY created_at DESC",
+            (chat_id,),
+        )
+        .fetchall()
+    )
+    return cast(list[TaskRecord], [dict(r) for r in rows])
+
+
+def delete_task(task_id: str) -> bool:
+    db = _db()
+    db.execute("DELETE FROM task_logs WHERE task_id = ?", (task_id,))
+    cur = db.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+    _commit(db)
+    return cur.rowcount > 0
+
+
 # ---------------------------------------------------------------------------
 # Behavior state
 # ---------------------------------------------------------------------------

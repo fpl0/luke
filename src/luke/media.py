@@ -26,16 +26,32 @@ _MAX_IMAGE_DIM = 1568  # Anthropic Vision API max dimension
 # ---------------------------------------------------------------------------
 
 
+def _clean_whisper_hallucinations(text: str) -> str:
+    """Strip repetitive tails that Whisper hallucinates at the end of transcriptions."""
+    # Detect repeated phrases/words at the end (3+ consecutive repeats of the same chunk)
+    cleaned = re.sub(r"(.{3,80}?)\1{2,}\s*$", r"\1", text)
+    return cleaned.strip()
+
+
 async def transcribe(path: Path) -> str | None:
     """Transcribe an audio file using Whisper. Returns text or None."""
     import mlx_whisper
 
     try:
         result: dict[str, Any] = await asyncio.wait_for(
-            asyncio.to_thread(mlx_whisper.transcribe, str(path), path_or_hf_repo=_WHISPER_MODEL),
+            asyncio.to_thread(
+                mlx_whisper.transcribe,
+                str(path),
+                path_or_hf_repo=_WHISPER_MODEL,
+                language="en",
+                condition_on_previous_text=False,
+            ),
             timeout=settings.transcription_timeout,
         )
         text: str = result.get("text", "").strip()
+        if not text:
+            return None
+        text = _clean_whisper_hallucinations(text)
         if not text:
             return None
         path.with_suffix(".txt").write_text(text, encoding="utf-8")
