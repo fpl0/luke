@@ -13,7 +13,7 @@ from croniter import croniter
 from structlog.stdlib import BoundLogger
 
 from . import db
-from .agent import run_agent, send_long_message
+from .agent import run_agent
 from .behaviors import run_consolidation, run_goal_execution, run_proactive_scan, run_reflection
 from .config import settings
 from .db import TaskRecord, ensure_utc
@@ -67,10 +67,19 @@ async def _run_task(task: TaskRecord, bot: Bot) -> None:
     )
 
     try:
+        # Scheduled tasks use the same pattern as behaviors: text output is
+        # never auto-forwarded to Telegram.  The agent must call send_message
+        # (or another send tool) explicitly to reach the user.  A short
+        # preamble tells the agent this fact so it doesn't rely on text output.
+        prompt = (
+            "[Scheduled task — text output is not delivered to the user. "
+            "Use send_message/reply to communicate.]\n\n"
+            + task["prompt"]
+        )
         result = await asyncio.wait_for(
             run_agent(
                 chat_id=task["chat_id"],
-                prompt=task["prompt"],
+                prompt=prompt,
                 session_id=None,
                 bot=bot,
             ),
@@ -79,12 +88,12 @@ async def _run_task(task: TaskRecord, bot: Bot) -> None:
 
         finished = datetime.now(UTC).isoformat()
         db.log_task_run(task_id, started, finished, "ok")
-        log.info("task_done", task_id=task_id, responses=len(result.texts))
-
-        # Only send result text if the agent didn't already message via MCP tools
-        if result.sent_messages == 0:
-            for text in result.texts:
-                await send_long_message(bot, chat_id=int(task["chat_id"]), text=text)
+        log.info(
+            "task_done",
+            task_id=task_id,
+            sent=result.sent_messages,
+            dropped_texts=len(result.texts),
+        )
 
         # One-time tasks complete after running
         if task["schedule_type"] == "once":

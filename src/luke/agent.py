@@ -347,7 +347,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
     @tool(
         "reply",
         "Reply to a specific message by its msg: ID from the prompt. Use Telegram HTML formatting.",
-        {"chat_id": str, "message_id": int, "text": str},
+        {"chat_id": str, "message_id": str, "text": str},
         annotations=_OPEN_WORLD,
     )
     async def t_reply(args: dict[str, Any]) -> dict[str, Any]:
@@ -355,14 +355,14 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
             bot,
             chat_id=_target(args),
             text=args["text"],
-            reply_parameters=ReplyParameters(message_id=args["message_id"]),
+            reply_parameters=ReplyParameters(message_id=int(args["message_id"])),
         )
         return _ok("Replied")
 
     @tool(
         "forward",
         "Forward a message to another chat",
-        {"from_chat_id": str, "to_chat_id": str, "message_id": int},
+        {"from_chat_id": str, "to_chat_id": str, "message_id": str},
         annotations=_OPEN_WORLD,
     )
     async def t_fwd(args: dict[str, Any]) -> dict[str, Any]:
@@ -371,20 +371,20 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
         await bot.forward_message(
             chat_id=to_id,
             from_chat_id=from_id,
-            message_id=args["message_id"],
+            message_id=int(args["message_id"]),
         )
         return _ok("Forwarded")
 
     @tool(
         "react",
         "React to a message with an emoji",
-        {"chat_id": str, "message_id": int, "emoji": str},
+        {"chat_id": str, "message_id": str, "emoji": str},
         annotations=_OPEN_WORLD,
     )
     async def t_react(args: dict[str, Any]) -> dict[str, Any]:
         await bot.set_message_reaction(
             chat_id=_target(args),
-            message_id=args["message_id"],
+            message_id=int(args["message_id"]),
             reaction=[ReactionTypeEmoji(emoji=args["emoji"])],
         )
         return _ok("Reacted")
@@ -392,13 +392,13 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
     @tool(
         "edit_message",
         "Edit a previously sent message. Use Telegram HTML formatting.",
-        {"chat_id": str, "message_id": int, "text": str},
+        {"chat_id": str, "message_id": str, "text": str},
         annotations=_DESTRUCTIVE,
     )
     async def t_edit(args: dict[str, Any]) -> dict[str, Any]:
         await bot.edit_message_text(
             chat_id=_target(args),
-            message_id=args["message_id"],
+            message_id=int(args["message_id"]),
             text=args["text"],
         )
         return _ok("Edited")
@@ -406,21 +406,21 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
     @tool(
         "delete_message",
         "Delete a message",
-        {"chat_id": str, "message_id": int},
+        {"chat_id": str, "message_id": str},
         annotations=_DESTRUCTIVE,
     )
     async def t_del(args: dict[str, Any]) -> dict[str, Any]:
-        await bot.delete_message(chat_id=_target(args), message_id=args["message_id"])
+        await bot.delete_message(chat_id=_target(args), message_id=int(args["message_id"]))
         return _ok("Deleted")
 
     @tool(
         "pin",
         "Pin a message in a chat",
-        {"chat_id": str, "message_id": int},
+        {"chat_id": str, "message_id": str},
         annotations=_OPEN_WORLD,
     )
     async def t_pin(args: dict[str, Any]) -> dict[str, Any]:
-        await bot.pin_chat_message(chat_id=_target(args), message_id=args["message_id"])
+        await bot.pin_chat_message(chat_id=_target(args), message_id=int(args["message_id"]))
         return _ok("Pinned")
 
     # --- Scheduling (3 tools) ---
@@ -821,12 +821,6 @@ async def run_agent(
     # Load LUKE.md persona (separate from project CLAUDE.md which is dev instructions)
     persona_path = root / "LUKE.md"
     persona = persona_path.read_text() if persona_path.exists() else ""
-
-    # Date grounding: inject current day/time so agent always knows what day it is
-    now_dt = datetime.now(UTC)
-    day_str = now_dt.strftime("%A, %B %d, %Y at %H:%M UTC")
-    date_context = f"\n# Current Date & Time\nIt is {day_str}.\n"
-    persona = date_context + persona
 
     # Per-run send rate-limit counter (closed over by PreToolUse hook)
     send_count = {"n": 0}
