@@ -22,7 +22,6 @@ from aiogram.enums import ParseMode
 from aiogram.types import BotCommand, ReactionTypeEmoji
 from claude_agent_sdk.types import (
     ThinkingConfig,
-    ThinkingConfigAdaptive,
     ThinkingConfigDisabled,
     ThinkingConfigEnabled,
 )
@@ -138,8 +137,8 @@ def _classify_effort(
         thinking_cfg = ThinkingConfigEnabled(type="enabled", budget_tokens=16_000)
         return "high", thinking_cfg, settings.model_high
 
-    # Normal: everything else
-    return "medium", ThinkingConfigAdaptive(type="adaptive"), settings.model_medium
+    # Normal: everything else — no thinking to keep latency low
+    return "medium", ThinkingConfigDisabled(type="disabled"), settings.model_medium
 
 
 # ---------------------------------------------------------------------------
@@ -279,9 +278,8 @@ async def process(chat_id: str) -> None:
 
         # Run build_prompt, memory recall, and conversation state concurrently
         combined_text = " ".join(m.content for m in messages)
-        recalled_memories: list[MemoryResult] = []
         if _needs_recall(combined_text):
-            prompt, (memory_context, recalled_memories), conv_state = await asyncio.gather(
+            prompt, (memory_context, _recalled), conv_state = await asyncio.gather(
                 build_prompt(messages, chat_id),
                 _auto_recall(combined_text, chat_id),
                 _get_conversation_state(chat_id),
@@ -292,24 +290,11 @@ async def process(chat_id: str) -> None:
             prompt = await build_prompt(messages, chat_id)
             memory_context = ""
 
-        # Classify effort BEFORE memory injection so injected context
-        # doesn't inflate word count and skew the complexity heuristic.
-        effort, thinking, model = _classify_effort(prompt)
+        # Classify effort for thinking config only — model routing disabled
+        effort, thinking, _routed_model = _classify_effort(prompt)
+        model = settings.agent_model  # always opus until routing is fixed
 
-        # Memory-aware routing boost: goal/procedure context ⇒ at least sonnet
-        if (
-            recalled_memories
-            and any(m.get("type") in ("goal", "procedure") for m in recalled_memories)
-            and _MODEL_RANK.get(model, 0) < _MODEL_RANK.get(settings.model_medium, 0)
-        ):
-            model = settings.model_medium
-
-        # Session-aware ratchet: never downgrade within an active session
         session_id = db.get_session(chat_id)
-        if session_id:
-            prev = _session_models.get(chat_id)
-            if prev and _MODEL_RANK.get(prev, 0) > _MODEL_RANK.get(model, 0):
-                model = prev
 
         if memory_context:
             log.info("memories_injected", chat=chat_id)
