@@ -180,7 +180,7 @@ class AgentResult:
 
 
 def _build_tools(chat_id: str, bot: Bot) -> Any:
-    """Create the in-process MCP server with all 25 tools."""
+    """Create the in-process MCP server with all tools."""
     root = settings.luke_dir
 
     # Allowed roots for file-sending tools (prevents arbitrary path access)
@@ -727,6 +727,59 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
         report = db.get_cost_report(args.get("period", "month"))
         return _ok(report)
 
+    # --- Browser (1 tool) ---
+
+    @tool(
+        "browse",
+        "Open a URL and extract page content. Returns title + text. "
+        "Optional: CSS selector to narrow extraction, screenshot to save a PNG.",
+        {"url": str, "selector": str, "screenshot": bool},
+        annotations=_OPEN_WORLD,
+    )
+    async def t_browse(args: dict[str, Any]) -> dict[str, Any]:
+        from playwright.async_api import async_playwright
+
+        url: str = args["url"]
+        selector: str | None = args.get("selector")
+        take_screenshot: bool = args.get("screenshot", False)
+
+        try:
+            async with async_playwright() as pw:
+                browser = await pw.chromium.launch(headless=True)
+                page = await browser.new_page()
+                await page.goto(url, timeout=30_000, wait_until="domcontentloaded")
+
+                title = await page.title()
+                final_url = page.url
+
+                if selector:
+                    elements = await page.query_selector_all(selector)
+                    parts = [await el.inner_text() for el in elements]
+                    content = "\n".join(p.strip() for p in parts if p.strip())
+                else:
+                    content = await page.inner_text("body")
+
+                result_parts = [f"Title: {title}", f"URL: {final_url}", ""]
+
+                if take_screenshot:
+                    ts = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+                    ss_dir = settings.workspace_dir / "media" / "screenshots"
+                    ss_dir.mkdir(parents=True, exist_ok=True)
+                    path = ss_dir / f"screenshot_{ts}.png"
+                    await page.screenshot(path=str(path))
+                    result_parts.append(f"Screenshot: {path}")
+
+                await browser.close()
+
+            max_chars = 15_000
+            if len(content) > max_chars:
+                content = content[:max_chars] + f"\n\n[Truncated — {len(content):,} total chars]"
+
+            result_parts.append(content)
+            return _ok("\n".join(result_parts))
+        except Exception as exc:
+            return _ok(f"Browse error: {exc}")
+
     return create_sdk_mcp_server(
         name="luke",
         version="1.0.0",
@@ -758,6 +811,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
             mem_bulk,
             mem_history,
             t_cost,
+            t_browse,
         ],
     )
 
@@ -878,6 +932,7 @@ _ALL_MCP_TOOL_NAMES: list[str] = [
     "bulk_memory",
     "memory_history",
     "get_cost_report",
+    "browse",
 ]
 
 _MCP_TOOLS_HAIKU: frozenset[str] = frozenset(

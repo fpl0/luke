@@ -15,6 +15,7 @@ dependencies = [
     "sqlite-vec>=0.1.6",
     "fastembed>=0.4",
     "mlx-whisper>=0.4",
+    "playwright>=1.50",
 ]
 
 [project.scripts]
@@ -59,6 +60,10 @@ ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 module = ["PIL.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["playwright.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
