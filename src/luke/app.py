@@ -416,9 +416,7 @@ async def process(chat_id: str) -> None:
 
         # Save conversation state for continuity (non-trivial conversations only)
         if effort != "low":
-            _fire_and_forget(
-                asyncio.to_thread(_save_conv_state, messages, result.texts)
-            )
+            _fire_and_forget(asyncio.to_thread(_save_conv_state, messages, result.texts))
 
 
 def _save_conv_state(
@@ -453,8 +451,12 @@ def _save_conv_state(
     )
     path.write_text(f"---\n{fm}---\n\n# Conversation State\n\n{body}\n")
     db.index_memory(
-        _CONV_STATE_ID, "episode", "Last conversation state", body,
-        tags=["conversation", "state"], importance=0.3,
+        _CONV_STATE_ID,
+        "episode",
+        "Last conversation state",
+        body,
+        tags=["conversation", "state"],
+        importance=0.3,
     )
 
 
@@ -653,7 +655,7 @@ async def on_photo(msg: types.Message) -> None:
     await _handle_media(
         msg,
         msg.photo[-1],
-        f"photo_{msg.message_id}.jpg",
+        f"media/photos/photo_{msg.message_id}.jpg",
         f"{msg.caption or ''}\n[Photo saved: {{dest}}]",
         reply_to=_reply_to(msg),
     )
@@ -667,7 +669,7 @@ async def on_voice(msg: types.Message) -> None:
     await _handle_media(
         msg,
         msg.voice,
-        f"voice_{msg.message_id}.ogg",
+        f"media/voice/voice_{msg.message_id}.ogg",
         "[Voice message saved: {dest}]",
         reply_to=_reply_to(msg),
         media_file_id=msg.voice.file_id,
@@ -683,7 +685,7 @@ async def on_document(msg: types.Message) -> None:
     await _handle_media(
         msg,
         msg.document,
-        f"{msg.message_id}_{raw_name}",
+        f"media/documents/{msg.message_id}_{raw_name}",
         f"{msg.caption or ''}\n[Document saved: {{dest}}]",
         reply_to=_reply_to(msg),
     )
@@ -696,7 +698,7 @@ async def on_video(msg: types.Message) -> None:
     await _handle_media(
         msg,
         msg.video,
-        f"video_{msg.message_id}.mp4",
+        f"media/video/video_{msg.message_id}.mp4",
         f"{msg.caption or ''}\n[Video saved: {{dest}}]",
         reply_to=_reply_to(msg),
         media_file_id=msg.video.file_id,
@@ -711,7 +713,7 @@ async def on_video_note(msg: types.Message) -> None:
     await _handle_media(
         msg,
         msg.video_note,
-        f"videonote_{msg.message_id}.mp4",
+        f"media/video/videonote_{msg.message_id}.mp4",
         "[Video note saved: {dest}]",
         reply_to=_reply_to(msg),
         media_file_id=msg.video_note.file_id,
@@ -729,7 +731,7 @@ async def on_sticker(msg: types.Message) -> None:
         await _handle_media(
             msg,
             msg.sticker,
-            f"sticker_{msg.message_id}.webp",
+            f"media/stickers/sticker_{msg.message_id}.webp",
             f"[Sticker: {emoji}]\n[Sticker image saved: {{dest}}]",
         )
         return
@@ -744,7 +746,7 @@ async def on_animation(msg: types.Message) -> None:
     await _handle_media(
         msg,
         msg.animation,
-        f"animation_{msg.message_id}.mp4",
+        f"media/animations/animation_{msg.message_id}.mp4",
         f"{msg.caption or '[GIF/Animation]'}\n[Animation saved: {{dest}}]",
         reply_to=_reply_to(msg),
         post_download=_animation_frame,
@@ -759,7 +761,7 @@ async def on_audio(msg: types.Message) -> None:
     await _handle_media(
         msg,
         msg.audio,
-        f"{msg.message_id}_{raw_name}",
+        f"media/audio/{msg.message_id}_{raw_name}",
         f"{msg.caption or ''}\n[Audio saved: {{dest}}]",
         reply_to=_reply_to(msg),
         post_download=_transcribe_post,
