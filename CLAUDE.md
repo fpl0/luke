@@ -1,6 +1,6 @@
 # Luke
 
-Personal agent on Telegram — remembers, researches, builds, decides, acts. Nine files, one process, no frameworks. See [README.md](README.md) for philosophy and setup.
+Personal agent on Telegram — remembers, researches, builds, decides, acts. One process, no frameworks. See [README.md](README.md) for philosophy and setup.
 
 ## Opinionated Design
 
@@ -26,7 +26,8 @@ Single Python process: aiogram dispatches Telegram messages → Claude Agent SDK
 |------|---------|
 | `src/luke/app.py` | Orchestrator: Telegram handlers, `_store` helper, `process` + `_dispatch`, main loop |
 | `src/luke/agent.py` | Claude SDK client + 27 MCP tools (Telegram, memory, scheduling, monitoring) + model routing |
-| `src/luke/db.py` | SQLite: messages, sessions, tasks, memory index (FTS5) |
+| `src/luke/memory.py` | Memory subsystem: FTS5 indexing, semantic search, graph traversal, scoring, decay |
+| `src/luke/db.py` | SQLite: messages, sessions, tasks, cost tracking |
 | `src/luke/config.py` | Settings from `.env` via pydantic-settings (`SecretStr` for token) |
 | `src/luke/scheduler.py` | Cron/interval/once task execution + hourly maintenance |
 | `src/luke/behaviors.py` | Autonomous behaviors: consolidation, reflection, proactive scan, deep work |
@@ -101,7 +102,7 @@ tail -f ~/.luke/luke.err
 
 ## Security
 
-- **Path traversal** — Telegram filenames sanitized with `Path(...).name`; memory IDs sanitized via `sanitize_memory_id()` in db.py; memory types validated against allowlist
+- **Path traversal** — Telegram filenames sanitized with `Path(...).name`; memory IDs sanitized via `sanitize_memory_id()` in memory.py; memory types validated against allowlist
 - **Duplicate messages** — `send_long_message()` checks SHA-256 content hash against `outbound_log` table (5-min window) before sending; hourly cleanup prunes old entries
 - **FTS5 injection** — `recall()` catches `sqlite3.OperationalError` from malformed MATCH queries
 - **Schedule validation** — `create_task()` validates type is `cron|interval|once`, validates cron with `croniter.is_valid()`, validates interval is integer
@@ -112,7 +113,7 @@ tail -f ~/.luke/luke.err
 
 Always write tests for new functionality. Test files live in `tests/` and mirror the source structure:
 - `tests/test_db.py` — message storage, sessions, tasks
-- `tests/test_db_memory.py` — memory indexing, recall, FTS, embeddings
+- `tests/test_db_memory.py` — memory.py: indexing, recall, FTS, embeddings, graph, scoring
 - `tests/test_media.py` — image encoding, transcription, ffmpeg
 - `tests/test_behaviors.py` — autonomous behavior functions
 - `tests/test_scheduler.py` — scheduler loop, task execution
@@ -197,4 +198,4 @@ Code lives in the repo (`src/`). Data lives in `$LUKE_DIR` (default `~/.luke`), 
 
 ## Customization = Code Changes
 
-No configuration sprawl. If you want different behavior, modify the code. The codebase is small enough (~3950 lines) that this is safe and practical. Skills (`/customize`) guide these changes.
+No configuration sprawl. If you want different behavior, modify the code. The codebase is small enough (~5000 lines) that this is safe and practical. Skills (`/customize`) guide these changes.

@@ -10,30 +10,11 @@ import pytest
 from luke.db import (
     batch,
     ensure_utc,
-    strip_frontmatter,
 )
 
 # ---------------------------------------------------------------------------
 # Helper functions
 # ---------------------------------------------------------------------------
-
-
-class TestStripFrontmatter:
-    def test_with_frontmatter(self) -> None:
-        text = "---\ntitle: Hello\n---\n\nBody text"
-        assert strip_frontmatter(text) == "Body text"
-
-    def test_without_frontmatter(self) -> None:
-        text = "Just regular text"
-        assert strip_frontmatter(text) == "Just regular text"
-
-    def test_incomplete_frontmatter(self) -> None:
-        text = "---\ntitle: Hello\nNo closing"
-        assert strip_frontmatter(text) == text
-
-    def test_empty_frontmatter(self) -> None:
-        text = "---\n---\n\nBody"
-        assert strip_frontmatter(text) == "Body"
 
 
 class TestEnsureUtc:

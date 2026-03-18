@@ -27,19 +27,19 @@ from claude_agent_sdk.types import (
 )
 from structlog.stdlib import BoundLogger
 
-from . import db
+from . import db, memory
 from .agent import _trunc, run_agent, send_long_message
 from .config import settings
-from .db import (
+from .db import ensure_utc
+from .media import build_prompt, extract_frame, transcribe
+from .memory import (
     MEMORY_DIRS,
     MemoryResult,
-    ensure_utc,
     get_graph_neighbors,
     read_frontmatter,
     recall,
     touch_memories,
 )
-from .media import build_prompt, extract_frame, transcribe
 from .scheduler import start_scheduler_loop
 
 log: BoundLogger = structlog.get_logger()
@@ -177,8 +177,8 @@ _COST_ANOMALY_MULTIPLIER = 3  # times rolling average
 
 def _load_conv_state() -> tuple[str, str | None]:
     """Read conversation state body and timestamp (sync, for use in to_thread)."""
-    body = db.read_memory_body("episode", _CONV_STATE_ID, settings.recall_content_limit)
-    updated = db.get_memory_updated(_CONV_STATE_ID) if body else None
+    body = memory.read_memory_body("episode", _CONV_STATE_ID, settings.recall_content_limit)
+    updated = memory.get_memory_updated(_CONV_STATE_ID) if body else None
     return body, updated
 
 
@@ -450,7 +450,7 @@ def _save_conv_state(
         default_flow_style=False,
     )
     path.write_text(f"---\n{fm}---\n\n# Conversation State\n\n{body}\n")
-    db.index_memory(
+    memory.index_memory(
         _CONV_STATE_ID,
         "episode",
         "Last conversation state",
@@ -589,7 +589,7 @@ def _format_memory_context(memories: list[MemoryResult]) -> str:
     """Format recalled memories as context prefix for the agent."""
     lines: list[str] = []
     for m in memories:
-        body = db.read_memory_body(m["type"], m["id"], settings.recall_content_limit)
+        body = memory.read_memory_body(m["type"], m["id"], settings.recall_content_limit)
         content = body or m.get("title", "")
         lines.append(f"[{m['id']}] ({m['type']}) {content}")
     body = "\n---\n".join(lines)
@@ -870,7 +870,7 @@ def _ensure_dirs() -> None:
     settings.luke_dir.mkdir(parents=True, exist_ok=True)
     settings.workspace_dir.mkdir(exist_ok=True)
     settings.memory_dir.mkdir(exist_ok=True)
-    for subdir in db.MEMORY_DIRS.values():
+    for subdir in MEMORY_DIRS.values():
         (settings.memory_dir / subdir).mkdir(exist_ok=True)
     # Seed LUKE.md persona from package template if not present
     persona_dest = settings.luke_dir / "LUKE.md"
@@ -886,7 +886,7 @@ async def main() -> None:
     db.init()
     db.clear_sessions()  # no session survives process restart
     log.info("starting", phase="memory_sync")
-    await asyncio.to_thread(db.sync_memory_index)
+    await asyncio.to_thread(memory.sync_memory_index)
     log.info("started", chat_id=settings.chat_id)
 
     await bot.set_my_commands(

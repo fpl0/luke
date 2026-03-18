@@ -91,9 +91,12 @@ class TestCron:
 
     def test_restart_not_due_if_recently_ran(self) -> None:
         """After restart, cron that ran recently should NOT fire again."""
-        last = (datetime.now(UTC) - timedelta(seconds=30)).isoformat()
+        # Use a fixed time mid-window (2 min after a */5 boundary) to avoid
+        # flakiness when now happens to land on a 5-minute boundary.
+        now = datetime(2026, 1, 15, 12, 2, 0, tzinfo=UTC)
+        last = (now - timedelta(seconds=30)).isoformat()
         task = _task(schedule_type="cron", schedule_value="*/5 * * * *", last_run=last)
-        assert _is_due(task, datetime.now(UTC)) is False
+        assert _is_due(task, now) is False
 
     def test_restart_never_ran_but_within_first_window(self) -> None:
         """After restart, task created 2 min ago with hourly cron — still not due."""
@@ -277,7 +280,10 @@ class TestSchedulerLoop:
         shutdown = asyncio.Event()
         shutdown.set()
 
-        with patch("luke.scheduler.db") as mock_db:
+        with (
+            patch("luke.scheduler.db") as mock_db,
+            patch("luke.scheduler.memory"),
+        ):
             mock_db.get_behavior_last_run.return_value = None
             # Should return quickly without hanging
             await asyncio.wait_for(
@@ -293,6 +299,7 @@ class TestSchedulerLoop:
         with (
             patch("luke.scheduler.settings") as mock_settings,
             patch("luke.scheduler.db") as mock_db,
+            patch("luke.scheduler.memory"),
         ):
             mock_settings.scheduler_interval = 0.01  # Very fast ticks
             mock_settings.cleanup_interval = 999999

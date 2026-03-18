@@ -412,8 +412,8 @@ class TestBuildTools:
 
     async def test_remember_tool(self, tool_env: dict[str, Any]) -> None:
         remember = tool_env["tools"]["remember"]
-        with patch("luke.agent.db") as mock_db:
-            mock_db.detect_changes.return_value = []
+        with patch("luke.agent.memory") as mock_memory:
+            mock_memory.detect_changes.return_value = []
             result = await remember(
                 {"id": "test-mem", "type": "entity", "title": "Test", "content": "body"}
             )
@@ -428,27 +428,27 @@ class TestBuildTools:
 
     async def test_recall_tool(self, tool_env: dict[str, Any]) -> None:
         recall = tool_env["tools"]["recall"]
-        with patch("luke.agent.db") as mock_db:
-            mock_db.recall.return_value = []
+        with patch("luke.agent.memory") as mock_memory:
+            mock_memory.recall.return_value = []
             result = await recall({"query": "test"})
         assert "No memories" in result["content"][0]["text"]
 
     async def test_forget_tool(self, tool_env: dict[str, Any]) -> None:
         forget = tool_env["tools"]["forget"]
-        with patch("luke.agent.db"):
+        with patch("luke.agent.memory"):
             result = await forget({"id": "mem-1"})
         assert "Archived" in result["content"][0]["text"]
 
     async def test_connect_tool(self, tool_env: dict[str, Any]) -> None:
         connect = tool_env["tools"]["connect"]
-        with patch("luke.agent.db"):
+        with patch("luke.agent.memory"):
             result = await connect({"from_id": "a", "to_id": "b", "relationship": "related"})
         assert "Linked" in result["content"][0]["text"]
 
     async def test_recall_conversation_tool(self, tool_env: dict[str, Any]) -> None:
         recall_conv = tool_env["tools"]["recall_conversation"]
-        with patch("luke.agent.db") as mock_db:
-            mock_db.recall_by_time_window.return_value = []
+        with patch("luke.agent.memory") as mock_memory:
+            mock_memory.recall_by_time_window.return_value = []
             result = await recall_conv({"after": "2024-01-01", "before": "2024-12-31"})
         assert "No memories" in result["content"][0]["text"]
 

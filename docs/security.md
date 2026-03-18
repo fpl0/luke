@@ -8,7 +8,7 @@ Luke runs with `bypassPermissions`. All security comes from validation at the bo
 
 **Telegram filenames** — `Path(...).name` strips all directory components from user-supplied filenames.
 
-**Memory IDs** — `sanitize_memory_id()` in db.py strips everything except `[a-zA-Z0-9_-]`.
+**Memory IDs** — `sanitize_memory_id()` in memory.py strips everything except `[a-zA-Z0-9_-]`.
 
 ## FTS5 Injection
 

@@ -12,7 +12,7 @@ from aiogram import Bot
 from croniter import croniter
 from structlog.stdlib import BoundLogger
 
-from . import db
+from . import db, memory
 from .agent import run_agent
 from .behaviors import run_consolidation, run_deep_work, run_proactive_scan, run_reflection
 from .config import settings
@@ -179,8 +179,8 @@ async def start_scheduler_loop(
         # Hourly: FTS cleanup + adaptive importance decay + session cleanup
         if now_mono - last_cleanup >= settings.cleanup_interval:
             last_cleanup = now_mono
-            db.cleanup_archived_fts()
-            updated = db.decay_importance(settings.decay_rates)
+            memory.cleanup_archived_fts()
+            updated = memory.decay_importance(settings.decay_rates)
             cleaned_ids = db.cleanup_stale_sessions(settings.session_timeout)
             # Clear model ratchet only for the specific expired sessions
             if cleaned_ids:
@@ -214,7 +214,7 @@ async def start_scheduler_loop(
             last_reflection = now_mono
             maintenance_coros.append(("reflection", run_reflection(bot, sem)))
             # Weekly FTS pruning (alongside reflection — not urgent)
-            pruned = db.prune_old_fts_entries(settings.fts_retention_days)
+            pruned = memory.prune_old_fts_entries(settings.fts_retention_days)
             if pruned:
                 log.info("fts_pruned", count=pruned)
 
