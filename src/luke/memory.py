@@ -462,6 +462,8 @@ def index_memory(
         ).fetchall():
             link_types[row["id"]] = row["type"]
         for link_id in links:
+            if not link_id or not link_id[0].isalnum():
+                continue  # skip corrupt IDs (e.g. from string iteration)
             target_type = link_types.get(link_id, "")
             rel = _DEFAULT_RELATIONSHIP.get((mem_type, target_type), "related")
             db.execute(
@@ -916,6 +918,9 @@ def link_memories(from_id: str, to_id: str, relationship: str) -> bool:
 
     Returns True if a new link was created, False if it already existed.
     """
+    if not from_id or not to_id or not from_id[0].isalnum() or not to_id[0].isalnum():
+        log.warning("link_rejected_invalid_id", from_id=from_id, to_id=to_id)
+        return False
     conn = _db()
     now = datetime.now(UTC).isoformat()
     cur = conn.execute(
