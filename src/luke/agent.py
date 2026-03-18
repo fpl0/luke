@@ -46,9 +46,9 @@ from claude_agent_sdk.types import (
 )
 from structlog.stdlib import BoundLogger
 
-from . import db
+from . import db, memory
 from .config import settings
-from .db import MEMORY_DIRS, read_frontmatter, read_memory_body, sanitize_memory_id
+from .memory import MEMORY_DIRS, read_frontmatter, read_memory_body, sanitize_memory_id
 
 log: BoundLogger = structlog.get_logger()
 
@@ -555,14 +555,14 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
         # Conflict detection after file write (so changelog is consistent with disk)
         change_note = ""
         if is_update:
-            changes = db.detect_changes(mem_id, args["content"], title)
+            changes = memory.detect_changes(mem_id, args["content"], title)
             if changes:
                 change_note = " Changes: " + "; ".join(changes)
-                db.record_memory_change(mem_id, changes)
+                memory.record_memory_change(mem_id, changes)
         raw_imp = args.get("importance")
         imp: float | None = max(0.1, min(2.0, float(raw_imp))) if raw_imp is not None else None
         await asyncio.to_thread(
-            db.index_memory,
+            memory.index_memory,
             mem_id,
             mem_type,
             title,
@@ -573,7 +573,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
         )
         # Linking is a graph-write, not retrieval — track access but not utility
         if links:
-            db.touch_memories(links, useful=False)
+            memory.touch_memories(links, useful=False)
         status = f"Remembered: {mem_id}"
         if change_note:
             status += change_note
@@ -586,7 +586,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
         annotations=_READ_ONLY,
     )
     async def mem_recall(args: dict[str, Any]) -> dict[str, Any]:
-        results = db.recall(
+        results = memory.recall(
             query=args.get("query", ""),
             mem_type=args.get("type"),
             after=args.get("after"),
@@ -600,7 +600,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
             body = read_memory_body(r["type"], r["id"], settings.recall_content_limit)
             content = body or r.get("title", "")
             lines.append(f"**{r['id']}** ({r['type']})\n{content}")
-        db.touch_memories([r["id"] for r in results])
+        memory.touch_memories([r["id"] for r in results])
         return _ok("\n---\n".join(lines))
 
     @tool(
@@ -610,7 +610,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
         annotations=_DESTRUCTIVE,
     )
     async def mem_forget(args: dict[str, Any]) -> dict[str, Any]:
-        db.archive_memory(args["id"])
+        memory.archive_memory(args["id"])
         return _ok(f"Archived: {args['id']}")
 
     @tool(
@@ -620,7 +620,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
         annotations=_READ_ONLY,
     )
     async def mem_recall_conv(args: dict[str, Any]) -> dict[str, Any]:
-        results = db.recall_by_time_window(
+        results = memory.recall_by_time_window(
             after=args["after"],
             before=args["before"],
         )
@@ -632,7 +632,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
             content = body or r.get("title", "")
             created = r.get("created", "")
             lines.append(f"[{created}] **{r['id']}** ({r['type']})\n{content}")
-        db.touch_memories([r["id"] for r in results])
+        memory.touch_memories([r["id"] for r in results])
         return _ok("\n---\n".join(lines))
 
     @tool(
@@ -641,9 +641,9 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
         {"from_id": str, "to_id": str, "relationship": str},
     )
     async def mem_link(args: dict[str, Any]) -> dict[str, Any]:
-        created = db.link_memories(args["from_id"], args["to_id"], args["relationship"])
+        created = memory.link_memories(args["from_id"], args["to_id"], args["relationship"])
         # Linking is a graph-write, not retrieval — track access but not utility
-        db.touch_memories([args["from_id"], args["to_id"]], useful=False)
+        memory.touch_memories([args["from_id"], args["to_id"]], useful=False)
         rel = args["relationship"]
         if created:
             return _ok(f"Linked: {args['from_id']} —{rel}→ {args['to_id']}")
@@ -657,7 +657,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
         {"id": str},
     )
     async def mem_restore(args: dict[str, Any]) -> dict[str, Any]:
-        restored = db.restore_memory(args["id"])
+        restored = memory.restore_memory(args["id"])
         if restored:
             return _ok(f"Restored: {args['id']}")
         return _ok(f"Not found or not archived: {args['id']}")
@@ -682,17 +682,17 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
         if action == "retag":
             tags: list[str] = args.get("tags", [])
             for mid in ids:
-                db.update_memory_tags(mid, tags)
+                memory.update_memory_tags(mid, tags)
         elif action == "relink":
             link_to = args.get("link_to", "")
             rel = args.get("relationship", "related")
             if not link_to:
                 return _ok("Error: link_to required for relink")
             for mid in ids:
-                db.link_memories(mid, link_to, rel)
+                memory.link_memories(mid, link_to, rel)
         elif action == "archive":
             for mid in ids:
-                db.archive_memory(mid)
+                memory.archive_memory(mid)
         else:
             return _ok(f"Unknown action: {action}")
         return _ok(f"{action}: {len(ids)} memories updated")
@@ -706,7 +706,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
         annotations=_READ_ONLY,
     )
     async def mem_history(args: dict[str, Any]) -> dict[str, Any]:
-        history = db.get_memory_history(args["id"])
+        history = memory.get_memory_history(args["id"])
         if not history:
             return _ok(f"No history for: {args['id']}")
         lines: list[str] = []

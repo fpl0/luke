@@ -26,12 +26,12 @@ class TestRunConsolidation:
         from luke.behaviors import run_consolidation
 
         with (
-            patch("luke.behaviors.db") as mock_db,
+            patch("luke.behaviors.memory") as mock_memory,
             patch("luke.behaviors.settings") as mock_settings,
         ):
             mock_settings.chat_id = "12345"
             mock_settings.consolidation_min_cluster = 3
-            mock_db.get_consolidation_candidates.return_value = []
+            mock_memory.get_consolidation_candidates.return_value = []
             await run_consolidation(AsyncMock(), _SEM)
 
     async def test_with_clusters(self, tmp_settings: Any) -> None:
@@ -51,10 +51,10 @@ class TestRunConsolidation:
         ]
 
         with (
-            patch("luke.behaviors.db") as mock_db,
+            patch("luke.behaviors.memory") as mock_memory,
             patch("luke.behaviors.run_agent", new_callable=AsyncMock) as mock_agent,
         ):
-            mock_db.get_consolidation_candidates.return_value = [cluster]
+            mock_memory.get_consolidation_candidates.return_value = [cluster]
             mock_agent.return_value = MagicMock(texts=[])
             await run_consolidation(AsyncMock(), _SEM)
 
@@ -69,7 +69,7 @@ class TestRunConsolidation:
         ]
 
         with (
-            patch("luke.behaviors.db") as mock_db,
+            patch("luke.behaviors.memory") as mock_memory,
             patch("luke.behaviors.run_agent", side_effect=RuntimeError("agent error")),
             patch("luke.behaviors.read_memory_body", return_value="content"),
             patch("luke.behaviors.settings") as mock_settings,
@@ -78,7 +78,7 @@ class TestRunConsolidation:
             mock_settings.consolidation_min_cluster = 3
             mock_settings.max_consolidation_clusters = 3
             mock_settings.agent_timeout = 10
-            mock_db.get_consolidation_candidates.return_value = [cluster]
+            mock_memory.get_consolidation_candidates.return_value = [cluster]
             # Should not raise
             await run_consolidation(AsyncMock(), _SEM)
 
@@ -91,7 +91,7 @@ class TestRunConsolidation:
         ]
 
         with (
-            patch("luke.behaviors.db") as mock_db,
+            patch("luke.behaviors.memory") as mock_memory,
             patch("luke.behaviors.read_memory_body", return_value=""),
             patch("luke.behaviors.settings") as mock_settings,
             patch("luke.behaviors.run_agent", new_callable=AsyncMock) as mock_agent,
@@ -99,7 +99,7 @@ class TestRunConsolidation:
             mock_settings.chat_id = "12345"
             mock_settings.consolidation_min_cluster = 3
             mock_settings.max_consolidation_clusters = 3
-            mock_db.get_consolidation_candidates.return_value = [cluster]
+            mock_memory.get_consolidation_candidates.return_value = [cluster]
             await run_consolidation(AsyncMock(), _SEM)
 
         mock_agent.assert_not_called()
@@ -122,11 +122,11 @@ class TestRunReflection:
         from luke.behaviors import run_reflection
 
         with (
-            patch("luke.behaviors.db") as mock_db,
+            patch("luke.behaviors.memory") as mock_memory,
             patch("luke.behaviors.settings") as mock_settings,
         ):
             mock_settings.chat_id = "12345"
-            mock_db.recall_by_time_window.return_value = []
+            mock_memory.recall_by_time_window.return_value = []
             await run_reflection(AsyncMock(), _SEM)
 
     async def test_with_memories(self, tmp_settings: Any) -> None:
@@ -140,9 +140,10 @@ class TestRunReflection:
 
         with (
             patch("luke.behaviors.db") as mock_db,
+            patch("luke.behaviors.memory") as mock_memory,
             patch("luke.behaviors.run_agent", new_callable=AsyncMock) as mock_agent,
         ):
-            mock_db.recall_by_time_window.return_value = memories
+            mock_memory.recall_by_time_window.return_value = memories
             mock_db.get_recent_messages.return_value = [
                 {"sender_name": "User", "timestamp": "2024-01-01", "content": "Hello"}
             ]
@@ -158,13 +159,14 @@ class TestRunReflection:
 
         with (
             patch("luke.behaviors.db") as mock_db,
+            patch("luke.behaviors.memory") as mock_memory,
             patch("luke.behaviors.run_agent", side_effect=RuntimeError("error")),
             patch("luke.behaviors.read_memory_body", return_value="content"),
             patch("luke.behaviors.settings") as mock_settings,
         ):
             mock_settings.chat_id = "12345"
             mock_settings.agent_timeout = 10
-            mock_db.recall_by_time_window.return_value = memories
+            mock_memory.recall_by_time_window.return_value = memories
             mock_db.get_recent_messages.return_value = []
             await run_reflection(AsyncMock(), _SEM)
 
@@ -187,10 +189,11 @@ class TestRunProactiveScan:
 
         with (
             patch("luke.behaviors.db") as mock_db,
+            patch("luke.behaviors.memory") as mock_memory,
             patch("luke.behaviors.settings") as mock_settings,
         ):
             mock_settings.chat_id = "12345"
-            mock_db.recall.return_value = []
+            mock_memory.recall.return_value = []
             mock_db.get_message_summaries.return_value = []
             await run_proactive_scan(AsyncMock(), _SEM)
 
@@ -211,9 +214,10 @@ class TestRunProactiveScan:
 
         with (
             patch("luke.behaviors.db") as mock_db,
+            patch("luke.behaviors.memory") as mock_memory,
             patch("luke.behaviors.run_agent", new_callable=AsyncMock) as mock_agent,
         ):
-            mock_db.recall.side_effect = [goals, insights]
+            mock_memory.recall.side_effect = [goals, insights]
             mock_db.get_message_summaries.return_value = [
                 {"date": "2024-01-01", "messages": ["User: hi"]}
             ]
@@ -227,13 +231,14 @@ class TestRunProactiveScan:
 
         with (
             patch("luke.behaviors.db") as mock_db,
+            patch("luke.behaviors.memory") as mock_memory,
             patch("luke.behaviors.run_agent", side_effect=RuntimeError("err")),
             patch("luke.behaviors.read_memory_body", return_value="content"),
             patch("luke.behaviors.settings") as mock_settings,
         ):
             mock_settings.chat_id = "12345"
             mock_settings.agent_timeout = 10
-            mock_db.recall.return_value = [
+            mock_memory.recall.return_value = [
                 {"id": "g1", "type": "goal", "title": "G1", "score": 1.0}
             ]
             mock_db.get_message_summaries.return_value = []
@@ -273,12 +278,13 @@ class TestRunDeepWork:
 
         with (
             patch("luke.behaviors.db") as mock_db,
+            patch("luke.behaviors.memory") as mock_memory,
             patch("luke.behaviors.settings") as mock_settings,
         ):
             mock_settings.chat_id = "12345"
             mock_settings.daily_deep_work_budget_usd = 60.0
             mock_db.get_daily_deep_work_cost.return_value = 0.0
-            mock_db.recall.return_value = []
+            mock_memory.recall.return_value = []
             await run_deep_work(AsyncMock(), _SEM)
 
     async def test_with_goals(self, tmp_settings: Any) -> None:
@@ -293,10 +299,11 @@ class TestRunDeepWork:
 
         with (
             patch("luke.behaviors.db") as mock_db,
+            patch("luke.behaviors.memory") as mock_memory,
             patch("luke.behaviors.run_agent", new_callable=AsyncMock) as mock_agent,
         ):
             mock_db.get_daily_deep_work_cost.return_value = 0.0
-            mock_db.recall.return_value = goals
+            mock_memory.recall.return_value = goals
             mock_agent.return_value = MagicMock(texts=[])
             await run_deep_work(AsyncMock(), _SEM)
 
@@ -311,6 +318,7 @@ class TestRunDeepWork:
 
         with (
             patch("luke.behaviors.db") as mock_db,
+            patch("luke.behaviors.memory") as mock_memory,
             patch("luke.behaviors.run_agent", side_effect=RuntimeError("err")),
             patch("luke.behaviors.read_memory_body", return_value="content"),
             patch("luke.behaviors.settings") as mock_settings,
@@ -323,7 +331,7 @@ class TestRunDeepWork:
             mock_settings.deep_work_max_budget_usd = 3.0
             mock_settings.workspace_dir = Path("/tmp/test_workspace")
             mock_db.get_daily_deep_work_cost.return_value = 0.0
-            mock_db.recall.return_value = [
+            mock_memory.recall.return_value = [
                 {"id": "g1", "type": "goal", "title": "G1", "score": 1.0}
             ]
             await run_deep_work(AsyncMock(), _SEM)
@@ -333,6 +341,7 @@ class TestRunDeepWork:
 
         with (
             patch("luke.behaviors.db") as mock_db,
+            patch("luke.behaviors.memory") as mock_memory,
             patch("luke.behaviors.read_memory_body", return_value=""),
             patch("luke.behaviors.settings") as mock_settings,
             patch("luke.behaviors.run_agent", new_callable=AsyncMock) as mock_agent,
@@ -342,7 +351,7 @@ class TestRunDeepWork:
             mock_settings.daily_deep_work_budget_usd = 60.0
             mock_settings.workspace_dir = Path("/tmp/test_workspace")
             mock_db.get_daily_deep_work_cost.return_value = 0.0
-            mock_db.recall.return_value = [
+            mock_memory.recall.return_value = [
                 {"id": "g1", "type": "goal", "title": "G1", "score": 1.0}
             ]
             await run_deep_work(AsyncMock(), _SEM)

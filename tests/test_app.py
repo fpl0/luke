@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from luke.db import MemoryResult
+from luke.memory import MemoryResult
 
 # ---------------------------------------------------------------------------
 # Error throttling
@@ -419,6 +419,7 @@ class TestProcess:
         # Cleanup
         app_mod._retry_counts.pop(chat_id, None)
 
+    @pytest.mark.filterwarnings("ignore::RuntimeWarning")
     async def test_max_retries_advances_cursor(self) -> None:
         """After max_retries failures, cursor should advance and user notified."""
         import luke.app as app_mod

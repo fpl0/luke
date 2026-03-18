@@ -11,10 +11,10 @@ import structlog
 from aiogram import Bot
 from structlog.stdlib import BoundLogger
 
-from . import db
+from . import db, memory
 from .agent import AgentResult, run_agent
 from .config import settings
-from .db import read_memory_body, sanitize_memory_id
+from .memory import read_memory_body, sanitize_memory_id
 
 log: BoundLogger = structlog.get_logger()
 
@@ -81,7 +81,7 @@ async def run_consolidation(bot: Bot, sem: asyncio.Semaphore) -> None:
     if not settings.chat_id:
         return
 
-    clusters = db.get_consolidation_candidates(settings.consolidation_min_cluster)
+    clusters = memory.get_consolidation_candidates(settings.consolidation_min_cluster)
     if not clusters:
         return
 
@@ -118,7 +118,7 @@ async def run_reflection(bot: Bot, sem: asyncio.Semaphore) -> None:
     now = datetime.now(UTC)
     week_ago = (now - timedelta(days=7)).isoformat()
 
-    recent = db.recall_by_time_window(after=week_ago, before=now.isoformat())
+    recent = memory.recall_by_time_window(after=week_ago, before=now.isoformat())
     if not recent:
         return
 
@@ -175,7 +175,7 @@ async def run_proactive_scan(bot: Bot, sem: asyncio.Semaphore) -> None:
     sections: list[str] = []
 
     # Active goals
-    goals = db.recall(mem_type="goal", limit=10)
+    goals = memory.recall(mem_type="goal", limit=10)
     if goals:
         goal_lines: list[str] = []
         for g in goals:
@@ -186,7 +186,7 @@ async def run_proactive_scan(bot: Bot, sem: asyncio.Semaphore) -> None:
             sections.append("Active goals:\n" + "\n---\n".join(goal_lines))
 
     # Recent insights (type-scoped query avoids fetching all types)
-    recent_insights = db.recall(
+    recent_insights = memory.recall(
         mem_type="insight",
         after=week_ago,
         before=now.isoformat(),
@@ -247,7 +247,7 @@ async def run_deep_work(bot: Bot, sem: asyncio.Semaphore) -> None:
         log.info("deep_work_budget_exhausted", daily_cost=daily_cost)
         return
 
-    goals = db.recall(mem_type="goal", limit=10)
+    goals = memory.recall(mem_type="goal", limit=10)
     if not goals:
         return
 

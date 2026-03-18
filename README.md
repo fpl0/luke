@@ -79,7 +79,8 @@ luke/
 ├── src/luke/
 │   ├── app.py               # Telegram handlers + agent dispatch
 │   ├── agent.py             # Claude SDK client + 27 MCP tools + model routing
-│   ├── db.py                # SQLite: messages, sessions, memory FTS5
+│   ├── memory.py            # Memory: FTS5 indexing, semantic search, graph, scoring
+│   ├── db.py                # SQLite: messages, sessions, tasks, cost tracking
 │   ├── config.py            # pydantic-settings from .env
 │   ├── scheduler.py         # Cron/interval/once task execution
 │   ├── behaviors.py         # Consolidation, reflection, proactive scan, deep work

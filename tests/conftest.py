@@ -14,6 +14,7 @@ import pytest
 
 from luke import db
 from luke.config import settings
+from luke.memory import MEMORY_DIRS
 
 
 def _clear_cached_properties() -> None:
@@ -41,7 +42,7 @@ def test_db(tmp_settings: Any) -> Any:
     tmp_settings.store_dir.mkdir(parents=True, exist_ok=True)
     # Create memory subdirs
     tmp_settings.memory_dir.mkdir(parents=True, exist_ok=True)
-    for subdir in db.MEMORY_DIRS.values():
+    for subdir in MEMORY_DIRS.values():
         (tmp_settings.memory_dir / subdir).mkdir(exist_ok=True)
     # Set chat_id for tests
     tmp_settings.chat_id = "12345"
