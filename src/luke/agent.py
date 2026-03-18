@@ -561,7 +561,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
                 memory.record_memory_change(mem_id, changes)
         raw_imp = args.get("importance")
         imp: float | None = max(0.1, min(2.0, float(raw_imp))) if raw_imp is not None else None
-        await asyncio.to_thread(
+        emb = await asyncio.to_thread(
             memory.index_memory,
             mem_id,
             mem_type,
@@ -577,6 +577,26 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
         status = f"Remembered: {mem_id}"
         if change_note:
             status += change_note
+        # Overlap detection for insights and entities (reuse embedding from index)
+        if mem_type in ("insight", "entity"):
+            similar = await asyncio.to_thread(
+                memory.find_similar,
+                mem_id,
+                mem_type,
+                args["content"],
+                limit=3,
+                embedding=emb,
+            )
+            if similar:
+                items = "; ".join(
+                    f"{s['id']} ({s['similarity']:.0%}): {s['body_preview'][:80]}" for s in similar
+                )
+                status += (
+                    f"\n\nSimilar existing memories — review for overlap, "
+                    f"contradiction, or consolidation:\n{items}\n"
+                    f"Consider: merge content, archive old + 'supersedes' link, "
+                    f"or keep both if complementary."
+                )
         return _ok(status)
 
     @tool(
@@ -637,17 +657,24 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
 
     @tool(
         "connect",
-        "Link two memories with a relationship",
-        {"from_id": str, "to_id": str, "relationship": str},
+        "Link two memories. Labels: related, involves, contributes_to, derived_from, "
+        "uses, about, informed_by, supports, caused, supersedes, contradicts, "
+        "blocked_by, enables. Set supersedes_rel to invalidate an old relationship.",
+        {"from_id": str, "to_id": str, "relationship": str, "supersedes_rel": str},
     )
     async def mem_link(args: dict[str, Any]) -> dict[str, Any]:
+        note = ""
+        if supersedes_rel := args.get("supersedes_rel"):
+            invalidated = memory.invalidate_link(args["from_id"], args["to_id"], supersedes_rel)
+            if invalidated:
+                note = f" (invalidated '{supersedes_rel}')"
         created = memory.link_memories(args["from_id"], args["to_id"], args["relationship"])
         # Linking is a graph-write, not retrieval — track access but not utility
         memory.touch_memories([args["from_id"], args["to_id"]], useful=False)
         rel = args["relationship"]
         if created:
-            return _ok(f"Linked: {args['from_id']} —{rel}→ {args['to_id']}")
-        return _ok(f"Already linked: {args['from_id']} —{rel}→ {args['to_id']}")
+            return _ok(f"Linked: {args['from_id']} —{rel}→ {args['to_id']}{note}")
+        return _ok(f"Already linked: {args['from_id']} —{rel}→ {args['to_id']}{note}")
 
     # --- Restore + Bulk memory (2 tools) ---
 

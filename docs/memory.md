@@ -57,6 +57,10 @@ The system distinguishes two kinds of memory access:
 
 The **utility rate** (`useful_count / access_count`) modulates the access score: memories with high utility (frequently used by the agent) get full credit, while memories that are frequently auto-injected but rarely used explicitly get a mild penalty (30% reduction). This closes the feedback loop — the scoring system learns which memories are actually useful.
 
+**Response-aware upgrade:** After the agent responds, auto-injected memories whose IDs appear in the response text get upgraded to `useful=True`. This closes the feedback loop — auto-injection no longer permanently penalizes utility scores.
+
+**Retrieval miss logging:** When the agent explicitly recalls memories not found in auto-injection, the query and missed IDs are logged to `recall_misses` for future analysis.
+
 ## Adaptive Forgetting
 
 Hourly, each memory's importance decays at a type-specific rate:
@@ -77,6 +81,10 @@ Memories connect via `memory_links` with labeled, weighted edges. Traversal is b
 
 **Hebbian co-access strengthening:** when multiple linked memories are recalled together (intentional access), the link weight between them increases by 0.05 (capped at 5.0). Over time, frequently co-recalled memories develop stronger associations, improving graph-based retrieval quality. Link weights are preserved when re-linking — `INSERT OR IGNORE` semantics prevent resetting accumulated weight.
 
+**Temporal Validity:** Links have `valid_from` and `valid_until` columns. `valid_from` is set when a link is created. `valid_until` is set when a link is invalidated (via `invalidate_link()` or the `connect` tool's `supersedes_rel` parameter). Graph traversal filters out expired links by default. Expired links are preserved for history — never deleted.
+
+**Causal Relationships:** Standard labels: `related`, `involves`, `contributes_to`, `derived_from`, `uses`, `about`, `informed_by`, `supports`, `caused`, `supersedes`, `contradicts`, `blocked_by`, `enables`. Default labels are assigned based on type pairs (episode→entity = "involves", insight→entity = "about", etc.). Causal labels (`caused`, `derived_from`, `supersedes`, `contradicts`, `supports`, `blocked_by`, `enables`) are prioritized in graph traversal when the query implies causal intent ("why", "because", "reason").
+
 ## Auto-Injection
 
 On every `process()` call:
@@ -95,9 +103,15 @@ Effort classification runs *before* injection so injected context doesn't inflat
 
 When updating an entity, `detect_changes()` compares old and new content and reports what changed back to the agent. Changes are recorded in the `memory_history` table, creating a timeline of how entities evolved. The `memory_history` tool lets the agent query "when did X change?"
 
+**Overlap Detection:** When saving an insight or entity, `find_similar()` checks for semantically similar existing memories of the same type. Results surfaced to the agent in the `remember` tool response. Agent decides: merge, archive old + supersedes link, or keep both.
+
 ## Consolidation
 
 Daily behavior clusters related episodes (≥2 shared tags or ≥2 shared links) and asks the agent to synthesize insights. See [autonomous behaviors](autonomous-behaviors.md).
+
+**Insight Consolidation:** Weekly behavior detects clusters of semantically similar non-feedback insights via KNN (sqlite-vec). Synthesizes clusters into authoritative consolidated insights with `derived_from` links. Archives fragments.
+
+**Feedback Consolidation:** Monthly behavior targets `feedback-*` insights specifically. Consolidates into a structured user preferences entity organized by category. Archives individual feedback fragments.
 
 ## Self-Healing
 
@@ -109,3 +123,7 @@ Daily behavior clusters related episodes (≥2 shared tags or ≥2 shared links)
 - **`restore`** tool → reverses archiving
 - **Weekly auto-prune** → archives episodes older than 5 years with importance below 0.1
 - **Hourly cleanup** → removes archived entries from FTS index
+
+## Lifecycle Review
+
+Monthly behavior cross-references stale memories with recent activity. Flags: entities not updated in 90 days (with episode mention count), procedures not accessed in 60 days, completed goals still active. Agent reviews and takes action (update, archive, extract lessons).

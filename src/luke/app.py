@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import fcntl
 import os
+import re
 import shutil
 import signal
 import sys
@@ -278,6 +279,7 @@ async def process(chat_id: str) -> None:
 
         # Run build_prompt, memory recall, and conversation state concurrently
         combined_text = " ".join(m.content for m in messages)
+        _recalled: list[MemoryResult] = []
         if _needs_recall(combined_text):
             prompt, (memory_context, _recalled), conv_state = await asyncio.gather(
                 build_prompt(messages, chat_id),
@@ -383,6 +385,17 @@ async def process(chat_id: str) -> None:
             # Advance cursor only after successful agent run
             db.advance_cursor(chat_id, messages[-1].id)
         _retry_counts.pop(chat_id, None)
+
+        # Upgrade utility for auto-recalled memories the agent actually referenced
+        if _recalled:
+            recalled_ids = [m["id"] for m in _recalled]
+            combined_response = " ".join(result.texts)
+            # Single compiled regex to find all referenced memory IDs at once
+            pattern = re.compile(r"\b(" + "|".join(re.escape(mid) for mid in recalled_ids) + r")\b")
+            found = set(pattern.findall(combined_response))
+            referenced = [mid for mid in recalled_ids if mid in found]
+            if referenced:
+                _fire_and_forget(asyncio.to_thread(touch_memories, referenced, useful_only=True))
 
         # Session loss detection
         if session_id and result.session_id != session_id:

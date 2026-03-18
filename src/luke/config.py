@@ -50,8 +50,15 @@ class Settings(BaseSettings):
     decay_rate_goal: float = 0.9997
 
     # Consolidation
-    consolidation_interval: float = 43200.0  # twice daily (seconds)
+    episode_consolidation_interval: float = 43200.0  # twice daily (seconds)
     consolidation_min_cluster: int = 2
+
+    # Insight consolidation
+    insight_consolidation_interval: float = 604800.0  # weekly
+    feedback_consolidation_interval: float = 2592000.0  # monthly
+
+    # Lifecycle review
+    lifecycle_review_interval: float = 2592000.0  # monthly (30 days)
 
     # FTS retention
     fts_retention_days: int = 1825  # 5 years; prune low-importance episodes older than this

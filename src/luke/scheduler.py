@@ -14,7 +14,15 @@ from structlog.stdlib import BoundLogger
 
 from . import db, memory
 from .agent import run_agent
-from .behaviors import run_consolidation, run_deep_work, run_proactive_scan, run_reflection
+from .behaviors import (
+    run_consolidation,
+    run_deep_work,
+    run_feedback_consolidation,
+    run_insight_consolidation,
+    run_lifecycle_review,
+    run_proactive_scan,
+    run_reflection,
+)
 from .config import settings
 from .db import TaskRecord, ensure_utc
 
@@ -159,10 +167,17 @@ async def start_scheduler_loop(
         return now_mono - elapsed
 
     last_cleanup = _load_offset("cleanup", settings.cleanup_interval)
-    last_consolidation = _load_offset("consolidation", settings.consolidation_interval)
+    last_consolidation = _load_offset("consolidation", settings.episode_consolidation_interval)
     last_reflection = _load_offset("reflection", settings.reflection_interval)
     last_proactive = _load_offset("proactive_scan", settings.proactive_scan_interval)
     last_deep_work = _load_offset("deep_work", settings.deep_work_interval)
+    last_insight_consolidation = _load_offset(
+        "insight_consolidation", settings.insight_consolidation_interval
+    )
+    last_feedback_consolidation = _load_offset(
+        "feedback_consolidation", settings.feedback_consolidation_interval
+    )
+    last_lifecycle_review = _load_offset("lifecycle_review", settings.lifecycle_review_interval)
 
     while not (shutdown and shutdown.is_set()):
         # Use wait with timeout so we wake up promptly on shutdown
@@ -202,7 +217,7 @@ async def start_scheduler_loop(
         # Step 1: Collect and run due maintenance behaviors (short-lived, awaited)
         maintenance_coros: list[tuple[str, Coroutine[object, object, None]]] = []
 
-        if now_mono - last_consolidation >= settings.consolidation_interval:
+        if now_mono - last_consolidation >= settings.episode_consolidation_interval:
             last_consolidation = now_mono
             maintenance_coros.append(("consolidation", run_consolidation(bot, sem)))
 
@@ -217,6 +232,20 @@ async def start_scheduler_loop(
             pruned = memory.prune_old_fts_entries(settings.fts_retention_days)
             if pruned:
                 log.info("fts_pruned", count=pruned)
+
+        if now_mono - last_insight_consolidation >= settings.insight_consolidation_interval:
+            last_insight_consolidation = now_mono
+            maintenance_coros.append(("insight_consolidation", run_insight_consolidation(bot, sem)))
+
+        if now_mono - last_feedback_consolidation >= settings.feedback_consolidation_interval:
+            last_feedback_consolidation = now_mono
+            maintenance_coros.append(
+                ("feedback_consolidation", run_feedback_consolidation(bot, sem))
+            )
+
+        if now_mono - last_lifecycle_review >= settings.lifecycle_review_interval:
+            last_lifecycle_review = now_mono
+            maintenance_coros.append(("lifecycle_review", run_lifecycle_review(bot, sem)))
 
         if maintenance_coros:
             names = [name for name, _ in maintenance_coros]
