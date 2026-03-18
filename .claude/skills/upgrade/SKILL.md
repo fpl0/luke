@@ -51,7 +51,7 @@ grep -A2 "CREATE TABLE\|CREATE INDEX\|CREATE VIRTUAL" src/luke/db.py
 sqlite3 "$LUKE_DIR/luke.db" ".schema"
 
 # Compare columns for each table
-for table in messages memory_meta memory_links tasks task_logs sessions cursors behavior_state memory_history cost_log reaction_feedback; do
+for table in messages memory_meta memory_links tasks task_logs sessions cursors behavior_state memory_history cost_log reaction_feedback schema_version; do
     sqlite3 "$LUKE_DIR/luke.db" "PRAGMA table_info($table);" 2>/dev/null
 done
 ```
@@ -69,6 +69,69 @@ sqlite3 "$LUKE_DIR/luke.db" "<migration SQL>"
 ```
 
 If the live schema matches the code, this step is a no-op.
+
+## 4b. Apply Data Migrations
+
+Data migrations are versioned alongside schema migrations in the `schema_version` table. Check the current version and run any pending data migrations:
+
+```bash
+source .env 2>/dev/null
+LUKE_DIR="${LUKE_DIR:-$HOME/.luke}"
+CURRENT=$(sqlite3 "$LUKE_DIR/luke.db" "SELECT COALESCE(MAX(version), 0) FROM schema_version" 2>/dev/null || echo 0)
+echo "Current schema version: $CURRENT"
+```
+
+**Version 4: Backfill valid_from + normalize ad-hoc relationship labels**
+Only run if `$CURRENT < 4`:
+```sql
+UPDATE memory_links SET valid_from = created WHERE valid_from = '';
+UPDATE memory_links SET relationship = 'derived_from' WHERE relationship IN ('derived from', 'derived-from', 'originated-from');
+UPDATE memory_links SET relationship = 'caused' WHERE relationship = 'root cause involves';
+UPDATE memory_links SET relationship = 'supports' WHERE relationship IN ('evidence-from', 'pattern exemplified by', 'reinforced-by');
+UPDATE memory_links SET relationship = 'related' WHERE relationship IN ('escalation path involves', 'describes emotional pattern of', 'complements');
+INSERT INTO schema_version (version) VALUES (4);
+```
+
+**Version 5: Re-label generic 'related' links by type pair**
+Only run if `$CURRENT < 5`:
+```sql
+UPDATE memory_links SET relationship = 'involves' WHERE relationship = 'related' AND from_id IN (SELECT id FROM memory_meta WHERE type = 'episode') AND to_id IN (SELECT id FROM memory_meta WHERE type = 'entity');
+UPDATE memory_links SET relationship = 'contributes_to' WHERE relationship = 'related' AND from_id IN (SELECT id FROM memory_meta WHERE type = 'episode') AND to_id IN (SELECT id FROM memory_meta WHERE type = 'goal');
+UPDATE memory_links SET relationship = 'derived_from' WHERE relationship = 'related' AND from_id IN (SELECT id FROM memory_meta WHERE type = 'episode') AND to_id IN (SELECT id FROM memory_meta WHERE type = 'insight');
+UPDATE memory_links SET relationship = 'uses' WHERE relationship = 'related' AND from_id IN (SELECT id FROM memory_meta WHERE type = 'episode') AND to_id IN (SELECT id FROM memory_meta WHERE type = 'procedure');
+UPDATE memory_links SET relationship = 'about' WHERE relationship = 'related' AND from_id IN (SELECT id FROM memory_meta WHERE type = 'insight') AND to_id IN (SELECT id FROM memory_meta WHERE type = 'entity');
+UPDATE memory_links SET relationship = 'about' WHERE relationship = 'related' AND from_id IN (SELECT id FROM memory_meta WHERE type = 'insight') AND to_id IN (SELECT id FROM memory_meta WHERE type = 'goal');
+UPDATE memory_links SET relationship = 'supports' WHERE relationship = 'related' AND from_id IN (SELECT id FROM memory_meta WHERE type = 'insight') AND to_id IN (SELECT id FROM memory_meta WHERE type = 'insight');
+UPDATE memory_links SET relationship = 'involves' WHERE relationship = 'related' AND from_id IN (SELECT id FROM memory_meta WHERE type = 'goal') AND to_id IN (SELECT id FROM memory_meta WHERE type = 'entity');
+UPDATE memory_links SET relationship = 'informed_by' WHERE relationship = 'related' AND from_id IN (SELECT id FROM memory_meta WHERE type = 'goal') AND to_id IN (SELECT id FROM memory_meta WHERE type = 'insight');
+UPDATE memory_links SET relationship = 'about' WHERE relationship = 'related' AND from_id IN (SELECT id FROM memory_meta WHERE type = 'procedure') AND to_id IN (SELECT id FROM memory_meta WHERE type = 'entity');
+INSERT INTO schema_version (version) VALUES (5);
+```
+Remaining `related` links (episode↔episode, entity↔entity, etc.) stay as `related`.
+
+**Version 6: Cleanup + trigger feedback consolidation**
+Only run if `$CURRENT < 6`:
+```bash
+# Archive test-mem debugging artifact
+sqlite3 "$LUKE_DIR/luke.db" "UPDATE memory_meta SET status = 'archived' WHERE id = 'test-mem'"
+# Trigger initial feedback consolidation on next scheduler tick
+sqlite3 "$LUKE_DIR/luke.db" "INSERT OR REPLACE INTO behavior_state (name, last_run) VALUES ('feedback_consolidation', '2000-01-01T00:00:00')"
+sqlite3 "$LUKE_DIR/luke.db" "INSERT INTO schema_version (version) VALUES (6)"
+```
+
+Also fix duplicate `#` title headers in 4 memory files (if present):
+- `$LUKE_DIR/memory/entities/person-filipe.md`
+- `$LUKE_DIR/memory/entities/project-clio-i18n.md`
+- `$LUKE_DIR/memory/procedures/procedure-morning-briefing.md`
+- `$LUKE_DIR/memory/procedures/capability-voice-messages.md`
+
+For each, check if the `# Title` line appears twice consecutively and remove the duplicate.
+
+After all data migrations, verify:
+```bash
+echo "Schema version: $(sqlite3 "$LUKE_DIR/luke.db" "SELECT MAX(version) FROM schema_version")"
+echo "Link labels: $(sqlite3 "$LUKE_DIR/luke.db" "SELECT relationship, COUNT(*) FROM memory_links GROUP BY relationship ORDER BY COUNT(*) DESC")"
+```
 
 ## 5. Update LUKE.md Persona
 

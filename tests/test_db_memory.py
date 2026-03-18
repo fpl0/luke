@@ -828,3 +828,175 @@ class TestMemoryHistory:
     def test_empty_changes_not_recorded(self, test_db: Any) -> None:
         memory.record_memory_change("e1", [])
         assert memory.get_memory_history("e1") == []
+
+
+# ---------------------------------------------------------------------------
+# Temporal validity on links
+# ---------------------------------------------------------------------------
+
+
+class TestTemporalLinks:
+    def test_link_has_created_and_null_valid_until(self, test_db: Any) -> None:
+        memory.index_memory("a", "entity", "A", "a")
+        memory.index_memory("b", "entity", "B", "b")
+        memory.link_memories("a", "b", "related")
+        row = (
+            db._db()
+            .execute("SELECT created, valid_until FROM memory_links WHERE from_id = 'a'")
+            .fetchone()
+        )
+        assert row["created"] != ""
+        assert row["valid_until"] is None
+
+    def test_invalidate_link(self, test_db: Any) -> None:
+        memory.index_memory("a", "entity", "A", "a")
+        memory.index_memory("b", "entity", "B", "b")
+        memory.link_memories("a", "b", "related")
+        assert memory.invalidate_link("a", "b", "related") is True
+        row = (
+            db._db()
+            .execute(
+                "SELECT valid_until FROM memory_links"
+                " WHERE from_id = 'a' AND relationship = 'related'"
+            )
+            .fetchone()
+        )
+        assert row["valid_until"] is not None and row["valid_until"] != ""
+
+    def test_invalidate_nonexistent(self, test_db: Any) -> None:
+        assert memory.invalidate_link("x", "y", "nope") is False
+
+    def test_invalidate_already_expired(self, test_db: Any) -> None:
+        memory.index_memory("a", "entity", "A", "a")
+        memory.index_memory("b", "entity", "B", "b")
+        memory.link_memories("a", "b", "related")
+        assert memory.invalidate_link("a", "b", "related") is True
+        # Second invalidation returns False (already expired)
+        assert memory.invalidate_link("a", "b", "related") is False
+
+    def test_graph_excludes_expired(self, test_db: Any) -> None:
+        memory.index_memory("a", "entity", "A", "a")
+        memory.index_memory("b", "entity", "B", "b")
+        memory.link_memories("a", "b", "related")
+        memory.invalidate_link("a", "b", "related")
+        results = memory.recall(related_to="a")
+        assert not any(r["id"] == "b" for r in results)
+
+    def test_coexisting_relationships(self, test_db: Any) -> None:
+        """Same pair can have both 'related' and 'caused' active."""
+        memory.index_memory("a", "episode", "A", "a")
+        memory.index_memory("b", "entity", "B", "b")
+        memory.link_memories("a", "b", "related")
+        memory.link_memories("a", "b", "caused")
+        results = memory.recall(related_to="a")
+        assert any(r["id"] == "b" for r in results)
+
+    def test_hebbian_only_active(self, test_db: Any) -> None:
+        memory.index_memory("a", "entity", "A", "a")
+        memory.index_memory("b", "entity", "B", "b")
+        memory.link_memories("a", "b", "related")
+        memory.invalidate_link("a", "b", "related")
+        # Strengthen should not affect expired link
+        memory.touch_memories(["a", "b"], useful=True)
+        row = db._db().execute("SELECT weight FROM memory_links WHERE from_id = 'a'").fetchone()
+        assert row["weight"] == pytest.approx(1.0)  # unchanged
+
+    def test_neighbors_filters_expired(self, test_db: Any) -> None:
+        memory.index_memory("a", "entity", "A", "a")
+        memory.index_memory("b", "entity", "B", "b")
+        memory.link_memories("a", "b", "related")
+        memory.invalidate_link("a", "b", "related")
+        neighbors = memory.get_graph_neighbors(["a"])
+        assert not any(n["id"] == "b" for n in neighbors)
+
+
+# ---------------------------------------------------------------------------
+# Type-pair default labels
+# ---------------------------------------------------------------------------
+
+
+class TestDefaultLabels:
+    def test_episode_entity_label(self, test_db: Any) -> None:
+        memory.index_memory("ep1", "episode", "Episode", "content", links=["ent1"])
+        memory.index_memory("ent1", "entity", "Entity", "content")
+        # Re-index to pick up the link with correct type pair
+        memory.index_memory("ep1", "episode", "Episode", "content", links=["ent1"])
+        row = (
+            db._db()
+            .execute(
+                "SELECT relationship FROM memory_links WHERE from_id = 'ep1' AND to_id = 'ent1'"
+            )
+            .fetchone()
+        )
+        assert row is not None
+        assert row["relationship"] == "involves"
+
+    def test_unmapped_pair_defaults_to_related(self, test_db: Any) -> None:
+        memory.index_memory("a", "entity", "A", "a", links=["b"])
+        memory.index_memory("b", "entity", "B", "b")
+        memory.index_memory("a", "entity", "A", "a", links=["b"])
+        row = (
+            db._db()
+            .execute("SELECT relationship FROM memory_links WHERE from_id = 'a' AND to_id = 'b'")
+            .fetchone()
+        )
+        assert row is not None
+        assert row["relationship"] == "related"
+
+
+# ---------------------------------------------------------------------------
+# Utility tracking
+# ---------------------------------------------------------------------------
+
+
+class TestUsefulOnly:
+    def test_increments_useful_only(self, test_db: Any) -> None:
+        memory.index_memory("a", "entity", "A", "a")
+        before = (
+            db._db()
+            .execute("SELECT access_count, useful_count FROM memory_meta WHERE id = 'a'")
+            .fetchone()
+        )
+        memory.touch_memories(["a"], useful_only=True)
+        after = (
+            db._db()
+            .execute("SELECT access_count, useful_count FROM memory_meta WHERE id = 'a'")
+            .fetchone()
+        )
+        assert after["useful_count"] == before["useful_count"] + 1
+        assert after["access_count"] == before["access_count"]  # unchanged
+
+    def test_empty_list_noop(self, test_db: Any) -> None:
+        memory.touch_memories([], useful_only=True)  # should not raise
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle candidates
+# ---------------------------------------------------------------------------
+
+
+class TestLifecycleCandidates:
+    def test_stale_entity_detected(self, test_db: Any) -> None:
+        memory.index_memory("old-entity", "entity", "Old", "content")
+        # Manually set updated to 100 days ago
+        old_date = (datetime.now(UTC) - timedelta(days=100)).isoformat()
+        db._db().execute("UPDATE memory_meta SET updated = ? WHERE id = 'old-entity'", (old_date,))
+        db._db().commit()
+        candidates = memory.get_lifecycle_candidates()
+        assert any(e["id"] == "old-entity" for e in candidates["stale_entities"])
+
+    def test_fresh_entity_not_flagged(self, test_db: Any) -> None:
+        memory.index_memory("fresh", "entity", "Fresh", "content")
+        candidates = memory.get_lifecycle_candidates()
+        assert not any(e["id"] == "fresh" for e in candidates["stale_entities"])
+
+    def test_unused_procedure_detected(self, test_db: Any) -> None:
+        memory.index_memory("old-proc", "procedure", "Proc", "content")
+        candidates = memory.get_lifecycle_candidates()
+        # last_accessed defaults to '' which counts as unused
+        assert any(p["id"] == "old-proc" for p in candidates["unused_procedures"])
+
+    def test_lingering_goal_detected(self, test_db: Any) -> None:
+        memory.index_memory("done-goal", "goal", "Done", "All done.", tags=["completed"])
+        candidates = memory.get_lifecycle_candidates()
+        assert any(g["id"] == "done-goal" for g in candidates["lingering_goals"])

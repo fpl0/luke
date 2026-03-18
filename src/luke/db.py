@@ -211,6 +211,7 @@ CREATE TABLE IF NOT EXISTS memory_links (
     relationship TEXT NOT NULL,
     weight       REAL NOT NULL DEFAULT 1.0,
     created      TEXT NOT NULL,
+    valid_until  TEXT,
     PRIMARY KEY (from_id, to_id, relationship)
 );
 CREATE INDEX IF NOT EXISTS idx_ml_to ON memory_links(to_id);
@@ -251,17 +252,61 @@ CREATE TABLE IF NOT EXISTS outbound_log (
     timestamp    TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_outbound_hash ON outbound_log(chat_id, content_hash);
+
+CREATE TABLE IF NOT EXISTS schema_version (
+    version INTEGER NOT NULL
+);
+
 """
+
+# ---------------------------------------------------------------------------
+# Versioned migrations
+# ---------------------------------------------------------------------------
+
+_MIGRATIONS: list[tuple[int, str, list[str]]] = [
+    (
+        1,
+        "add consecutive_failures to tasks",
+        [
+            "ALTER TABLE tasks ADD COLUMN consecutive_failures INTEGER NOT NULL DEFAULT 0",
+        ],
+    ),
+    (
+        2,
+        "add temporal validity to memory_links",
+        [
+            "ALTER TABLE memory_links ADD COLUMN valid_until TEXT",
+        ],
+    ),
+]
+
+
+def _run_migrations(db: sqlite3.Connection) -> None:
+    """Run pending schema migrations. Each runs exactly once."""
+    row = db.execute("SELECT MAX(version) FROM schema_version").fetchone()
+    current: int = row[0] if row[0] is not None else 0
+    for version, description, statements in _MIGRATIONS:
+        if version <= current:
+            continue
+        for sql in statements:
+            with contextlib.suppress(sqlite3.OperationalError):
+                db.execute(sql)
+        db.execute("INSERT INTO schema_version (version) VALUES (?)", (version,))
+        db.commit()
+        log.info("migration_applied", version=version, description=description)
+
+
+def get_schema_version() -> int:
+    """Return the current schema version, or 0 if unversioned."""
+    row = _db().execute("SELECT MAX(version) FROM schema_version").fetchone()
+    return int(row[0]) if row[0] is not None else 0
 
 
 def init() -> None:
     """Create tables (including sqlite-vec virtual table) and run migrations."""
     db = _db()
     db.executescript(_SCHEMA)
-    # Migration: add consecutive_failures column to tasks table
-    with contextlib.suppress(sqlite3.OperationalError):
-        db.execute("ALTER TABLE tasks ADD COLUMN consecutive_failures INTEGER NOT NULL DEFAULT 0")
-    db.commit()
+    _run_migrations(db)
 
 
 # ---------------------------------------------------------------------------

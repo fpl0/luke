@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import collections
 import hashlib
 import json
 import math
@@ -34,6 +35,51 @@ MEMORY_DIRS: dict[str, str] = {
     "goal": "goals",
 }
 _DIR_TO_TYPE: dict[str, str] = {v: k for k, v in MEMORY_DIRS.items()}
+
+# Causal labels — prioritized in graph traversal for "why" queries
+CAUSAL_RELATIONSHIPS: frozenset[str] = frozenset(
+    {"caused", "derived_from", "supersedes", "contradicts", "supports", "blocked_by", "enables"}
+)
+
+# All standard relationship labels — built from causal + contextual to avoid maintaining two lists
+RELATIONSHIP_LABELS: frozenset[str] = CAUSAL_RELATIONSHIPS | frozenset(
+    {"related", "involves", "contributes_to", "uses", "about", "informed_by"}
+)
+
+# Default label based on (from_type, to_type) pair — fallback is "related"
+_DEFAULT_RELATIONSHIP: dict[tuple[str, str], str] = {
+    ("episode", "entity"): "involves",
+    ("episode", "goal"): "contributes_to",
+    ("episode", "insight"): "derived_from",
+    ("episode", "procedure"): "uses",
+    ("insight", "entity"): "about",
+    ("insight", "goal"): "about",
+    ("insight", "insight"): "supports",
+    ("goal", "entity"): "involves",
+    ("goal", "insight"): "informed_by",
+    ("procedure", "entity"): "about",
+}
+
+_CAUSAL_QUERY_RE = re.compile(
+    r"\b(why|because|reason|cause[ds]?|led to|result of|due to|motivated)\b", re.IGNORECASE
+)
+
+assert CAUSAL_RELATIONSHIPS <= RELATIONSHIP_LABELS, "causal labels must be a subset of all labels"
+
+
+def _valid_link_clause(alias: str = "") -> str:
+    """SQL clause for filtering active (non-expired) links."""
+    prefix = f"{alias}." if alias else ""
+    return f"AND ({prefix}valid_until IS NULL OR {prefix}valid_until = '')"
+
+
+# Insight consolidation thresholds — domain constants, not user settings
+_INSIGHT_SIMILARITY_THRESHOLD = 0.65
+_INSIGHT_MIN_CLUSTER = 3
+
+# Lifecycle review thresholds
+_STALE_ENTITY_DAYS = 90
+_UNUSED_PROCEDURE_DAYS = 60
 
 
 class MemoryResult(TypedDict):
@@ -352,7 +398,7 @@ def index_memory(
     tags: list[str] | None = None,
     links: list[str] | None = None,
     importance: float | None = None,
-) -> None:
+) -> list[float] | None:
     # Frontmatter may store tags/links as JSON strings — parse them
     if isinstance(tags, str):
         tags = json.loads(tags)
@@ -407,13 +453,23 @@ def index_memory(
         ),
     )
 
-    # Update links
-    for link_id in links:
-        db.execute(
-            """INSERT OR IGNORE INTO memory_links (from_id, to_id, relationship, weight, created)
-               VALUES (?, ?, 'related', 1.0, ?)""",
-            (mem_id, link_id, now),
-        )
+    # Update links — determine relationship from type pair
+    if links:
+        link_types: dict[str, str] = {}
+        ph = ",".join("?" for _ in links)
+        for row in db.execute(
+            f"SELECT id, type FROM memory_meta WHERE id IN ({ph})", links
+        ).fetchall():
+            link_types[row["id"]] = row["type"]
+        for link_id in links:
+            target_type = link_types.get(link_id, "")
+            rel = _DEFAULT_RELATIONSHIP.get((mem_type, target_type), "related")
+            db.execute(
+                """INSERT OR IGNORE INTO memory_links
+                   (from_id, to_id, relationship, weight, created)
+                   VALUES (?, ?, ?, 1.0, ?)""",
+                (mem_id, link_id, rel, now),
+            )
 
     # Embed for semantic search (None on runtime errors — FTS still works)
     embedding = _embed_passage(f"{title} {content}")
@@ -426,6 +482,7 @@ def index_memory(
             (rowid, blob, mem_id),
         )
     _commit(db)
+    return embedding
 
 
 _FTS_STRIP = re.compile(r'[*"^(){}\[\]:+\-~]')
@@ -563,11 +620,13 @@ def recall(
 
     # --- Strategy 4: Multi-hop graph traversal (BFS, depth up to graph_max_depth) ---
     if related_to:
+        # For causal queries, filter graph traversal to causal edges
+        causal_filter = CAUSAL_RELATIONSHIPS if query and _CAUSAL_QUERY_RE.search(query) else None
         visited: set[str] = {related_to}
         frontier = [related_to]
         for depth in range(settings.graph_max_depth):
             hop_weight = settings.graph_decay_per_hop ** (depth + 1)
-            neighbors = _get_neighbors_batch(db, frontier)
+            neighbors = _get_neighbors_batch(db, frontier, relationship_filter=causal_filter)
             next_frontier: list[str] = []
             for n in neighbors:
                 if n["id"] not in visited:
@@ -627,11 +686,27 @@ def recall(
 # ---------------------------------------------------------------------------
 
 
-def _get_neighbors_batch(db: sqlite3.Connection, node_ids: list[str]) -> list[dict[str, Any]]:
-    """Get bidirectional graph neighbors of multiple memory nodes in one query."""
+def _get_neighbors_batch(
+    db: sqlite3.Connection,
+    node_ids: list[str],
+    *,
+    relationship_filter: frozenset[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Get bidirectional graph neighbors of multiple memory nodes in one query.
+
+    Only returns currently-valid links (valid_until IS NULL or empty).
+    Optionally filters to specific relationship types.
+    """
     if not node_ids:
         return []
     ph = ",".join("?" for _ in node_ids)
+    valid_clause = _valid_link_clause("ml")
+    rel_clause = ""
+    rel_params: tuple[str, ...] = ()
+    if relationship_filter:
+        rel_ph = ",".join("?" for _ in relationship_filter)
+        rel_clause = f"AND ml.relationship IN ({rel_ph})"
+        rel_params = tuple(relationship_filter)
     rows = db.execute(
         f"""SELECT ml.to_id AS id, m.type, f.title, ml.relationship, ml.weight,
                    m.importance, m.access_count, m.useful_count, m.updated
@@ -639,14 +714,16 @@ def _get_neighbors_batch(db: sqlite3.Connection, node_ids: list[str]) -> list[di
             JOIN memory_meta m ON ml.to_id = m.id
             JOIN memory_fts f ON ml.to_id = f.id
             WHERE ml.from_id IN ({ph}) AND m.status = 'active'
+            {valid_clause} {rel_clause}
             UNION
             SELECT ml.from_id AS id, m.type, f.title, ml.relationship, ml.weight,
                    m.importance, m.access_count, m.useful_count, m.updated
             FROM memory_links ml
             JOIN memory_meta m ON ml.from_id = m.id
             JOIN memory_fts f ON ml.from_id = f.id
-            WHERE ml.to_id IN ({ph}) AND m.status = 'active'""",
-        (*node_ids, *node_ids),
+            WHERE ml.to_id IN ({ph}) AND m.status = 'active'
+            {valid_clause} {rel_clause}""",
+        (*node_ids, *rel_params, *node_ids, *rel_params),
     ).fetchall()
     return [dict(r) for r in rows]
 
@@ -701,25 +778,31 @@ def _apply_composite_scores(results: dict[str, dict[str, Any]]) -> None:
             entry["score"] = context_norm * 0.3
 
 
-def touch_memories(mem_ids: list[str], *, useful: bool = True) -> None:
+def touch_memories(mem_ids: list[str], *, useful: bool = True, useful_only: bool = False) -> None:
     """Increment access_count and update last_accessed. If *useful*, also increment
-    useful_count and strengthen co-access graph links (Hebbian learning)."""
+    useful_count and strengthen co-access graph links (Hebbian learning).
+    If *useful_only*, increment only useful_count (for retroactive utility upgrade)."""
     if not mem_ids:
         return
     conn = _db()
     now = datetime.now(UTC).isoformat()
     ph = ",".join("?" for _ in mem_ids)
-    set_clause = (
-        "access_count = access_count + 1, useful_count = useful_count + 1, last_accessed = ?"
-        if useful
-        else "access_count = access_count + 1, last_accessed = ?"
-    )
-    conn.execute(f"UPDATE memory_meta SET {set_clause} WHERE id IN ({ph})", (now, *mem_ids))
-    # Hebbian co-access: strengthen existing links between co-recalled memories
+    if useful_only:
+        set_clause = "useful_count = useful_count + 1"
+        conn.execute(f"UPDATE memory_meta SET {set_clause} WHERE id IN ({ph})", mem_ids)
+    else:
+        set_clause = (
+            "access_count = access_count + 1, useful_count = useful_count + 1, last_accessed = ?"
+            if useful
+            else "access_count = access_count + 1, last_accessed = ?"
+        )
+        conn.execute(f"UPDATE memory_meta SET {set_clause} WHERE id IN ({ph})", (now, *mem_ids))
+    # Hebbian co-access: strengthen existing active links between co-recalled memories
     if useful and len(mem_ids) > 1:
         conn.execute(
             f"""UPDATE memory_links SET weight = MIN(weight + 0.05, 5.0)
-                WHERE from_id IN ({ph}) AND to_id IN ({ph})""",
+                WHERE from_id IN ({ph}) AND to_id IN ({ph})
+                {_valid_link_clause()}""",
             (*mem_ids, *mem_ids),
         )
     _commit(conn)
@@ -731,20 +814,21 @@ def get_graph_neighbors(mem_ids: list[str], *, limit: int = 3) -> list[MemoryRes
         return []
     conn = _db()
     ph = ",".join("?" for _ in mem_ids)
+    valid = _valid_link_clause("ml")
     rows = conn.execute(
         f"""SELECT DISTINCT m.id, m.type, f.title, ml.relationship
             FROM memory_links ml
             JOIN memory_meta m ON ml.to_id = m.id
             JOIN memory_fts f ON ml.to_id = f.id
             WHERE ml.from_id IN ({ph}) AND m.status = 'active'
-              AND ml.to_id NOT IN ({ph})
+              AND ml.to_id NOT IN ({ph}) {valid}
             UNION
             SELECT DISTINCT m.id, m.type, f.title, ml.relationship
             FROM memory_links ml
             JOIN memory_meta m ON ml.from_id = m.id
             JOIN memory_fts f ON ml.from_id = f.id
             WHERE ml.to_id IN ({ph}) AND m.status = 'active'
-              AND ml.from_id NOT IN ({ph})
+              AND ml.from_id NOT IN ({ph}) {valid}
             LIMIT ?""",
         (*mem_ids, *mem_ids, *mem_ids, *mem_ids, limit),
     ).fetchall()
@@ -835,9 +919,24 @@ def link_memories(from_id: str, to_id: str, relationship: str) -> bool:
     conn = _db()
     now = datetime.now(UTC).isoformat()
     cur = conn.execute(
-        """INSERT OR IGNORE INTO memory_links (from_id, to_id, relationship, weight, created)
+        """INSERT OR IGNORE INTO memory_links
+           (from_id, to_id, relationship, weight, created)
            VALUES (?, ?, ?, 1.0, ?)""",
         (from_id, to_id, relationship, now),
+    )
+    _commit(conn)
+    return cur.rowcount > 0
+
+
+def invalidate_link(from_id: str, to_id: str, relationship: str) -> bool:
+    """Set valid_until on a specific link. Returns True if found and invalidated."""
+    conn = _db()
+    now = datetime.now(UTC).isoformat()
+    cur = conn.execute(
+        f"""UPDATE memory_links SET valid_until = ?
+           WHERE from_id = ? AND to_id = ? AND relationship = ?
+           {_valid_link_clause()}""",
+        (now, from_id, to_id, relationship),
     )
     _commit(conn)
     return cur.rowcount > 0
@@ -913,6 +1012,217 @@ def get_memory_history(mem_id: str, limit: int = 20) -> list[dict[str, Any]]:
         .fetchall()
     )
     return [{"changes": json.loads(r["changed_fields"]), "timestamp": r["timestamp"]} for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Overlap / contradiction detection
+# ---------------------------------------------------------------------------
+
+
+def find_similar(
+    mem_id: str,
+    mem_type: str,
+    content: str,
+    *,
+    limit: int = 5,
+    embedding: list[float] | None = None,
+) -> list[dict[str, Any]]:
+    """Find existing memories of the same type that are semantically similar.
+
+    Used to surface potential overlaps, contradictions, or consolidation
+    candidates when saving a new insight or entity. The caller (agent)
+    decides what to do — no automated threshold-based judgment.
+
+    If *embedding* is provided, skip re-embedding (saves ~100ms CPU).
+    """
+    if embedding is None:
+        embedding = _embed_passage(content)
+    if embedding is None:
+        return []
+    candidates = _semantic_search(
+        embedding,
+        mem_type=mem_type,
+        limit=limit + 1,  # +1 to account for self-match
+        include_private=True,
+    )
+    results: list[dict[str, Any]] = []
+    for c in candidates:
+        if c["id"] == mem_id:
+            continue
+        body = read_memory_body(c["type"], c["id"], 300)
+        results.append(
+            {
+                "id": c["id"],
+                "title": c["title"],
+                "similarity": round(c["score"], 3),
+                "body_preview": body[:200] if body else "",
+            }
+        )
+        if len(results) >= limit:
+            break
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Insight clustering (for consolidation)
+# ---------------------------------------------------------------------------
+
+
+def get_insight_clusters(
+    *,
+    similarity_threshold: float | None = None,
+    min_cluster: int | None = None,
+    exclude_tags: frozenset[str] | None = None,
+) -> list[list[dict[str, Any]]]:
+    """Find clusters of semantically similar active insights.
+
+    Uses KNN via sqlite-vec (O(n·K), not O(n²) pairwise). Scalable to thousands.
+    """
+    if similarity_threshold is None:
+        similarity_threshold = _INSIGHT_SIMILARITY_THRESHOLD
+    if min_cluster is None:
+        min_cluster = _INSIGHT_MIN_CLUSTER
+    if exclude_tags is None:
+        exclude_tags = frozenset({"feedback"})
+
+    db = _db()
+    rows = db.execute(
+        "SELECT id, tags_json FROM memory_meta WHERE type = 'insight' AND status = 'active'"
+    ).fetchall()
+
+    # Filter out excluded tags
+    insight_ids: list[str] = []
+    for r in rows:
+        tags = set(json.loads(r["tags_json"]))
+        if not (exclude_tags & tags):
+            insight_ids.append(r["id"])
+
+    if len(insight_ids) < min_cluster:
+        return []
+
+    # Build neighbor graph via KNN — for each insight, find top-5 nearest among others
+    adjacency: dict[str, set[str]] = {mid: set() for mid in insight_ids}
+    id_set = set(insight_ids)
+
+    for mid in insight_ids:
+        # Fetch this memory's embedding
+        row = db.execute("SELECT embedding FROM memory_vec WHERE memory_id = ?", (mid,)).fetchone()
+        if row is None:
+            continue
+        vec = list(struct.unpack(f"{len(row['embedding']) // 4}f", row["embedding"]))
+        neighbors = _semantic_search(vec, mem_type="insight", limit=6, include_private=True)
+        for n in neighbors:
+            if n["id"] != mid and n["id"] in id_set and n["score"] >= similarity_threshold:
+                adjacency[mid].add(n["id"])
+                adjacency.setdefault(n["id"], set()).add(mid)
+
+    # BFS to find connected components
+    visited: set[str] = set()
+    clusters: list[list[dict[str, Any]]] = []
+
+    for start in insight_ids:
+        if start in visited:
+            continue
+        component: list[str] = []
+        queue = collections.deque([start])
+        while queue:
+            node = queue.popleft()
+            if node in visited:
+                continue
+            visited.add(node)
+            component.append(node)
+            queue.extend(adjacency.get(node, set()) - visited)
+        if len(component) >= min_cluster:
+            # Fetch metadata for cluster members
+            ph = ",".join("?" for _ in component)
+            meta_rows = db.execute(
+                f"""SELECT m.id, m.type, f.title, m.created, m.updated, m.importance
+                    FROM memory_meta m JOIN memory_fts f ON m.id = f.id
+                    WHERE m.id IN ({ph})""",
+                component,
+            ).fetchall()
+            clusters.append([dict(r) for r in meta_rows])
+
+    return clusters
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle review
+# ---------------------------------------------------------------------------
+
+
+def get_lifecycle_candidates() -> dict[str, list[dict[str, Any]]]:
+    """Find memories needing review, with context from recent activity.
+
+    Returns dict with keys: stale_entities, unused_procedures, lingering_goals.
+    """
+    db = _db()
+    result: dict[str, list[dict[str, Any]]] = {
+        "stale_entities": [],
+        "unused_procedures": [],
+        "lingering_goals": [],
+    }
+
+    stale_cutoff = (datetime.now(UTC) - timedelta(days=_STALE_ENTITY_DAYS)).isoformat()
+    unused_cutoff = (datetime.now(UTC) - timedelta(days=_UNUSED_PROCEDURE_DAYS)).isoformat()
+
+    # Stale entities: not updated in N days + cross-reference with recent episodes
+    stale_rows = db.execute(
+        """SELECT id, type, updated FROM memory_meta
+           WHERE type = 'entity' AND status = 'active' AND updated < ?""",
+        (stale_cutoff,),
+    ).fetchall()
+    for r in stale_rows:
+        # Count recent episodes mentioning this entity via FTS
+        try:
+            mention_row = db.execute(
+                "SELECT COUNT(*) AS cnt FROM memory_fts WHERE type = 'episode' AND content MATCH ?",
+                (r["id"],),
+            ).fetchone()
+            mentions = mention_row["cnt"] if mention_row else 0
+        except sqlite3.OperationalError:
+            mentions = 0
+        result["stale_entities"].append(
+            {
+                "id": r["id"],
+                "type": r["type"],
+                "updated": r["updated"],
+                "recent_mentions": mentions,
+            }
+        )
+
+    # Unused procedures: not accessed in N days
+    unused_rows = db.execute(
+        """SELECT id, type, last_accessed FROM memory_meta
+           WHERE type = 'procedure' AND status = 'active'
+           AND (last_accessed = '' OR last_accessed < ?)""",
+        (unused_cutoff,),
+    ).fetchall()
+    result["unused_procedures"] = [dict(r) for r in unused_rows]
+
+    # Lingering goals: completed tag but still active status
+    goal_rows = db.execute(
+        """SELECT id, type FROM memory_meta
+           WHERE type = 'goal' AND status = 'active'
+           AND tags_json LIKE '%"completed"%'"""
+    ).fetchall()
+    result["lingering_goals"] = [dict(r) for r in goal_rows]
+
+    return result
+
+
+def get_feedback_insight_ids() -> list[str]:
+    """Return IDs of active feedback insights (prefixed 'feedback-' or tagged 'feedback')."""
+    rows = (
+        _db()
+        .execute(
+            """SELECT id FROM memory_meta
+           WHERE type = 'insight' AND status = 'active'
+           AND (id LIKE 'feedback-%' OR tags_json LIKE '%"feedback"%')"""
+        )
+        .fetchall()
+    )
+    return [r["id"] for r in rows]
 
 
 # ---------------------------------------------------------------------------

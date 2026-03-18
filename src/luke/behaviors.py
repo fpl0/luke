@@ -313,3 +313,135 @@ async def run_deep_work(bot: Bot, sem: asyncio.Semaphore) -> None:
         max_sends=1,
         goals_reviewed=len(goals),
     )
+
+
+async def run_feedback_consolidation(bot: Bot, sem: asyncio.Semaphore) -> None:
+    """Consolidate feedback-* insights into a structured user preferences entity."""
+    if not settings.chat_id:
+        return
+
+    feedback_ids = memory.get_feedback_insight_ids()
+    if len(feedback_ids) < 5:
+        return
+
+    contents: list[str] = []
+    for fid in feedback_ids:
+        body = read_memory_body("insight", fid, 500)
+        if body:
+            contents.append(f"[{fid}]: {body}")
+
+    if not contents:
+        return
+
+    prompt = (
+        "Feedback consolidation task. These feedback insights capture user preferences "
+        "as individual fragments. Synthesize into a SINGLE structured entity called "
+        "'user-preferences' organized by category:\n"
+        "- Communication (style, format, frequency)\n"
+        "- Deep work (autonomy, scheduling, process)\n"
+        "- Content (quality, testing, conventions)\n"
+        "- Process (approval workflow, transparency)\n\n"
+        "Steps:\n"
+        "1. Create the 'user-preferences' entity with all preferences consolidated\n"
+        "2. Create 'derived_from' links from the new entity to each original insight\n"
+        "3. Archive the individual feedback insights with 'forget'\n"
+        "4. Keep only genuinely unique insights that don't fit into categories\n\n"
+        + "\n---\n".join(contents)
+    )
+
+    await _run_behavior(
+        "feedback_consolidation",
+        prompt,
+        bot,
+        sem,
+        feedback_count=len(feedback_ids),
+    )
+
+
+async def run_insight_consolidation(bot: Bot, sem: asyncio.Semaphore) -> None:
+    """Consolidate overlapping non-feedback insights into authoritative summaries."""
+    if not settings.chat_id:
+        return
+
+    clusters = memory.get_insight_clusters()
+    if not clusters:
+        return
+
+    for cluster in clusters[: settings.max_consolidation_clusters]:
+        insight_ids = [m["id"] for m in cluster]
+        contents: list[str] = []
+        for m in cluster:
+            body = read_memory_body("insight", m["id"], 500)
+            if body:
+                contents.append(f"[{m['id']}]: {body}")
+        if not contents:
+            continue
+
+        prompt = (
+            "Insight consolidation task. These insights overlap semantically:\n\n"
+            + "\n---\n".join(contents)
+            + "\n\nSteps:\n"
+            "1. Synthesize into ONE authoritative insight that captures all information\n"
+            "2. Create 'derived_from' links from the new insight to each original\n"
+            "3. Archive the individual fragments with 'forget'\n"
+            "4. Connect the new insight to relevant entities\n"
+        )
+
+        await _run_behavior(
+            "insight_consolidation",
+            prompt,
+            bot,
+            sem,
+            insights=insight_ids,
+        )
+
+
+async def run_lifecycle_review(bot: Bot, sem: asyncio.Semaphore) -> None:
+    """Monthly review: flag stale entities, unused procedures, lingering goals."""
+    if not settings.chat_id:
+        return
+
+    candidates = memory.get_lifecycle_candidates()
+    sections: list[str] = []
+
+    if candidates["stale_entities"]:
+        items = []
+        for e in candidates["stale_entities"]:
+            mentions = e.get("recent_mentions", 0)
+            note = f" ({mentions} recent episode mentions)" if mentions else ""
+            items.append(f"  - {e['id']}: last updated {e['updated']}{note}")
+        sections.append("Stale entities (not updated in 90+ days):\n" + "\n".join(items))
+
+    if candidates["unused_procedures"]:
+        items = [
+            f"  - {p['id']}: last accessed {p['last_accessed'] or 'never'}"
+            for p in candidates["unused_procedures"]
+        ]
+        sections.append("Unused procedures (60+ days):\n" + "\n".join(items))
+
+    if candidates["lingering_goals"]:
+        items = [f"  - {g['id']}" for g in candidates["lingering_goals"]]
+        sections.append("Completed goals still active:\n" + "\n".join(items))
+
+    if not sections:
+        return
+
+    prompt = (
+        "Monthly lifecycle review. These memories need attention:\n\n"
+        + "\n\n".join(sections)
+        + "\n\nFor each:\n"
+        "- Stale entities: update with current info, or archive if no longer relevant\n"
+        "- Unused procedures: verify still valid, update or archive\n"
+        "- Lingering goals: extract lessons as episodes, then archive\n"
+        "Do NOT message the user — just take action on the memories.\n"
+    )
+
+    await _run_behavior(
+        "lifecycle_review",
+        prompt,
+        bot,
+        sem,
+        stale=len(candidates["stale_entities"]),
+        unused=len(candidates["unused_procedures"]),
+        lingering=len(candidates["lingering_goals"]),
+    )

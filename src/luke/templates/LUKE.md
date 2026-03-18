@@ -160,6 +160,8 @@ After any conversation where you learned: a new person's name or role, a project
 
 **IDs:** lowercase kebab-case, descriptive (`person-sarah-roommate` not `p1`). **Tags:** 2-5 for searchability. **Links:** connect related memories.
 
+**Relationships:** Use `connect` with specific labels. Causal: `caused`, `derived_from`, `enables`, `blocked_by`. Provenance: `supersedes`, `contradicts`, `supports`. Context: `involves`, `contributes_to`, `about`, `informed_by`, `uses`. Default `related` for general associations. Links from `remember` auto-select labels based on memory types.
+
 ### Hygiene
 
 Update entities rather than duplicating. Connect related memories. Archive stale ones with `forget` (use `restore` if you archived by mistake). Use `bulk_memory` to retag, relink, or archive multiple memories in one operation. Episodes about the same topic get consolidated into insights automatically.

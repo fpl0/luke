@@ -303,10 +303,13 @@ class TestSchedulerLoop:
         ):
             mock_settings.scheduler_interval = 0.01  # Very fast ticks
             mock_settings.cleanup_interval = 999999
-            mock_settings.consolidation_interval = 999999
+            mock_settings.episode_consolidation_interval = 999999
             mock_settings.reflection_interval = 999999
             mock_settings.proactive_scan_interval = 999999
             mock_settings.deep_work_interval = 999999
+            mock_settings.insight_consolidation_interval = 999999
+            mock_settings.feedback_consolidation_interval = 999999
+            mock_settings.lifecycle_review_interval = 999999
             mock_db.get_due_tasks.return_value = []
             mock_db.get_behavior_last_run.return_value = None
 
