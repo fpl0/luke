@@ -172,19 +172,6 @@ def _should_send_error(chat_id: str) -> bool:
 
 _CONV_STATE_ID = "conversation-state-latest"
 _STALE_HOURS = 24.0
-# Agent text outputs that should not be forwarded to Telegram
-_SKIP_TEXTS: frozenset[str] = frozenset({
-    "no response needed.",
-    "no response needed",
-    "no response requested.",
-    "no response requested",
-    "no response necessary.",
-    "no response necessary",
-    "acknowledged.",
-    "acknowledged",
-    "noted.",
-    "noted",
-})
 _COST_ANOMALY_MIN = 2.0  # minimum cost to trigger anomaly check
 _COST_ANOMALY_MULTIPLIER = 3  # times rolling average
 
@@ -438,11 +425,6 @@ async def process(chat_id: str) -> None:
         # Only send result text if the agent didn't already message via MCP tools
         if result.sent_messages == 0:
             for text in result.texts:
-                # Skip non-substantive agent outputs that shouldn't reach the user
-                stripped = text.strip().lower()
-                if stripped in _SKIP_TEXTS:
-                    log.debug("skipped_empty_response", text=text[:50])
-                    continue
                 await send_long_message(bot, chat_id=int(chat_id), text=text)
 
         # Save conversation state for continuity (non-trivial conversations only)
