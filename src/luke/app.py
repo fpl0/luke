@@ -205,10 +205,10 @@ async def _get_conversation_state(chat_id: str) -> str:
         return f"<conversation-state>\n{body}\n</conversation-state>\n"
 
     # Fallback: synthesize from recent messages
-    recent = await asyncio.to_thread(db.get_recent_messages, chat_id, limit=10)
+    recent = await asyncio.to_thread(db.get_recent_messages, chat_id, limit=20)
     if not recent:
         return ""
-    lines = [f"{m['sender_name']}: {m['content'][:100]}" for m in recent]
+    lines = [f"{m['sender_name']}: {m['content'][:500]}" for m in recent[-10:]]
     ctx = "\n".join(lines)
     return (
         "<conversation-state>\n"
@@ -436,13 +436,32 @@ def _save_conv_state(
     messages: list[db.StoredMessage],
     agent_texts: list[str],
 ) -> None:
-    """Save conversation-state-latest memory (sync, runs in to_thread)."""
-    user_lines = [f"**User:** {m.content[:200]}" for m in messages[-3:]]
-    agent_line = f"**Luke:** {agent_texts[-1][:300]}" if agent_texts else ""
+    """Save conversation-state-latest memory (sync, runs in to_thread).
+
+    Captures enough context for the agent to seamlessly continue the thread:
+    last ~10 recent messages + last agent response, with generous truncation.
+    """
     now = datetime.now(UTC).isoformat(timespec="minutes")
-    body = f"**Last exchange:** {now}\n" + "\n".join(user_lines)
-    if agent_line:
-        body += f"\n{agent_line}"
+    # Pull recent messages for broader context (not just current batch)
+    recent = db.get_recent_messages(settings.chat_id, limit=20) if messages else []
+
+    # Build conversation thread: recent history + current exchange
+    lines: list[str] = []
+    for m in recent[-10:]:
+        preview = m["content"][:500]
+        lines.append(f"**{m['sender_name']}** ({m['timestamp'][:16]}): {preview}")
+
+    # Add current batch messages if not already in recent
+    recent_contents = {r["content"][:50] for r in recent}
+    for msg in messages[-5:]:
+        if msg.content[:50] not in recent_contents:
+            lines.append(f"**{msg.sender_name}** ({msg.timestamp[:16]}): {msg.content[:500]}")
+
+    # Add agent response
+    if agent_texts:
+        lines.append(f"**Luke** ({now}): {agent_texts[-1][:800]}")
+
+    body = f"**Last exchange:** {now}\n" + "\n".join(lines)
     # Write memory file
     import yaml
 
