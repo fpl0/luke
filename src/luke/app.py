@@ -593,6 +593,8 @@ def _save_conv_state(
         tags=["conversation", "state"],
         importance=0.3,
     )
+    # Emit event so event-driven behaviors notice the new episode
+    db.emit_event("new_episode", f'{{"id": "{_CONV_STATE_ID}"}}')
 
 
 _background_tasks: set[asyncio.Task[None]] = set()
