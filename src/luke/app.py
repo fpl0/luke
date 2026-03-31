@@ -62,6 +62,8 @@ _retry_counts: dict[str, int] = {}  # chat_id → consecutive failure count
 _MODEL_RANK: dict[str, int] = {"haiku": 0, "sonnet": 1, "opus": 2}
 _session_models: dict[str, str] = {}  # chat_id → highest model used in session
 
+_session_lost: dict[str, bool] = {}  # chat_id → whether last session was lost
+
 
 _TRIVIAL_WORDS = frozenset(
     {
@@ -191,6 +193,9 @@ async def _get_conversation_state(chat_id: str) -> str:
     """
     body, updated = await asyncio.to_thread(_load_conv_state)
     if body:
+        # Add session recovery notice if applicable
+        if _session_lost.pop(chat_id, False):
+            body = "[Session was reset — use this context to resume seamlessly]\n" + body
         if updated:
             try:
                 ts = ensure_utc(datetime.fromisoformat(updated))
@@ -409,6 +414,7 @@ async def process(chat_id: str) -> None:
                 old=session_id[:8],
                 new=result.session_id[:8] if result.session_id else "none",
             )
+            _session_lost[chat_id] = True
 
         # Cost anomaly detection
         if result.cost_usd > _COST_ANOMALY_MIN:
@@ -467,6 +473,23 @@ def _extract_topics(messages: list[db.StoredMessage], agent_texts: list[str]) ->
     return [word for word, _ in counter.most_common(5) if _ >= 2]
 
 
+def _extract_pending_actions(agent_texts: list[str]) -> list[str]:
+    """Extract pending actions from agent responses."""
+    patterns = [
+        r"(?:I'll|I will|I'm going to|next step[s]?[:\s]|still need to|working on|TODO:?|remaining:?|will follow up)\s*(.{10,100}?)(?:\.|$|\n)",
+    ]
+    actions: list[str] = []
+    combined = " ".join(agent_texts)
+    for pat in patterns:
+        for match in re.finditer(pat, combined, re.IGNORECASE):
+            action = match.group(1).strip().rstrip(".")
+            if action and action not in actions:
+                actions.append(action)
+            if len(actions) >= 5:
+                break
+    return actions[:5]
+
+
 def _save_conv_state(
     messages: list[db.StoredMessage],
     agent_texts: list[str],
@@ -505,6 +528,11 @@ def _save_conv_state(
     if topics:
         structured += f"**Active topics:** {', '.join(topics)}\n"
     structured += f"**User last active:** {last_user_active}\n"
+
+    # Extract pending actions from agent responses
+    pending = _extract_pending_actions(agent_texts)
+    if pending:
+        structured += f"**Pending actions:** {' | '.join(pending)}\n"
 
     body = f"**Last exchange:** {now}\n{structured}" + "\n".join(lines)
     # Write memory file

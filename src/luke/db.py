@@ -319,8 +319,17 @@ def _run_migrations(db: sqlite3.Connection) -> None:
         if version <= current:
             continue
         for sql in statements:
-            with contextlib.suppress(sqlite3.OperationalError):
+            try:
                 db.execute(sql)
+            except sqlite3.OperationalError as exc:
+                # Tolerate "already exists" / "duplicate column" from re-runs,
+                # but let genuine failures propagate so the version isn't
+                # recorded for a migration that didn't actually apply.
+                msg = str(exc).lower()
+                if "already exists" in msg or "duplicate column" in msg:
+                    pass
+                else:
+                    raise
         db.execute("INSERT INTO schema_version (version) VALUES (?)", (version,))
         db.commit()
         log.info("migration_applied", version=version, description=description)

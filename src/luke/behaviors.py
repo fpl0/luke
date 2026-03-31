@@ -546,6 +546,11 @@ async def run_dream(bot: Bot, sem: asyncio.Semaphore) -> None:
     if not sections:
         return
 
+    # Include conversation state for reasoning continuity
+    conv_state_body = memory.read_memory_body("episode", "conversation-state-latest", 1000)
+    if conv_state_body:
+        sections.append("Last conversation state:\n" + conv_state_body)
+
     now_str = datetime.now(UTC).isoformat(timespec="minutes")
 
     prompt = (
@@ -566,7 +571,9 @@ async def run_dream(bot: Bot, sem: asyncio.Semaphore) -> None:
         "4. What's the user working toward at the deepest level — "
         "beyond the stated goals? What would truly change their situation?\n"
         "5. What capabilities or knowledge gaps should be addressed "
-        "that nobody has noticed yet?\n\n"
+        "that nobody has noticed yet?\n"
+        "6. Review the conversation state — are there pending actions or open threads "
+        "that could benefit from background thinking?\n\n"
         "Rules:\n"
         "- Save genuinely interesting thoughts as insights (tag: 'dream')\n"
         "- Only save things that are novel — not restatements of existing insights\n"
