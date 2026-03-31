@@ -301,11 +301,19 @@ async def process(chat_id: str) -> None:
             prompt = await build_prompt(messages, chat_id)
             memory_context = ""
 
-        # Classify effort for thinking config only — model routing disabled
-        effort, thinking, _routed_model = _classify_effort(prompt)
-        model = settings.agent_model  # always opus until routing is fixed
+        # Classify effort and select model tier dynamically
+        effort, thinking, routed_model = _classify_effort(prompt)
+        # One-way ratchet: never downgrade within a session
+        prev_model = _session_models.get(chat_id)
+        if prev_model and _MODEL_RANK.get(prev_model, 0) > _MODEL_RANK.get(routed_model, 0):
+            model = prev_model
+        else:
+            model = routed_model
 
         session_id = db.get_session(chat_id)
+        # Non-opus models crash on session resume (SDK bug) — start fresh
+        if model != "opus" and session_id:
+            session_id = None
 
         if memory_context:
             log.info("memories_injected", chat=chat_id)
