@@ -303,6 +303,11 @@ async def process(chat_id: str) -> None:
 
         # Classify effort and select model tier dynamically
         effort, thinking, routed_model = _classify_effort(prompt)
+        # Memory-aware boost: if haiku was selected but substantial context was
+        # injected, upgrade to sonnet so the model can process the memories.
+        # Only triggers on trivial messages with heavy context — avoids always-fire.
+        if routed_model == "haiku" and memory_context and len(memory_context) > 500:
+            routed_model = "sonnet"
         # One-way ratchet: never downgrade within a session
         prev_model = _session_models.get(chat_id)
         if prev_model and _MODEL_RANK.get(prev_model, 0) > _MODEL_RANK.get(routed_model, 0):
