@@ -108,6 +108,15 @@ _COMPLEX_KEYWORDS: frozenset[str] = frozenset(
     {"research", "analyze", "compare", "build", "create", "plan", "implement", "design"}
 )
 
+# Coding keywords force opus regardless of message length
+_CODE_KEYWORDS: frozenset[str] = frozenset(
+    {
+        "code", "fix", "bug", "debug", "refactor", "deploy", "test", "script",
+        "function", "class", "error", "exception", "traceback", "commit", "merge",
+        "pr", "pull request", "api", "endpoint", "database", "migration", "schema",
+    }
+)
+
 
 def _classify_effort(
     prompt: str | list[dict[str, Any]],
@@ -122,18 +131,23 @@ def _classify_effort(
     words = text.split()
     word_count = len(words)
     has_question = "?" in text
+    text_lower = text.lower()
+
+    # Coding tasks always get opus — regardless of message length
+    has_code = "```" in text or any(kw in text_lower for kw in _CODE_KEYWORDS)
+    if has_code:
+        thinking_cfg = ThinkingConfigEnabled(type="enabled", budget_tokens=16_000)
+        return "high", thinking_cfg, settings.model_high
 
     # Trivial: short, no questions, no media
     if word_count < 15 and not has_question and not has_media:
         return "low", ThinkingConfigDisabled(type="disabled"), settings.model_low
 
-    # Complex: long messages, multiple questions, media, code blocks
-    text_lower = text.lower()
+    # Complex: long messages, multiple questions, media, complex keywords
     is_complex = (
         word_count > 150
         or text.count("?") > 2
         or has_media
-        or "```" in text
         or any(kw in text_lower for kw in _COMPLEX_KEYWORDS)
     )
     if is_complex:

@@ -333,6 +333,7 @@ async def run_deep_work(bot: Bot, sem: asyncio.Semaphore) -> None:
         prompt,
         bot,
         sem,
+        model=settings.deep_work_model,  # always opus for coding/building
         max_turns=settings.deep_work_max_turns,
         max_budget_usd=settings.deep_work_max_budget_usd,
         max_sends=1,
