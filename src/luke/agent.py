@@ -600,7 +600,13 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
         # Emit events for event-driven behavior triggers
         _EVENT_TYPES = {"episode": "new_episode", "insight": "new_insight", "goal": "goal_updated"}
         if mem_type in _EVENT_TYPES:
-            db.emit_event(_EVENT_TYPES[mem_type], f'{{"id": "{mem_id}"}}')
+            eid = db.emit_event(_EVENT_TYPES[mem_type], f'{{"id": "{mem_id}"}}')
+            log.info(
+                "event_emitted",
+                event_type=_EVENT_TYPES[mem_type],
+                event_id=eid,
+                mem_id=mem_id,
+            )
         return _ok(status)
 
     @tool(
