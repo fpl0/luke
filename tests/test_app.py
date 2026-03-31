@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from luke.config import settings
 from luke.memory import MemoryResult
 
 # ---------------------------------------------------------------------------
@@ -638,3 +639,406 @@ class TestAcquireLock:
             if app._lock_fd is not None:
                 os.close(app._lock_fd)
             app._lock_fd = old
+
+
+# ---------------------------------------------------------------------------
+# Model routing: _classify_effort
+# ---------------------------------------------------------------------------
+
+
+class TestClassifyEffort:
+    """Verify _classify_effort routes to the correct effort/model tier."""
+
+    # -- Trivial messages -> low / haiku --
+
+    def test_trivial_hey(self) -> None:
+        from luke.app import _classify_effort
+
+        effort, thinking, model = _classify_effort("hey")
+        assert effort == "low"
+        assert thinking["type"] == "disabled"
+        assert model == settings.model_low
+
+    def test_trivial_ok(self) -> None:
+        from luke.app import _classify_effort
+
+        effort, _, model = _classify_effort("ok")
+        assert effort == "low"
+        assert model == settings.model_low
+
+    def test_trivial_thanks(self) -> None:
+        from luke.app import _classify_effort
+
+        effort, _, model = _classify_effort("thanks")
+        assert effort == "low"
+        assert model == settings.model_low
+
+    def test_trivial_single_word(self) -> None:
+        from luke.app import _classify_effort
+
+        effort, _, model = _classify_effort("sure")
+        assert effort == "low"
+        assert model == settings.model_low
+
+    def test_trivial_short_no_question(self) -> None:
+        from luke.app import _classify_effort
+
+        effort, _, model = _classify_effort("sounds good to me")
+        assert effort == "low"
+        assert model == settings.model_low
+
+    # -- Normal messages -> medium / sonnet --
+
+    def test_medium_normal_question(self) -> None:
+        from luke.app import _classify_effort
+
+        effort, thinking, model = _classify_effort(
+            "What time is the meeting tomorrow?"
+        )
+        assert effort == "medium"
+        assert thinking["type"] == "disabled"
+        assert model == settings.model_medium
+
+    def test_medium_moderate_length(self) -> None:
+        from luke.app import _classify_effort
+
+        # 20 words, one question mark — should be medium
+        msg = "I was thinking about going to the park later today " * 2 + "what do you think?"
+        effort, _, model = _classify_effort(msg)
+        assert effort == "medium"
+        assert model == settings.model_medium
+
+    def test_medium_boundary_no_complex_keywords(self) -> None:
+        from luke.app import _classify_effort
+
+        # A message around 50 words with no complex or code keywords
+        words = ["something"] * 50
+        msg = " ".join(words) + "?"
+        effort, _, model = _classify_effort(msg)
+        assert effort == "medium"
+        assert model == settings.model_medium
+
+    # -- Complex messages -> high / opus --
+
+    def test_complex_long_message(self) -> None:
+        from luke.app import _classify_effort
+
+        # 160 words -> over 150 threshold
+        msg = " ".join(["word"] * 160)
+        effort, thinking, model = _classify_effort(msg)
+        assert effort == "high"
+        assert thinking["type"] == "enabled"
+        assert model == settings.model_high
+
+    def test_complex_multiple_questions(self) -> None:
+        from luke.app import _classify_effort
+
+        # 3+ question marks triggers complex
+        msg = "What is this? How does it work? Why did it break?"
+        effort, _, model = _classify_effort(msg)
+        assert effort == "high"
+        assert model == settings.model_high
+
+    def test_complex_multimodal_input(self) -> None:
+        from luke.app import _classify_effort
+
+        # List input with an image block -> has_media=True -> complex
+        blocks: list[dict[str, Any]] = [
+            {"type": "text", "text": "What is this picture showing"},
+            {"type": "image", "source": {"data": "base64data"}},
+        ]
+        effort, _, model = _classify_effort(blocks)
+        assert effort == "high"
+        assert model == settings.model_high
+
+    def test_complex_keyword_research(self) -> None:
+        from luke.app import _classify_effort
+
+        # Complex keywords only trigger past the trivial gate (>=15 words or has ?)
+        msg = "Can you research this topic and give me a detailed summary of findings?"
+        effort, _, model = _classify_effort(msg)
+        assert effort == "high"
+        assert model == settings.model_high
+
+    def test_complex_keyword_analyze(self) -> None:
+        from luke.app import _classify_effort
+
+        msg = "I need you to analyze the recent market trends and provide insights"
+        effort, _, model = _classify_effort(msg)
+        assert effort == "high"
+        assert model == settings.model_high
+
+    def test_complex_keyword_compare(self) -> None:
+        from luke.app import _classify_effort
+
+        msg = "Please compare these two different approaches and tell me which is better?"
+        effort, _, model = _classify_effort(msg)
+        assert effort == "high"
+        assert model == settings.model_high
+
+    def test_complex_keyword_implement(self) -> None:
+        from luke.app import _classify_effort
+
+        msg = "We need to implement the new feature for the dashboard before next week, can you help?"
+        effort, _, model = _classify_effort(msg)
+        assert effort == "high"
+        assert model == settings.model_high
+
+    def test_complex_keyword_design(self) -> None:
+        from luke.app import _classify_effort
+
+        msg = "Can you help me design the overall architecture for this new system?"
+        effort, _, model = _classify_effort(msg)
+        assert effort == "high"
+        assert model == settings.model_high
+
+    def test_complex_keyword_short_message_stays_trivial(self) -> None:
+        """Complex keywords in short messages (<15 words, no ?) are still trivial."""
+        from luke.app import _classify_effort
+
+        # "research" is a complex keyword but message is short with no question
+        effort, _, model = _classify_effort("research this")
+        assert effort == "low"
+        assert model == settings.model_low
+
+    # -- Code keywords in short messages -> high / opus --
+
+    def test_code_keyword_fix_the_bug(self) -> None:
+        from luke.app import _classify_effort
+
+        effort, thinking, model = _classify_effort("fix the bug")
+        assert effort == "high"
+        assert thinking["type"] == "enabled"
+        assert model == settings.model_high
+
+    def test_code_keyword_debug(self) -> None:
+        from luke.app import _classify_effort
+
+        effort, _, model = _classify_effort("debug this issue")
+        assert effort == "high"
+        assert model == settings.model_high
+
+    def test_code_keyword_refactor(self) -> None:
+        from luke.app import _classify_effort
+
+        effort, _, model = _classify_effort("refactor the module")
+        assert effort == "high"
+        assert model == settings.model_high
+
+    def test_code_keyword_deploy(self) -> None:
+        from luke.app import _classify_effort
+
+        effort, _, model = _classify_effort("deploy to production")
+        assert effort == "high"
+        assert model == settings.model_high
+
+    def test_code_keyword_commit(self) -> None:
+        from luke.app import _classify_effort
+
+        effort, _, model = _classify_effort("commit the changes")
+        assert effort == "high"
+        assert model == settings.model_high
+
+    def test_code_keyword_merge(self) -> None:
+        from luke.app import _classify_effort
+
+        effort, _, model = _classify_effort("merge into main")
+        assert effort == "high"
+        assert model == settings.model_high
+
+    def test_code_keyword_api(self) -> None:
+        from luke.app import _classify_effort
+
+        effort, _, model = _classify_effort("call the api")
+        assert effort == "high"
+        assert model == settings.model_high
+
+    def test_code_keyword_database(self) -> None:
+        from luke.app import _classify_effort
+
+        effort, _, model = _classify_effort("update the database")
+        assert effort == "high"
+        assert model == settings.model_high
+
+    def test_code_keyword_code(self) -> None:
+        from luke.app import _classify_effort
+
+        effort, _, model = _classify_effort("write some code")
+        assert effort == "high"
+        assert model == settings.model_high
+
+    def test_code_keyword_test(self) -> None:
+        from luke.app import _classify_effort
+
+        effort, _, model = _classify_effort("test the endpoint")
+        assert effort == "high"
+        assert model == settings.model_high
+
+    # -- Code blocks -> high / opus --
+
+    def test_code_block_triggers_high(self) -> None:
+        from luke.app import _classify_effort
+
+        msg = "Look at this:\n```python\nprint('hello')\n```"
+        effort, thinking, model = _classify_effort(msg)
+        assert effort == "high"
+        assert thinking["type"] == "enabled"
+        assert model == settings.model_high
+
+    def test_code_block_empty(self) -> None:
+        from luke.app import _classify_effort
+
+        msg = "What does this do?\n```\n```"
+        effort, _, model = _classify_effort(msg)
+        assert effort == "high"
+        assert model == settings.model_high
+
+    # -- Thinking config correctness --
+
+    def test_low_has_disabled_thinking(self) -> None:
+        from luke.app import _classify_effort
+
+        _, thinking, _ = _classify_effort("hi")
+        assert thinking["type"] == "disabled"
+
+    def test_medium_has_disabled_thinking(self) -> None:
+        from luke.app import _classify_effort
+
+        _, thinking, _ = _classify_effort("How is the weather today?")
+        assert thinking["type"] == "disabled"
+
+    def test_high_has_enabled_thinking(self) -> None:
+        from luke.app import _classify_effort
+
+        _, thinking, _ = _classify_effort("fix the bug in production")
+        assert thinking["type"] == "enabled"
+
+    # -- Edge cases --
+
+    def test_question_in_short_message_is_medium(self) -> None:
+        from luke.app import _classify_effort
+
+        # Short message with a question mark -> not trivial, should be medium
+        effort, _, model = _classify_effort("why?")
+        assert effort == "medium"
+        assert model == settings.model_medium
+
+    def test_multimodal_text_only_blocks(self) -> None:
+        from luke.app import _classify_effort
+
+        # List input but no image -> has_media=False
+        blocks: list[dict[str, Any]] = [
+            {"type": "text", "text": "hello there"},
+        ]
+        effort, _, model = _classify_effort(blocks)
+        assert effort == "low"
+        assert model == settings.model_low
+
+    def test_multimodal_code_keyword_in_text_block(self) -> None:
+        from luke.app import _classify_effort
+
+        # Code keyword inside a text block in list format
+        blocks: list[dict[str, Any]] = [
+            {"type": "text", "text": "fix the bug in the api"},
+        ]
+        effort, _, model = _classify_effort(blocks)
+        assert effort == "high"
+        assert model == settings.model_high
+
+    def test_code_keyword_case_insensitive(self) -> None:
+        from luke.app import _classify_effort
+
+        effort, _, model = _classify_effort("DEBUG the issue")
+        assert effort == "high"
+        assert model == settings.model_high
+
+    def test_code_keyword_partial_match(self) -> None:
+        """Code keywords use 'in' matching, so 'testing' contains 'test'."""
+        from luke.app import _classify_effort
+
+        effort, _, model = _classify_effort("testing my patience")
+        assert effort == "high"
+        assert model == settings.model_high
+
+    def test_exactly_fifteen_words_no_question(self) -> None:
+        """15 words is NOT < 15, so it falls to the normal path."""
+        from luke.app import _classify_effort
+
+        msg = " ".join(["word"] * 15)
+        effort, _, model = _classify_effort(msg)
+        assert effort == "medium"
+        assert model == settings.model_medium
+
+    def test_exactly_fourteen_words_no_question(self) -> None:
+        """14 words IS < 15, so trivial."""
+        from luke.app import _classify_effort
+
+        msg = " ".join(["word"] * 14)
+        effort, _, model = _classify_effort(msg)
+        assert effort == "low"
+        assert model == settings.model_low
+
+    def test_exactly_151_words(self) -> None:
+        """151 words is > 150, so complex."""
+        from luke.app import _classify_effort
+
+        msg = " ".join(["word"] * 151)
+        effort, _, model = _classify_effort(msg)
+        assert effort == "high"
+        assert model == settings.model_high
+
+    def test_exactly_150_words_no_triggers(self) -> None:
+        """150 words is NOT > 150, so medium (no other triggers)."""
+        from luke.app import _classify_effort
+
+        msg = " ".join(["word"] * 150)
+        effort, _, model = _classify_effort(msg)
+        assert effort == "medium"
+        assert model == settings.model_medium
+
+    def test_two_questions_is_medium(self) -> None:
+        """2 question marks is not > 2, so medium."""
+        from luke.app import _classify_effort
+
+        msg = "What is this? How does it work?"
+        effort, _, model = _classify_effort(msg)
+        assert effort == "medium"
+        assert model == settings.model_medium
+
+
+# ---------------------------------------------------------------------------
+# Model routing: _CODE_KEYWORDS completeness
+# ---------------------------------------------------------------------------
+
+
+class TestCodeKeywords:
+    """Verify each code keyword individually routes to high/opus."""
+
+    @pytest.mark.parametrize(
+        "keyword",
+        [
+            "code", "fix", "bug", "debug", "refactor", "deploy", "test",
+            "script", "function", "class", "error", "exception", "traceback",
+            "commit", "merge", "pr", "pull request", "api", "endpoint",
+            "database", "migration", "schema",
+        ],
+    )
+    def test_each_code_keyword_routes_high(self, keyword: str) -> None:
+        from luke.app import _classify_effort
+
+        msg = f"please handle {keyword} now"
+        effort, _, model = _classify_effort(msg)
+        assert effort == "high", f"keyword '{keyword}' did not route to high"
+        assert model == settings.model_high, f"keyword '{keyword}' did not route to opus"
+
+    def test_code_keywords_set_is_complete(self) -> None:
+        """Sanity check: the keywords set in the module matches our expectations."""
+        from luke.app import _CODE_KEYWORDS
+
+        expected = {
+            "code", "fix", "bug", "debug", "refactor", "deploy", "test",
+            "script", "function", "class", "error", "exception", "traceback",
+            "commit", "merge", "pr", "pull request", "api", "endpoint",
+            "database", "migration", "schema",
+        }
+        assert _CODE_KEYWORDS == expected
