@@ -394,6 +394,8 @@ async def process(chat_id: str) -> None:
         log.info(
             "agent_done",
             chat_id=chat_id,
+            model=model,
+            effort=effort,
             responses=len(result.texts),
             cost_usd=result.cost_usd,
             turns=result.num_turns,
@@ -402,7 +404,8 @@ async def process(chat_id: str) -> None:
         # Single commit for cost log + cursor advance
         with db.batch():
             db.log_cost(
-                chat_id, result.cost_usd, result.num_turns, result.duration_api_ms, "message"
+                chat_id, result.cost_usd, result.num_turns, result.duration_api_ms,
+                f"message:{model}",
             )
             # Advance cursor only after successful agent run
             db.advance_cursor(chat_id, messages[-1].id)
