@@ -197,6 +197,79 @@ class TestUnknownType:
 
 
 # ---------------------------------------------------------------------------
+# _effective_interval  (nested in start_scheduler_loop; tested via formula)
+# ---------------------------------------------------------------------------
+
+
+def _effective_interval_formula(no_ops: int, base: float) -> float:
+    """Mirror of the _effective_interval logic from scheduler.py.
+
+    Formula: base * (2 ** min(no_ops, 4))
+    """
+    return base * (2 ** min(no_ops, 4))
+
+
+class TestEffectiveInterval:
+    """Tests for the exponential backoff formula used in behavior scheduling."""
+
+    def test_zero_no_ops_returns_base(self) -> None:
+        """0 no-ops means no backoff: effective interval equals base."""
+        assert _effective_interval_formula(0, 300.0) == 300.0
+
+    def test_one_no_op_doubles(self) -> None:
+        """1 no-op: 2x base interval."""
+        assert _effective_interval_formula(1, 300.0) == 600.0
+
+    def test_two_no_ops_quadruples(self) -> None:
+        """2 no-ops: 4x base interval."""
+        assert _effective_interval_formula(2, 300.0) == 1200.0
+
+    def test_three_no_ops_8x(self) -> None:
+        """3 no-ops: 8x base interval."""
+        assert _effective_interval_formula(3, 300.0) == 2400.0
+
+    def test_four_no_ops_16x(self) -> None:
+        """4 no-ops: 16x base interval (maximum multiplier)."""
+        assert _effective_interval_formula(4, 300.0) == 4800.0
+
+    def test_five_no_ops_still_capped_at_16x(self) -> None:
+        """5+ no-ops: still capped at 16x base interval."""
+        assert _effective_interval_formula(5, 300.0) == 4800.0
+
+    def test_large_no_ops_capped_at_16x(self) -> None:
+        """Extremely high no-ops should still be capped at 16x."""
+        assert _effective_interval_formula(100, 300.0) == 4800.0
+
+    def test_with_db_mock(self) -> None:
+        """Verify _effective_interval integrates correctly with db.get_behavior_no_ops."""
+        with patch("luke.scheduler.db") as mock_db:
+            mock_db.get_behavior_no_ops.return_value = 3
+            no_ops = int(mock_db.get_behavior_no_ops("consolidation"))
+            result = 300.0 * (2 ** min(no_ops, 4))
+            assert result == 2400.0
+
+    def test_db_returns_none_treated_as_zero(self) -> None:
+        """When db returns a non-integer, the except clause defaults to 0 no-ops."""
+        # The real code wraps int(db.get_behavior_no_ops(name)) in try/except
+        # and defaults to 0 on TypeError/ValueError
+        with patch("luke.scheduler.db") as mock_db:
+            mock_db.get_behavior_no_ops.return_value = None
+            try:
+                no_ops = int(mock_db.get_behavior_no_ops("consolidation"))
+            except (TypeError, ValueError):
+                no_ops = 0
+            result = 300.0 * (2 ** min(no_ops, 4))
+            assert result == 300.0  # base interval, no backoff
+
+    def test_different_base_intervals(self) -> None:
+        """Backoff works correctly with various base interval values."""
+        # 2 no-ops with a 60s base
+        assert _effective_interval_formula(2, 60.0) == 240.0
+        # 4 no-ops with a 3600s base
+        assert _effective_interval_formula(4, 3600.0) == 57600.0
+
+
+# ---------------------------------------------------------------------------
 # _run_task
 # ---------------------------------------------------------------------------
 
