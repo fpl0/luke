@@ -238,7 +238,7 @@ async def start_scheduler_loop(
         )
         if now_mono - last_consolidation >= consol_interval:
             has_episodes = db.count_unconsumed_events("new_episode") >= settings.consolidation_min_cluster
-            if has_episodes or now_mono - last_consolidation >= consol_interval * 2:
+            if has_episodes or now_mono - last_consolidation >= consol_interval * 6:
                 last_consolidation = now_mono
                 maintenance_coros.append(("consolidation", run_consolidation(bot, sem)))
 
@@ -256,7 +256,7 @@ async def start_scheduler_loop(
             has_feedback = db.count_unconsumed_events(
                 "feedback_negative", "user_message"
             ) >= 5
-            if has_feedback or now_mono - last_reflection >= reflection_interval * 2:
+            if has_feedback or now_mono - last_reflection >= reflection_interval * 6:
                 last_reflection = now_mono
                 maintenance_coros.append(("reflection", run_reflection(bot, sem)))
                 # Weekly FTS pruning (alongside reflection — not urgent)
@@ -270,7 +270,7 @@ async def start_scheduler_loop(
         )
         if now_mono - last_insight_consolidation >= insight_interval:
             has_insights = db.count_unconsumed_events("new_insight") >= 3
-            if has_insights or now_mono - last_insight_consolidation >= insight_interval * 2:
+            if has_insights or now_mono - last_insight_consolidation >= insight_interval * 6:
                 last_insight_consolidation = now_mono
                 maintenance_coros.append(
                     ("insight_consolidation", run_insight_consolidation(bot, sem))
@@ -282,7 +282,7 @@ async def start_scheduler_loop(
         )
         if now_mono - last_feedback_consolidation >= feedback_interval:
             has_negatives = db.count_unconsumed_events("feedback_negative") >= 2
-            if has_negatives or now_mono - last_feedback_consolidation >= feedback_interval * 2:
+            if has_negatives or now_mono - last_feedback_consolidation >= feedback_interval * 6:
                 last_feedback_consolidation = now_mono
                 maintenance_coros.append(
                     ("feedback_consolidation", run_feedback_consolidation(bot, sem))
@@ -313,10 +313,11 @@ async def start_scheduler_loop(
             _BEHAVIOR_EVENTS: dict[str, tuple[str, ...]] = {
                 "consolidation": ("new_episode",),
                 "reflection": ("feedback_negative", "user_message"),
-                "proactive_scan": (),
+                "proactive_scan": ("goal_updated",),
                 "insight_consolidation": ("new_insight",),
                 "feedback_consolidation": ("feedback_negative",),
                 "lifecycle_review": (),
+                "dream": (),
             }
             with db.batch():
                 for (name, _), result in zip(maintenance_coros, results, strict=True):
@@ -327,7 +328,15 @@ async def start_scheduler_loop(
                         # Consume events this behavior was triggered by
                         events = _BEHAVIOR_EVENTS.get(name, ())
                         if events:
-                            db.consume_events(*events)
+                            consumed = db.consume_events(*events)
+                            # Track no-ops for smart backoff
+                            if consumed > 0:
+                                db.reset_behavior_no_ops(name)
+                            else:
+                                db.increment_behavior_no_ops(name)
+                        else:
+                            # Behaviors without event gates don't backoff
+                            pass
 
         # Step 2: Launch deep work as background task (long-lived, NOT awaited)
         deep_work_running = _deep_work_task is not None and not _deep_work_task.done()
@@ -342,6 +351,12 @@ async def start_scheduler_loop(
                 exc = fut.exception() if not fut.cancelled() else None
                 if exc:
                     log.exception("deep_work_task_error", exc_info=exc)
+                else:
+                    # Consume goal events that deep work acts on
+                    consumed = db.consume_events("goal_updated")
+                    if consumed > 0:
+                        db.reset_behavior_no_ops("deep_work")
+                    log.info("deep_work_events_consumed", consumed=consumed)
 
             _deep_work_task.add_done_callback(_on_deep_work_done)
             log.info("deep_work_launched")
