@@ -67,7 +67,7 @@ class Settings(BaseSettings):
     reflection_interval: float = 604800.0  # weekly (seconds)
     proactive_scan_interval: float = 21600.0  # every 6 hours (seconds)
     # Dream (autonomous thinking periods)
-    dream_interval: float = 86400.0  # 24h between sessions
+    dream_interval: float = 21600.0  # 6h between sessions
     dream_max_budget_usd: float = 2.0  # per-session cap
     dream_quiet_hours: float = 2.0  # only dream if user inactive this long
 
