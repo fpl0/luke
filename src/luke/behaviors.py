@@ -67,8 +67,10 @@ async def _run_behavior(
             duration_s=round(time.monotonic() - started, 1),
             **log_fields,
         )
+        effective_model = model or settings.agent_model
         db.log_cost(
-            chat_id, result.cost_usd, result.num_turns, result.duration_api_ms, f"behavior:{name}"
+            chat_id, result.cost_usd, result.num_turns, result.duration_api_ms,
+            f"behavior:{name}:{effective_model}",
         )
         return result
     except Exception:
@@ -105,6 +107,7 @@ async def run_consolidation(bot: Bot, sem: asyncio.Semaphore) -> None:
             prompt,
             bot,
             sem,
+            model=settings.consolidation_model,
             max_sends=0,
             episodes=episode_ids,
         )
@@ -170,6 +173,7 @@ async def run_reflection(bot: Bot, sem: asyncio.Semaphore) -> None:
         prompt,
         bot,
         sem,
+        model=settings.reflection_model,
         max_sends=0,
         memories_reviewed=len(recent),
         messages_reviewed=len(msg_lines),
@@ -244,6 +248,7 @@ async def run_proactive_scan(bot: Bot, sem: asyncio.Semaphore) -> None:
         prompt,
         bot,
         sem,
+        model=settings.proactive_scan_model,
         max_sends=2,
         sections=len(sections),
     )
