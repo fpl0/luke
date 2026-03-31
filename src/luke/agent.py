@@ -597,6 +597,10 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
                     f"Consider: merge content, archive old + 'supersedes' link, "
                     f"or keep both if complementary."
                 )
+        # Emit events for event-driven behavior triggers
+        _EVENT_TYPES = {"episode": "new_episode", "insight": "new_insight", "goal": "goal_updated"}
+        if mem_type in _EVENT_TYPES:
+            db.emit_event(_EVENT_TYPES[mem_type], f'{{"id": "{mem_id}"}}')
         return _ok(status)
 
     @tool(

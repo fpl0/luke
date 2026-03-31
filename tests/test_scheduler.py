@@ -310,6 +310,7 @@ class TestSchedulerLoop:
             mock_settings.insight_consolidation_interval = 999999
             mock_settings.feedback_consolidation_interval = 999999
             mock_settings.lifecycle_review_interval = 999999
+            mock_settings.dream_interval = 999999
             mock_db.get_due_tasks.return_value = []
             mock_db.get_behavior_last_run.return_value = None
 

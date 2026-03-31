@@ -105,6 +105,7 @@ async def run_consolidation(bot: Bot, sem: asyncio.Semaphore) -> None:
             prompt,
             bot,
             sem,
+            max_sends=0,
             episodes=episode_ids,
         )
 
@@ -136,22 +137,32 @@ async def run_reflection(bot: Bot, sem: asyncio.Semaphore) -> None:
     for m in db.get_recent_messages(chat_id, limit=50):
         msg_lines.append(f"[{m['sender_name']} {m['timestamp']}] {m['content'][:150]}")
 
+    # Include actual reaction data from the database
+    reaction_lines: list[str] = []
+    for r in db.get_reactions(chat_id, limit=50):
+        reaction_lines.append(
+            f"  msg:{r['msg_id']} {r['emoji']} ({r['sentiment']}) "
+            f"from {r['sender_id']} at {r['timestamp']}"
+        )
+
     prompt = (
-        "Weekly reflection task. Review these recent memories AND conversation "
-        "history:\n\n"
+        "Weekly reflection task. Review these recent memories, conversation "
+        "history, AND user reactions:\n\n"
         "=== Recent Memories ===\n"
         + "\n---\n".join(contents)
         + "\n\n=== Recent Conversations ===\n"
         + "\n".join(msg_lines[-50:])
+        + "\n\n=== User Reactions (emoji feedback on your messages) ===\n"
+        + ("\n".join(reaction_lines) if reaction_lines else "(No reactions this period)")
         + "\n\nReflect on:\n"
-        "1. Which responses did the user react positively to? "
-        "(reactions, thanks, follow-through)\n"
-        "2. Which responses were corrected or ignored?\n"
+        "1. Which of your messages got positive reactions? What made them work?\n"
+        "2. Which messages got negative reactions or were corrected/ignored?\n"
         "3. What patterns in user satisfaction do you notice?\n"
-        "4. What should you do differently?\n"
+        "4. What should you do differently — and save specific feedback insights?\n"
         "5. Are there recurring requests that should become procedures or tools?\n"
         "6. Active goals: what progress was made this week?\n\n"
-        "Save actionable insights. Be specific about what to change."
+        "Save actionable insights with 'remember'. Be specific about what to change.\n"
+        "Do NOT message the user — this is internal reflection only."
     )
 
     await _run_behavior(
@@ -159,6 +170,7 @@ async def run_reflection(bot: Bot, sem: asyncio.Semaphore) -> None:
         prompt,
         bot,
         sem,
+        max_sends=0,
         memories_reviewed=len(recent),
         messages_reviewed=len(msg_lines),
     )
@@ -232,6 +244,7 @@ async def run_proactive_scan(bot: Bot, sem: asyncio.Semaphore) -> None:
         prompt,
         bot,
         sem,
+        max_sends=2,
         sections=len(sections),
     )
 
@@ -294,10 +307,17 @@ async def run_deep_work(bot: Bot, sem: asyncio.Semaphore) -> None:
         "   - Add progress note with timestamp\n"
         "   - Update steps_completed count and last_updated\n"
         "   - Update the goal memory with new progress %\n\n"
-        "Phase 3 — WRAP UP:\n"
-        "9. If the goal is complete: update plan status to completed, update goal memory\n"
-        "10. If blocked: update plan status to blocked, note what you need\n"
-        "11. Save a summary episode (deep-work-log) of what was accomplished\n\n"
+        "Phase 3 — QUALITY CHECK (mandatory before wrap-up):\n"
+        "9. Review what you produced this session. Ask yourself:\n"
+        "   - Would the user actually want or use this output?\n"
+        "   - Is this advancing the goal meaningfully, or is it busywork?\n"
+        "   - Rate this session 1-5: 1=wasted, 3=okay, 5=substantial progress\n"
+        "   Add the rating to your plan file under '## Session Quality'\n"
+        "   If the last 3 sessions average below 2: pause the goal and note why.\n\n"
+        "Phase 4 — WRAP UP:\n"
+        "10. If the goal is complete: update plan status to completed, update goal memory\n"
+        "11. If blocked: update plan status to blocked, note what you need\n"
+        "12. Save a summary episode (deep-work-log) of what was accomplished\n\n"
         "You may send at most ONE message to the user per session — only if truly blocked.\n"
         "Prefer updating the plan's Blockers section over messaging.\n"
         "You have full tool access: web search, code, files, memory.\n"
@@ -354,6 +374,7 @@ async def run_feedback_consolidation(bot: Bot, sem: asyncio.Semaphore) -> None:
         prompt,
         bot,
         sem,
+        max_sends=0,
         feedback_count=len(feedback_ids),
     )
 
@@ -392,6 +413,7 @@ async def run_insight_consolidation(bot: Bot, sem: asyncio.Semaphore) -> None:
             prompt,
             bot,
             sem,
+            max_sends=0,
             insights=insight_ids,
         )
 
@@ -441,7 +463,124 @@ async def run_lifecycle_review(bot: Bot, sem: asyncio.Semaphore) -> None:
         prompt,
         bot,
         sem,
+        max_sends=0,
         stale=len(candidates["stale_entities"]),
         unused=len(candidates["unused_procedures"]),
         lingering=len(candidates["lingering_goals"]),
+    )
+
+
+async def run_dream(bot: Bot, sem: asyncio.Semaphore) -> None:
+    """Autonomous thinking period: make connections, notice patterns, generate ideas.
+
+    Unlike deep work (which executes on goals) or reflection (which analyzes performance),
+    dreaming is free-form ideation. It reads broadly across memories and looks for
+    unexpected connections, creative possibilities, and unasked questions.
+    """
+    chat_id = settings.chat_id
+    if not chat_id:
+        return
+
+    # Only dream during quiet periods — respect the user's silence
+    recent = db.get_recent_messages(chat_id, limit=5)
+    if recent:
+        latest_ts = recent[-1].get("timestamp", "")
+        if latest_ts:
+            try:
+                last_msg = datetime.fromisoformat(latest_ts)
+                if last_msg.tzinfo is None:
+                    last_msg = last_msg.replace(tzinfo=UTC)
+                quiet_hours = (datetime.now(UTC) - last_msg).total_seconds() / 3600
+                if quiet_hours < settings.dream_quiet_hours:
+                    return  # user is active, don't dream
+            except ValueError:
+                pass
+
+    # Gather diverse memory types for cross-pollination
+    sections: list[str] = []
+
+    # Recent insights — the distilled patterns
+    insights = memory.recall(mem_type="insight", limit=10)
+    if insights:
+        lines = []
+        for r in insights:
+            body = memory.read_memory_body(r["type"], r["id"], 300)
+            if body:
+                lines.append(f"[{r['id']}]: {body}")
+        if lines:
+            sections.append("Recent insights:\n" + "\n---\n".join(lines))
+
+    # Active goals — what matters
+    goals = memory.recall(mem_type="goal", limit=5)
+    if goals:
+        lines = []
+        for g in goals:
+            body = memory.read_memory_body(g["type"], g["id"], 200)
+            if body:
+                lines.append(f"[{g['id']}]: {body}")
+        if lines:
+            sections.append("Active goals:\n" + "\n---\n".join(lines))
+
+    # Key entities — the people and things
+    entities = memory.recall(mem_type="entity", limit=8)
+    if entities:
+        lines = []
+        for e in entities:
+            body = memory.read_memory_body(e["type"], e["id"], 200)
+            if body:
+                lines.append(f"[{e['id']}]: {body}")
+        if lines:
+            sections.append("Key entities:\n" + "\n---\n".join(lines))
+
+    # Procedures — what you know how to do
+    procedures = memory.recall(mem_type="procedure", limit=5)
+    if procedures:
+        lines = []
+        for p in procedures:
+            body = memory.read_memory_body(p["type"], p["id"], 200)
+            if body:
+                lines.append(f"[{p['id']}]: {body}")
+        if lines:
+            sections.append("Procedures:\n" + "\n---\n".join(lines))
+
+    if not sections:
+        return
+
+    now_str = datetime.now(UTC).isoformat(timespec="minutes")
+
+    prompt = (
+        f"Dream session. Current time: {now_str}.\n\n"
+        "This is a free-form thinking period. You're not executing tasks or "
+        "analyzing performance — you're thinking deeply, making connections, "
+        "and generating ideas.\n\n"
+        "Here's a cross-section of your memory:\n\n"
+        + "\n\n".join(sections)
+        + "\n\n"
+        "Think about:\n"
+        "1. What unexpected connections exist between these memories? "
+        "What patterns span across different domains?\n"
+        "2. What questions haven't been asked that should be? "
+        "What assumptions might be wrong?\n"
+        "3. What creative possibilities exist that nobody has considered? "
+        "What would be genuinely surprising or valuable?\n"
+        "4. What's the user working toward at the deepest level — "
+        "beyond the stated goals? What would truly change their situation?\n"
+        "5. What capabilities or knowledge gaps should be addressed "
+        "that nobody has noticed yet?\n\n"
+        "Rules:\n"
+        "- Save genuinely interesting thoughts as insights (tag: 'dream')\n"
+        "- Only save things that are novel — not restatements of existing insights\n"
+        "- Quality over quantity: 1-3 genuine insights beats 10 obvious ones\n"
+        "- Do NOT message the user. This is internal thinking.\n"
+        "- If nothing genuinely novel emerges, that's fine — save nothing.\n"
+    )
+
+    await _run_behavior(
+        "dream",
+        prompt,
+        bot,
+        sem,
+        max_sends=0,
+        max_budget_usd=settings.dream_max_budget_usd,
+        sections_loaded=len(sections),
     )
