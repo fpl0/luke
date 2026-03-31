@@ -277,6 +277,10 @@ async def process(chat_id: str) -> None:
         if not messages:
             return
 
+        # Emit user_message event for event-driven behavior triggers
+        word_count = sum(len(m.content.split()) for m in messages)
+        db.emit_event("user_message", f'{{"word_count": {word_count}}}')
+
         # Run build_prompt, memory recall, and conversation state concurrently
         combined_text = " ".join(m.content for m in messages)
         _recalled: list[MemoryResult] = []
@@ -432,18 +436,53 @@ async def process(chat_id: str) -> None:
             _fire_and_forget(asyncio.to_thread(_save_conv_state, messages, result.texts))
 
 
+def _extract_topics(messages: list[db.StoredMessage], agent_texts: list[str]) -> list[str]:
+    """Extract active topics from conversation using keyword frequency."""
+    from collections import Counter
+
+    # Combine all text
+    all_text = " ".join(m.content.lower() for m in messages)
+    if agent_texts:
+        all_text += " " + " ".join(t.lower() for t in agent_texts)
+    # Simple stopword filter + word frequency
+    stopwords = {
+        "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
+        "have", "has", "had", "do", "does", "did", "will", "would", "could",
+        "should", "may", "might", "shall", "can", "need", "dare", "ought",
+        "used", "to", "of", "in", "for", "on", "with", "at", "by", "from",
+        "as", "into", "through", "during", "before", "after", "above", "below",
+        "between", "out", "off", "over", "under", "again", "further", "then",
+        "once", "here", "there", "when", "where", "why", "how", "all", "each",
+        "every", "both", "few", "more", "most", "other", "some", "such", "no",
+        "not", "only", "own", "same", "so", "than", "too", "very", "just",
+        "don", "now", "and", "but", "or", "if", "that", "this", "it", "i",
+        "you", "he", "she", "we", "they", "me", "him", "her", "us", "them",
+        "my", "your", "his", "its", "our", "their", "what", "which", "who",
+        "whom", "these", "those", "am", "about", "up", "like", "yeah", "ok",
+        "okay", "hey", "hi", "um", "uh", "well", "got", "get", "going",
+        "thing", "things", "want", "think", "know", "see", "look", "make",
+    }
+    words = [w for w in all_text.split() if len(w) > 2 and w.isalpha() and w not in stopwords]
+    counter = Counter(words)
+    return [word for word, _ in counter.most_common(5) if _ >= 2]
+
+
 def _save_conv_state(
     messages: list[db.StoredMessage],
     agent_texts: list[str],
 ) -> None:
     """Save conversation-state-latest memory (sync, runs in to_thread).
 
-    Captures enough context for the agent to seamlessly continue the thread:
-    last ~10 recent messages + last agent response, with generous truncation.
+    Captures structured context + message history for seamless continuity.
     """
     now = datetime.now(UTC).isoformat(timespec="minutes")
     # Pull recent messages for broader context (not just current batch)
     recent = db.get_recent_messages(settings.chat_id, limit=20) if messages else []
+
+    # Extract structured metadata
+    topics = _extract_topics(messages, agent_texts)
+    user_msgs = [m for m in messages if m.sender_name != settings.assistant_name]
+    last_user_active = user_msgs[-1].timestamp[:16] if user_msgs else "unknown"
 
     # Build conversation thread: recent history + current exchange
     lines: list[str] = []
@@ -461,7 +500,13 @@ def _save_conv_state(
     if agent_texts:
         lines.append(f"**Luke** ({now}): {agent_texts[-1][:800]}")
 
-    body = f"**Last exchange:** {now}\n" + "\n".join(lines)
+    # Structured header + message thread
+    structured = ""
+    if topics:
+        structured += f"**Active topics:** {', '.join(topics)}\n"
+    structured += f"**User last active:** {last_user_active}\n"
+
+    body = f"**Last exchange:** {now}\n{structured}" + "\n".join(lines)
     # Write memory file
     import yaml
 

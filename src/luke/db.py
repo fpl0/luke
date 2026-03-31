@@ -253,6 +253,15 @@ CREATE TABLE IF NOT EXISTS outbound_log (
 );
 CREATE INDEX IF NOT EXISTS idx_outbound_hash ON outbound_log(chat_id, content_hash);
 
+CREATE TABLE IF NOT EXISTS events (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_type TEXT NOT NULL,
+    payload    TEXT NOT NULL DEFAULT '{}',
+    created    TEXT NOT NULL DEFAULT (datetime('now')),
+    consumed   INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type, consumed, created);
+
 CREATE TABLE IF NOT EXISTS schema_version (
     version INTEGER NOT NULL
 );
@@ -276,6 +285,27 @@ _MIGRATIONS: list[tuple[int, str, list[str]]] = [
         "add temporal validity to memory_links",
         [
             "ALTER TABLE memory_links ADD COLUMN valid_until TEXT",
+        ],
+    ),
+    (
+        3,
+        "add events table for event-driven behaviors",
+        [
+            """CREATE TABLE IF NOT EXISTS events (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_type TEXT NOT NULL,
+                payload    TEXT NOT NULL DEFAULT '{}',
+                created    TEXT NOT NULL DEFAULT (datetime('now')),
+                consumed   INTEGER NOT NULL DEFAULT 0
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type, consumed, created)",
+        ],
+    ),
+    (
+        4,
+        "add consecutive_no_ops to behavior_state for smart backoff",
+        [
+            "ALTER TABLE behavior_state ADD COLUMN consecutive_no_ops INTEGER NOT NULL DEFAULT 0",
         ],
     ),
 ]
@@ -445,6 +475,9 @@ def store_reaction_feedback(
         (chat_id, msg_id, sender_id, emoji, sentiment, timestamp),
     )
     _commit(conn)
+    # Emit event for negative reactions — triggers reflection behavior
+    if sentiment == "negative":
+        emit_event("feedback_negative", f'{{"msg_id": {msg_id}, "emoji": "{emoji}"}}')
 
 
 def get_reactions(
@@ -673,6 +706,92 @@ def set_behavior_last_run(name: str, timestamp: str) -> None:
         (name, timestamp),
     )
     _commit(conn)
+
+
+def get_behavior_no_ops(name: str) -> int:
+    """Return consecutive no-op count for a behavior."""
+    row = _db().execute(
+        "SELECT consecutive_no_ops FROM behavior_state WHERE name = ?", (name,)
+    ).fetchone()
+    return int(row["consecutive_no_ops"]) if row and row["consecutive_no_ops"] else 0
+
+
+def increment_behavior_no_ops(name: str) -> int:
+    """Increment no-op counter. Returns new value."""
+    conn = _db()
+    conn.execute(
+        "UPDATE behavior_state SET consecutive_no_ops = consecutive_no_ops + 1 WHERE name = ?",
+        (name,),
+    )
+    _commit(conn)
+    return get_behavior_no_ops(name)
+
+
+def reset_behavior_no_ops(name: str) -> None:
+    """Reset no-op counter to 0 (behavior produced useful output)."""
+    conn = _db()
+    conn.execute(
+        "UPDATE behavior_state SET consecutive_no_ops = 0 WHERE name = ?",
+        (name,),
+    )
+    _commit(conn)
+
+
+# ---------------------------------------------------------------------------
+# Events (for event-driven behavior triggers)
+# ---------------------------------------------------------------------------
+
+
+def emit_event(event_type: str, payload: str = "{}") -> int:
+    """Emit an event. Returns the event ID."""
+    conn = _db()
+    cur = conn.execute(
+        "INSERT INTO events (event_type, payload) VALUES (?, ?)",
+        (event_type, payload),
+    )
+    _commit(conn)
+    return cur.lastrowid or 0
+
+
+def count_unconsumed_events(*event_types: str, since: str | None = None) -> int:
+    """Count unconsumed events of given types, optionally since a timestamp."""
+    if not event_types:
+        return 0
+    placeholders = ",".join("?" for _ in event_types)
+    params: list[Any] = list(event_types)
+    where = f"event_type IN ({placeholders}) AND consumed = 0"
+    if since:
+        where += " AND created > ?"
+        params.append(since)
+    row = _db().execute(f"SELECT COUNT(*) AS cnt FROM events WHERE {where}", params).fetchone()
+    return int(row["cnt"]) if row else 0
+
+
+def consume_events(*event_types: str, since: str | None = None) -> int:
+    """Mark events as consumed. Returns count consumed."""
+    if not event_types:
+        return 0
+    placeholders = ",".join("?" for _ in event_types)
+    params: list[Any] = list(event_types)
+    where = f"event_type IN ({placeholders}) AND consumed = 0"
+    if since:
+        where += " AND created > ?"
+        params.append(since)
+    conn = _db()
+    cur = conn.execute(f"UPDATE events SET consumed = 1 WHERE {where}", params)
+    _commit(conn)
+    return cur.rowcount
+
+
+def cleanup_events(retention_days: int = 7) -> int:
+    """Remove consumed events older than retention period."""
+    conn = _db()
+    cur = conn.execute(
+        "DELETE FROM events WHERE consumed = 1 AND created < datetime('now', ?)",
+        (f"-{retention_days} days",),
+    )
+    _commit(conn)
+    return cur.rowcount
 
 
 # ---------------------------------------------------------------------------

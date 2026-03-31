@@ -66,6 +66,11 @@ class Settings(BaseSettings):
     # Reflection + proactive scan + goal execution
     reflection_interval: float = 604800.0  # weekly (seconds)
     proactive_scan_interval: float = 21600.0  # every 6 hours (seconds)
+    # Dream (autonomous thinking periods)
+    dream_interval: float = 28800.0  # 8h between sessions
+    dream_max_budget_usd: float = 2.0  # per-session cap
+    dream_quiet_hours: float = 2.0  # only dream if user inactive this long
+
     # Autonomous goal loop (replaces goal_execution)
     deep_work_interval: float = 14400.0  # 4h between sessions
     deep_work_max_turns: int = 500

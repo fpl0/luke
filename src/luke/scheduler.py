@@ -17,6 +17,7 @@ from .agent import run_agent
 from .behaviors import (
     run_consolidation,
     run_deep_work,
+    run_dream,
     run_feedback_consolidation,
     run_insight_consolidation,
     run_lifecycle_review,
@@ -178,6 +179,7 @@ async def start_scheduler_loop(
         "feedback_consolidation", settings.feedback_consolidation_interval
     )
     last_lifecycle_review = _load_offset("lifecycle_review", settings.lifecycle_review_interval)
+    last_dream = _load_offset("dream", settings.dream_interval)
 
     while not (shutdown and shutdown.is_set()):
         # Use wait with timeout so we wake up promptly on shutdown
@@ -205,6 +207,7 @@ async def start_scheduler_loop(
                     _session_models.pop(cid, None)
             pruned_logs = db.cleanup_task_logs()
             pruned_outbound = db.cleanup_outbound_log()
+            pruned_events = db.cleanup_events()
             db.set_behavior_last_run("cleanup", datetime.now(UTC).isoformat())
             log.info(
                 "hourly_maintenance",
@@ -212,40 +215,88 @@ async def start_scheduler_loop(
                 sessions_cleaned=len(cleaned_ids),
                 task_logs_pruned=pruned_logs,
                 outbound_pruned=pruned_outbound,
+                events_pruned=pruned_events,
             )
 
         # Step 1: Collect and run due maintenance behaviors (short-lived, awaited)
+        # Each behavior uses a hybrid trigger: time-based interval AND event awareness.
+        # Smart backoff: if a behavior produced nothing useful, its effective interval
+        # doubles (up to 16x) until a relevant event resets the counter.
         maintenance_coros: list[tuple[str, Coroutine[object, object, None]]] = []
 
-        if now_mono - last_consolidation >= settings.episode_consolidation_interval:
-            last_consolidation = now_mono
-            maintenance_coros.append(("consolidation", run_consolidation(bot, sem)))
+        def _effective_interval(name: str, base: float) -> float:
+            """Apply exponential backoff based on consecutive no-op runs."""
+            try:
+                no_ops = int(db.get_behavior_no_ops(name))
+            except (TypeError, ValueError):
+                no_ops = 0
+            return base * (2 ** min(no_ops, 4))  # caps at 16x base interval
 
-        if now_mono - last_proactive >= settings.proactive_scan_interval:
+        # Consolidation: time-based + needs episode events
+        consol_interval = _effective_interval(
+            "consolidation", settings.episode_consolidation_interval
+        )
+        if now_mono - last_consolidation >= consol_interval:
+            has_episodes = db.count_unconsumed_events("new_episode") >= settings.consolidation_min_cluster
+            if has_episodes or now_mono - last_consolidation >= consol_interval * 2:
+                last_consolidation = now_mono
+                maintenance_coros.append(("consolidation", run_consolidation(bot, sem)))
+
+        # Proactive scan: time-based (keeps fallback) + any event
+        proactive_interval = _effective_interval(
+            "proactive_scan", settings.proactive_scan_interval
+        )
+        if now_mono - last_proactive >= proactive_interval:
             last_proactive = now_mono
             maintenance_coros.append(("proactive_scan", run_proactive_scan(bot, sem)))
 
-        if now_mono - last_reflection >= settings.reflection_interval:
-            last_reflection = now_mono
-            maintenance_coros.append(("reflection", run_reflection(bot, sem)))
-            # Weekly FTS pruning (alongside reflection — not urgent)
-            pruned = memory.prune_old_fts_entries(settings.fts_retention_days)
-            if pruned:
-                log.info("fts_pruned", count=pruned)
+        # Reflection: time-based + needs user interaction or feedback
+        reflection_interval = _effective_interval("reflection", settings.reflection_interval)
+        if now_mono - last_reflection >= reflection_interval:
+            has_feedback = db.count_unconsumed_events(
+                "feedback_negative", "user_message"
+            ) >= 5
+            if has_feedback or now_mono - last_reflection >= reflection_interval * 2:
+                last_reflection = now_mono
+                maintenance_coros.append(("reflection", run_reflection(bot, sem)))
+                # Weekly FTS pruning (alongside reflection — not urgent)
+                pruned = memory.prune_old_fts_entries(settings.fts_retention_days)
+                if pruned:
+                    log.info("fts_pruned", count=pruned)
 
-        if now_mono - last_insight_consolidation >= settings.insight_consolidation_interval:
-            last_insight_consolidation = now_mono
-            maintenance_coros.append(("insight_consolidation", run_insight_consolidation(bot, sem)))
+        # Insight consolidation: time-based + needs insight events
+        insight_interval = _effective_interval(
+            "insight_consolidation", settings.insight_consolidation_interval
+        )
+        if now_mono - last_insight_consolidation >= insight_interval:
+            has_insights = db.count_unconsumed_events("new_insight") >= 3
+            if has_insights or now_mono - last_insight_consolidation >= insight_interval * 2:
+                last_insight_consolidation = now_mono
+                maintenance_coros.append(
+                    ("insight_consolidation", run_insight_consolidation(bot, sem))
+                )
 
-        if now_mono - last_feedback_consolidation >= settings.feedback_consolidation_interval:
-            last_feedback_consolidation = now_mono
-            maintenance_coros.append(
-                ("feedback_consolidation", run_feedback_consolidation(bot, sem))
-            )
+        # Feedback consolidation: time-based + needs negative feedback
+        feedback_interval = _effective_interval(
+            "feedback_consolidation", settings.feedback_consolidation_interval
+        )
+        if now_mono - last_feedback_consolidation >= feedback_interval:
+            has_negatives = db.count_unconsumed_events("feedback_negative") >= 2
+            if has_negatives or now_mono - last_feedback_consolidation >= feedback_interval * 2:
+                last_feedback_consolidation = now_mono
+                maintenance_coros.append(
+                    ("feedback_consolidation", run_feedback_consolidation(bot, sem))
+                )
 
+        # Lifecycle review: purely time-based (inherently periodic)
         if now_mono - last_lifecycle_review >= settings.lifecycle_review_interval:
             last_lifecycle_review = now_mono
             maintenance_coros.append(("lifecycle_review", run_lifecycle_review(bot, sem)))
+
+        # Dream: autonomous thinking periods (quiet-gated internally)
+        if now_mono - last_dream >= settings.dream_interval:
+            last_dream = now_mono
+            maintenance_coros.append(("dream", run_dream(bot, sem)))
 
         if maintenance_coros:
             names = [name for name, _ in maintenance_coros]
@@ -258,12 +309,25 @@ async def start_scheduler_loop(
                 return_exceptions=True,
             )
             now_iso = datetime.now(UTC).isoformat()
+            # Map behavior names to the events they consume
+            _BEHAVIOR_EVENTS: dict[str, tuple[str, ...]] = {
+                "consolidation": ("new_episode",),
+                "reflection": ("feedback_negative", "user_message"),
+                "proactive_scan": (),
+                "insight_consolidation": ("new_insight",),
+                "feedback_consolidation": ("feedback_negative",),
+                "lifecycle_review": (),
+            }
             with db.batch():
                 for (name, _), result in zip(maintenance_coros, results, strict=True):
                     if isinstance(result, BaseException):
                         log.exception(f"{name}_error", exc_info=result)
                     else:
                         db.set_behavior_last_run(name, now_iso)
+                        # Consume events this behavior was triggered by
+                        events = _BEHAVIOR_EVENTS.get(name, ())
+                        if events:
+                            db.consume_events(*events)
 
         # Step 2: Launch deep work as background task (long-lived, NOT awaited)
         deep_work_running = _deep_work_task is not None and not _deep_work_task.done()
