@@ -233,6 +233,27 @@ class TestCleanupEvents:
         assert removed == 3
 
 
+    def test_removes_stale_unconsumed(self, test_db: Any) -> None:
+        """Unconsumed events older than 4x retention are cleaned as a safety net."""
+        test_db.emit_event("user_message")
+        conn = test_db._db()
+        # Backdate beyond 4x retention (7 * 4 = 28 days)
+        conn.execute("UPDATE events SET created = datetime('now', '-30 days')")
+        conn.commit()
+        removed = test_db.cleanup_events(retention_days=7)
+        assert removed == 1
+
+    def test_keeps_moderately_old_unconsumed(self, test_db: Any) -> None:
+        """Unconsumed events within the 4x retention window survive."""
+        test_db.emit_event("user_message")
+        conn = test_db._db()
+        # 20 days old, within 28-day stale cutoff
+        conn.execute("UPDATE events SET created = datetime('now', '-20 days')")
+        conn.commit()
+        removed = test_db.cleanup_events(retention_days=7)
+        assert removed == 0
+
+
 class TestBehaviorNoOps:
     def test_get_no_ops_default(self, test_db: Any) -> None:
         # Need to insert a behavior_state row first

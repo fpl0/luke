@@ -793,11 +793,19 @@ def consume_events(*event_types: str, since: str | None = None) -> int:
 
 
 def cleanup_events(retention_days: int = 7) -> int:
-    """Remove consumed events older than retention period."""
+    """Remove consumed events older than retention period and stale unconsumed events.
+
+    Consumed events are removed after `retention_days`.
+    Unconsumed events are removed after 4x retention (safety net for events
+    that were never consumed due to behavior gaps).
+    """
     conn = _db()
+    stale_days = retention_days * 4
     cur = conn.execute(
-        "DELETE FROM events WHERE consumed = 1 AND created < datetime('now', ?)",
-        (f"-{retention_days} days",),
+        "DELETE FROM events WHERE "
+        "(consumed = 1 AND created < datetime('now', ?)) OR "
+        "(consumed = 0 AND created < datetime('now', ?))",
+        (f"-{retention_days} days", f"-{stale_days} days"),
     )
     _commit(conn)
     return cur.rowcount
