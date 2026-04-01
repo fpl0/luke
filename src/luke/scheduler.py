@@ -104,6 +104,7 @@ async def _run_task(task: TaskRecord, bot: Bot) -> None:
                 prompt=prompt,
                 session_id=None,
                 bot=bot,
+                autonomous=True,
             ),
             timeout=settings.agent_timeout,
         )

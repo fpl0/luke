@@ -147,6 +147,10 @@ class TestRunReflection:
             mock_db.get_recent_messages.return_value = [
                 {"sender_name": "User", "timestamp": "2024-01-01", "content": "Hello"}
             ]
+            mock_db.get_reactions.return_value = []
+            mock_db.get_reaction_summary.return_value = {
+                "total": 0, "sentiments": {}, "top_emojis": [], "by_sender": {}, "period_days": 7,
+            }
             mock_agent.return_value = MagicMock(texts=[])
             await run_reflection(AsyncMock(), _SEM)
 
@@ -166,8 +170,13 @@ class TestRunReflection:
         ):
             mock_settings.chat_id = "12345"
             mock_settings.agent_timeout = 10
+            mock_settings.assistant_name = "Luke"
             mock_memory.recall_by_time_window.return_value = memories
             mock_db.get_recent_messages.return_value = []
+            mock_db.get_reactions.return_value = []
+            mock_db.get_reaction_summary.return_value = {
+                "total": 0, "sentiments": {}, "top_emojis": [], "by_sender": {}, "period_days": 7,
+            }
             await run_reflection(AsyncMock(), _SEM)
 
 
@@ -217,7 +226,7 @@ class TestRunProactiveScan:
             patch("luke.behaviors.memory") as mock_memory,
             patch("luke.behaviors.run_agent", new_callable=AsyncMock) as mock_agent,
         ):
-            mock_memory.recall.side_effect = [goals, insights]
+            mock_memory.recall.side_effect = [goals, insights, []]
             mock_db.get_message_summaries.return_value = [
                 {"date": "2024-01-01", "messages": ["User: hi"]}
             ]

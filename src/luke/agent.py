@@ -1016,6 +1016,7 @@ async def run_agent(
     max_sends: int | None = None,
     effort: Literal["low", "medium", "high", "max"] | None = None,
     thinking: ThinkingConfig | None = None,
+    autonomous: bool = False,
 ) -> AgentResult:
     root = settings.luke_dir
     effective_model = model or settings.agent_model
@@ -1039,6 +1040,15 @@ async def run_agent(
             send_count["n"] += 1
             if send_count["n"] > effective_max_sends:
                 return {"decision": "block", "reason": "Rate limit: too many outbound messages"}
+            # Global hourly budget for autonomous runs (behaviors + crons)
+            if autonomous and db.count_recent_outbound(chat_id) >= settings.max_sends_per_hour:
+                log.warning(
+                    "hourly_budget_exceeded",
+                    chat_id=chat_id,
+                    hourly_count=db.count_recent_outbound(chat_id),
+                    limit=settings.max_sends_per_hour,
+                )
+                return {"decision": "block", "reason": "Hourly message budget exceeded"}
         return {}
 
     hooks: dict[HookEvent, list[HookMatcher]] = {
