@@ -55,6 +55,7 @@ async def _run_behavior(
                     ),
                     max_sends=max_sends,
                     effort="high",
+                    autonomous=True,
                 ),
                 timeout=settings.agent_timeout,
             )
@@ -148,6 +149,24 @@ async def run_reflection(bot: Bot, sem: asyncio.Semaphore) -> None:
             f"from {r['sender_id']} at {r['timestamp']}"
         )
 
+    # Pre-analyzed reaction summary for pattern detection
+    summary = db.get_reaction_summary(chat_id, days=7)
+    summary_text = ""
+    if summary["total"] > 0:
+        parts = [f"Total reactions: {summary['total']}"]
+        for s, cnt in summary["sentiments"].items():
+            pct = round(100 * cnt / summary["total"])
+            parts.append(f"  {s}: {cnt} ({pct}%)")
+        if summary["top_emojis"]:
+            parts.append("Top emojis: " + ", ".join(f"{e} x{c}" for e, c in summary["top_emojis"]))
+        luke_stats = summary["by_sender"].get(settings.assistant_name, {})
+        if luke_stats:
+            parts.append(
+                f"Reactions on {settings.assistant_name}'s messages: "
+                + ", ".join(f"{s}={c}" for s, c in luke_stats.items())
+            )
+        summary_text = "\n".join(parts)
+
     prompt = (
         "Weekly reflection task. Review these recent memories, conversation "
         "history, AND user reactions:\n\n"
@@ -155,8 +174,10 @@ async def run_reflection(bot: Bot, sem: asyncio.Semaphore) -> None:
         + "\n---\n".join(contents)
         + "\n\n=== Recent Conversations ===\n"
         + "\n".join(msg_lines[-50:])
-        + "\n\n=== User Reactions (emoji feedback on your messages) ===\n"
-        + ("\n".join(reaction_lines) if reaction_lines else "(No reactions this period)")
+        + "\n\n=== Reaction Summary (last 7 days) ===\n"
+        + (summary_text if summary_text else "(No reactions this period)")
+        + "\n\n=== Individual Reactions ===\n"
+        + ("\n".join(reaction_lines) if reaction_lines else "(None)")
         + "\n\nReflect on:\n"
         "1. Which of your messages got positive reactions? What made them work?\n"
         "2. Which messages got negative reactions or were corrected/ignored?\n"
@@ -216,6 +237,24 @@ async def run_proactive_scan(bot: Bot, sem: asyncio.Semaphore) -> None:
                 insight_lines.append(f"[{r['id']}]: {body}")
         if insight_lines:
             sections.append("Recent insights:\n" + "\n---\n".join(insight_lines))
+
+    # Recall feedback insights so proactive actions avoid past mistakes
+    feedback_insights = memory.recall(
+        query="feedback communication preference",
+        mem_type="insight",
+        limit=5,
+    )
+    if feedback_insights:
+        fi_lines: list[str] = []
+        for fi in feedback_insights:
+            body = read_memory_body(fi["type"], fi["id"], 200)
+            if body:
+                fi_lines.append(f"[{fi['id']}]: {body}")
+        if fi_lines:
+            sections.append(
+                "Feedback insights (apply these — do NOT repeat past mistakes):\n"
+                + "\n---\n".join(fi_lines)
+            )
 
     # Add conversation summaries for anticipatory pattern recognition
     summaries = db.get_message_summaries(chat_id, days=14)

@@ -88,6 +88,7 @@ class Settings(BaseSettings):
     agent_model: str = "opus"
     agent_fallback_model: str = "sonnet"
     max_sends_per_run: int = 20  # rate-limit outbound Telegram messages per agent run
+    max_sends_per_hour: int = 8  # global hourly cap on autonomous outbound messages
 
     # Model routing per effort level
     model_low: str = "haiku"  # trivial messages (acks, short replies)

@@ -528,6 +528,59 @@ def get_reactions(
     return [dict(r) for r in rows]
 
 
+def get_reaction_summary(chat_id: str, days: int = 7) -> dict[str, Any]:
+    """Aggregate reaction stats for the given period.
+
+    Returns sentiment counts, top emojis, and which message types
+    (by sender: Luke vs user) get the most reactions.
+    """
+    cutoff = (datetime.now(UTC) - timedelta(days=days)).isoformat()
+    conn = _db()
+
+    # Sentiment breakdown
+    sentiment_rows = conn.execute(
+        """SELECT sentiment, COUNT(*) AS cnt
+           FROM reaction_feedback
+           WHERE chat_id = ? AND timestamp >= ?
+           GROUP BY sentiment""",
+        (chat_id, cutoff),
+    ).fetchall()
+    sentiments = {r["sentiment"]: r["cnt"] for r in sentiment_rows}
+
+    # Top emojis
+    emoji_rows = conn.execute(
+        """SELECT emoji, COUNT(*) AS cnt
+           FROM reaction_feedback
+           WHERE chat_id = ? AND timestamp >= ?
+           GROUP BY emoji ORDER BY cnt DESC LIMIT 5""",
+        (chat_id, cutoff),
+    ).fetchall()
+    top_emojis = [(r["emoji"], r["cnt"]) for r in emoji_rows]
+
+    # Reactions on Luke's messages vs others
+    sender_rows = conn.execute(
+        """SELECT m.sender AS msg_sender, r.sentiment, COUNT(*) AS cnt
+           FROM reaction_feedback r
+           LEFT JOIN messages m ON m.chat_id = r.chat_id AND m.msg_id = r.msg_id
+           WHERE r.chat_id = ? AND r.timestamp >= ?
+           GROUP BY m.sender, r.sentiment""",
+        (chat_id, cutoff),
+    ).fetchall()
+    by_sender: dict[str, dict[str, int]] = {}
+    for r in sender_rows:
+        sender = r["msg_sender"] or "unknown"
+        by_sender.setdefault(sender, {})[r["sentiment"]] = r["cnt"]
+
+    total = sum(sentiments.values())
+    return {
+        "total": total,
+        "sentiments": sentiments,
+        "top_emojis": top_emojis,
+        "by_sender": by_sender,
+        "period_days": days,
+    }
+
+
 def get_message_summaries(chat_id: str, days: int = 14) -> list[dict[str, Any]]:
     """Group messages by date for the last N days. Returns date + previews."""
     cutoff = (datetime.now(UTC) - timedelta(days=days)).isoformat()
@@ -924,6 +977,20 @@ def is_duplicate_outbound(chat_id: str, content_hash: str, window_seconds: int =
         .fetchone()
     )
     return row is not None
+
+
+def count_recent_outbound(chat_id: str, window_seconds: int = 3600) -> int:
+    """Count outbound messages sent within the given time window."""
+    row = (
+        _db()
+        .execute(
+            "SELECT COUNT(*) FROM outbound_log "
+            "WHERE chat_id = ? AND timestamp >= datetime('now', ?)",
+            (chat_id, f"-{window_seconds} seconds"),
+        )
+        .fetchone()
+    )
+    return row[0] if row else 0
 
 
 def cleanup_outbound_log(retention_hours: int = 24) -> int:
