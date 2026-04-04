@@ -330,6 +330,23 @@ _MIGRATIONS: list[tuple[int, str, list[str]]] = [
             "CREATE INDEX IF NOT EXISTS idx_memory_meta_taxonomy ON memory_meta(taxonomy)",
         ],
     ),
+    (
+        7,
+        "repair: ensure migrations 5-6 objects exist (fixes ghost-recorded versions)",
+        [
+            # Re-create table/column that may have been ghost-recorded
+            """CREATE TABLE IF NOT EXISTS deep_work_quality (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                goal_id      TEXT NOT NULL,
+                rating       INTEGER NOT NULL CHECK (rating BETWEEN 1 AND 5),
+                session_date TEXT NOT NULL DEFAULT (datetime('now')),
+                created      TEXT NOT NULL DEFAULT (datetime('now'))
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_dwq_goal ON deep_work_quality(goal_id, created DESC)",
+            "ALTER TABLE memory_meta ADD COLUMN taxonomy TEXT NOT NULL DEFAULT ''",
+            "CREATE INDEX IF NOT EXISTS idx_memory_meta_taxonomy ON memory_meta(taxonomy)",
+        ],
+    ),
 ]
 
 
