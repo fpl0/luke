@@ -164,6 +164,9 @@ _SEND_TOOLS: frozenset[str] = frozenset(
 )
 
 
+_AUTO_SKILL_THRESHOLD: int = 5  # tool calls to trigger procedure extraction in stop hook
+
+
 @dataclass(slots=True)
 class AgentResult:
     texts: list[str] = field(default_factory=list)
@@ -172,6 +175,7 @@ class AgentResult:
     num_turns: int = 0
     duration_api_ms: int = 0
     sent_messages: int = 0  # messages sent via MCP tools during this run
+    tool_uses: int = 0  # total tool calls made during this run
 
 
 # ---------------------------------------------------------------------------
@@ -764,6 +768,28 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
         report = db.get_cost_report(args.get("period", "month"))
         return _ok(report)
 
+    # --- Deep Work Quality (1 tool) ---
+
+    @tool(
+        "log_deep_work_quality",
+        "Record quality rating (1-5) for a deep work session on a goal. "
+        "Call at end of every deep work session.",
+        {"goal_id": str, "rating": int},
+        annotations=_OPEN_WORLD,
+    )
+    async def t_quality(args: dict[str, Any]) -> dict[str, Any]:
+        goal_id = args["goal_id"]
+        rating = int(args["rating"])
+        if not 1 <= rating <= 5:
+            return _ok("Error: rating must be 1-5")
+        db.log_deep_work_quality(goal_id, rating)
+        scores = db.get_recent_quality_scores(goal_id, 3)
+        avg = sum(scores) / len(scores) if scores else 0
+        return _ok(
+            f"Quality logged: {rating}/5 for {goal_id}. "
+            f"Last {len(scores)} avg: {avg:.1f}"
+        )
+
     # --- Browser (1 tool) ---
 
     @tool(
@@ -848,6 +874,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
             mem_bulk,
             mem_history,
             t_cost,
+            t_quality,
             t_browse,
         ],
     )
@@ -858,26 +885,46 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
 # ---------------------------------------------------------------------------
 
 
-async def _stop_hook(
-    input_data: StopHookInput,
-    tool_use_id: str | None,
-    context: HookContext,
-) -> SyncHookJSONOutput:
-    return {
-        "systemMessage": (
-            "Session ending. Before you stop:\n"
-            "1. Did you learn anything new about the user? Save it with 'remember'.\n"
-            "2. Did any entity (person, project) change? Update their db.\n"
-            "3. Was this conversation significant? Save an episode — include your reasoning: "
-            "what approaches you considered, why you chose your solution, what worked or didn't.\n"
-            "4. Did you notice a pattern or preference? Save an insight.\n"
-            "5. Is there anything pending that needs follow-up? Schedule a reminder.\n"
-            "6. Did the user mention wanting to achieve something? Create or update a goal.\n"
-            "7. Save a 'conversation-state-latest' episode: what you discussed, "
-            "user's mood/energy, anything unresolved or promised, what's likely to "
-            "come up next. Keep under 200 words. Overwrite the previous one if it exists."
-        )
-    }
+def _build_stop_hook(
+    tool_count: dict[str, int], autonomous: bool
+) -> HookCallback:
+    """Factory returning a Stop hook closure with access to the run's tool count."""
+
+    async def _stop_hook(
+        input_data: StopHookInput,
+        tool_use_id: str | None,
+        context: HookContext,
+    ) -> SyncHookJSONOutput:
+        skill_prompt = ""
+        if not autonomous and tool_count["n"] >= _AUTO_SKILL_THRESHOLD:
+            skill_prompt = (
+                f"\n8. Skill extraction: this conversation used {tool_count['n']} tool calls "
+                "— it was complex. Before stopping, check whether a reusable procedure can be extracted:\n"
+                "   - Did you solve something that is likely to come up again?\n"
+                "   - Is there a clear sequence of steps that another session could follow?\n"
+                "   If yes, save a procedure memory (type: procedure):\n"
+                "     - ID: descriptive kebab-case (e.g. how-to-deploy-app, research-flight-options)\n"
+                "     - Include: trigger condition, step-by-step approach, gotchas, example\n"
+                "   If no clear reusable pattern exists, skip this — don't save noise."
+            )
+        return {
+            "systemMessage": (
+                "Session ending. Before you stop:\n"
+                "1. Did you learn anything new about the user? Save it with 'remember'.\n"
+                "2. Did any entity (person, project) change? Update their db.\n"
+                "3. Was this conversation significant? Save an episode — include your reasoning: "
+                "what approaches you considered, why you chose your solution, what worked or didn't.\n"
+                "4. Did you notice a pattern or preference? Save an insight.\n"
+                "5. Is there anything pending that needs follow-up? Schedule a reminder.\n"
+                "6. Did the user mention wanting to achieve something? Create or update a goal.\n"
+                "7. Save a 'conversation-state-latest' episode: what you discussed, "
+                "user's mood/energy, anything unresolved or promised, what's likely to "
+                "come up next. Keep under 200 words. Overwrite the previous one if it exists."
+                + skill_prompt
+            )
+        }
+
+    return cast(HookCallback, _stop_hook)
 
 
 async def _pre_compact_hook(
@@ -969,6 +1016,7 @@ _ALL_MCP_TOOL_NAMES: list[str] = [
     "bulk_memory",
     "memory_history",
     "get_cost_report",
+    "log_deep_work_quality",
     "browse",
 ]
 
@@ -1017,6 +1065,7 @@ async def run_agent(
     effort: Literal["low", "medium", "high", "max"] | None = None,
     thinking: ThinkingConfig | None = None,
     autonomous: bool = False,
+    urgent: bool = False,
 ) -> AgentResult:
     root = settings.luke_dir
     effective_model = model or settings.agent_model
@@ -1025,8 +1074,9 @@ async def run_agent(
     persona_path = root / "LUKE.md"
     persona = persona_path.read_text() if persona_path.exists() else ""
 
-    # Per-run send rate-limit counter (closed over by PreToolUse hook)
+    # Per-run counters (closed over by PreToolUse hook)
     send_count = {"n": 0}
+    tool_count: dict[str, int] = {"n": 0}
     effective_max_sends = max_sends if max_sends is not None else settings.max_sends_per_run
 
     async def _pre_tool_hook(
@@ -1036,23 +1086,33 @@ async def run_agent(
     ) -> SyncHookJSONOutput:
         tool_name = input_data["tool_name"]
         log.info("tool_use", tool=tool_name, input=_trunc(str(input_data["tool_input"])))
+        tool_count["n"] += 1
         if tool_name in _SEND_TOOLS:
             send_count["n"] += 1
             if send_count["n"] > effective_max_sends:
                 return {"decision": "block", "reason": "Rate limit: too many outbound messages"}
-            # Global hourly budget for autonomous runs (behaviors + crons)
-            if autonomous and db.count_recent_outbound(chat_id) >= settings.max_sends_per_hour:
-                log.warning(
-                    "hourly_budget_exceeded",
-                    chat_id=chat_id,
-                    hourly_count=db.count_recent_outbound(chat_id),
-                    limit=settings.max_sends_per_hour,
-                )
-                return {"decision": "block", "reason": "Hourly message budget exceeded"}
+            # Global hourly attention budget for autonomous runs (behaviors + crons).
+            # Urgent behaviors (e.g. proactive_scan) can draw from a small reserve
+            # beyond the normal cap so they can still reach the user when the normal
+            # budget is exhausted.  Non-urgent behaviors are blocked at max_sends_per_hour.
+            if autonomous:
+                hourly_count = db.count_recent_outbound(chat_id)
+                normal_limit = settings.max_sends_per_hour
+                urgent_limit = normal_limit + settings.attention_urgent_reserve
+                effective_limit = urgent_limit if urgent else normal_limit
+                if hourly_count >= effective_limit:
+                    log.warning(
+                        "hourly_budget_exceeded",
+                        chat_id=chat_id,
+                        hourly_count=hourly_count,
+                        limit=effective_limit,
+                        urgent=urgent,
+                    )
+                    return {"decision": "block", "reason": "Hourly message budget exceeded"}
         return {}
 
     hooks: dict[HookEvent, list[HookMatcher]] = {
-        "Stop": [HookMatcher(hooks=[cast(HookCallback, _stop_hook)])],
+        "Stop": [HookMatcher(hooks=[_build_stop_hook(tool_count, autonomous)])],
         "PreToolUse": [HookMatcher(hooks=[cast(HookCallback, _pre_tool_hook)])],
         "PreCompact": [HookMatcher(hooks=[cast(HookCallback, _pre_compact_hook)])],
         "Notification": [HookMatcher(hooks=[cast(HookCallback, _notification_hook)])],
@@ -1180,4 +1240,5 @@ async def run_agent(
                         result.texts.append(text)
 
     result.sent_messages = send_count["n"]
+    result.tool_uses = tool_count["n"]
     return result
