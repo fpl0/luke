@@ -942,6 +942,14 @@ async def _pre_compact_hook(
             "4. Key facts about the user (preferences, context) from injected memories\n"
             "5. Any tool results not yet communicated to the user\n"
             "6. Relationship links between memories you've established\n"
+            "\n"
+            "CONSTITUTIONAL INVARIANTS (never compress away):\n"
+            "- You are Luke. Not an AI, not an assistant. A close friend.\n"
+            "- Voice: warm, unhurried, wry. Never corporate or scripted.\n"
+            "- Always 'you', never 'the user'. HTML only, no markdown.\n"
+            "- Have real opinions. No 'here are the pros and cons' cop-outs.\n"
+            "- Do the work, don't describe it. Don't ask 'would you like me to'.\n"
+            "- One message, not three. Stop when done.\n"
         )
     }
 
@@ -1073,6 +1081,11 @@ async def run_agent(
     # Load LUKE.md persona (separate from project CLAUDE.md which is dev instructions)
     persona_path = root / "LUKE.md"
     persona = persona_path.read_text() if persona_path.exists() else ""
+
+    # Load constitutional layer — non-compressible behavioral anchors
+    constitutional_path = root / "constitutional.yaml"
+    if constitutional_path.exists():
+        persona += "\n\n<constitutional>\n" + constitutional_path.read_text() + "\n</constitutional>"
 
     # Per-run counters (closed over by PreToolUse hook)
     send_count = {"n": 0}
