@@ -177,7 +177,6 @@ CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
 CREATE TABLE IF NOT EXISTS memory_meta (
     id            TEXT PRIMARY KEY,
     type          TEXT NOT NULL,
-    taxonomy      TEXT NOT NULL DEFAULT '',
     created       TEXT NOT NULL,
     updated       TEXT NOT NULL,
     access_count  INTEGER NOT NULL DEFAULT 0,
@@ -194,7 +193,6 @@ CREATE INDEX IF NOT EXISTS idx_memory_meta_created ON memory_meta(created);
 CREATE INDEX IF NOT EXISTS idx_memory_meta_status ON memory_meta(status);
 CREATE INDEX IF NOT EXISTS idx_memory_meta_type_status
     ON memory_meta(type, status, updated DESC);
-CREATE INDEX IF NOT EXISTS idx_memory_meta_taxonomy ON memory_meta(taxonomy);
 
 CREATE TABLE IF NOT EXISTS reaction_feedback (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
