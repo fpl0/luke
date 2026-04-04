@@ -1042,3 +1042,134 @@ class TestCodeKeywords:
             "database", "migration", "schema",
         }
         assert _CODE_KEYWORDS == expected
+
+
+# ---------------------------------------------------------------------------
+# _extract_topics
+# ---------------------------------------------------------------------------
+
+
+def _make_msg(content: str, sender: str = "Filipe") -> Any:
+    from luke.db import StoredMessage
+
+    return StoredMessage(
+        id=1,
+        sender_name=sender,
+        sender_id="user1",
+        message_id=1,
+        content=content,
+        timestamp="2026-04-01T10:00:00",
+    )
+
+
+class TestExtractTopics:
+    def test_returns_top_keywords(self) -> None:
+        from luke.app import _extract_topics
+
+        msgs = [_make_msg("python python python programming programming")]
+        topics = _extract_topics(msgs, [])
+        assert "python" in topics
+        assert "programming" in topics
+
+    def test_filters_stopwords(self) -> None:
+        from luke.app import _extract_topics
+
+        msgs = [_make_msg("the a an is are was were have has had")]
+        topics = _extract_topics(msgs, [])
+        assert topics == []
+
+    def test_filters_short_words(self) -> None:
+        from luke.app import _extract_topics
+
+        msgs = [_make_msg("go do it at by")]
+        topics = _extract_topics(msgs, [])
+        assert topics == []
+
+    def test_includes_agent_texts(self) -> None:
+        from luke.app import _extract_topics
+
+        msgs = [_make_msg("something unrelated")]
+        topics = _extract_topics(msgs, ["deployment deployment deployment pipeline pipeline"])
+        assert "deployment" in topics
+
+    def test_requires_frequency_2(self) -> None:
+        from luke.app import _extract_topics
+
+        msgs = [_make_msg("unique word appears once")]
+        topics = _extract_topics(msgs, [])
+        # "unique", "word", "appears" each appear once — should NOT be in topics
+        assert "unique" not in topics
+
+    def test_max_5_topics(self) -> None:
+        from luke.app import _extract_topics
+
+        # 8 distinct words each appearing 3 times
+        text = " ".join(w * 3 for w in ["alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta"])
+        msgs = [_make_msg(text)]
+        topics = _extract_topics(msgs, [])
+        assert len(topics) <= 5
+
+    def test_empty_input(self) -> None:
+        from luke.app import _extract_topics
+
+        assert _extract_topics([], []) == []
+
+    def test_case_insensitive(self) -> None:
+        from luke.app import _extract_topics
+
+        msgs = [_make_msg("Python python PYTHON")]
+        topics = _extract_topics(msgs, [])
+        assert "python" in topics
+
+
+# ---------------------------------------------------------------------------
+# _extract_pending_actions
+# ---------------------------------------------------------------------------
+
+
+class TestExtractPendingActions:
+    def test_extracts_ill_pattern(self) -> None:
+        from luke.app import _extract_pending_actions
+
+        actions = _extract_pending_actions(["I'll check the database tomorrow"])
+        assert len(actions) == 1
+        assert "check the database tomorrow" in actions[0]
+
+    def test_extracts_i_will_pattern(self) -> None:
+        from luke.app import _extract_pending_actions
+
+        actions = _extract_pending_actions(["I will send you the report"])
+        assert len(actions) == 1
+
+    def test_extracts_next_steps(self) -> None:
+        from luke.app import _extract_pending_actions
+
+        actions = _extract_pending_actions(["Next steps: review the code carefully."])
+        assert len(actions) == 1
+
+    def test_deduplicates_actions(self) -> None:
+        from luke.app import _extract_pending_actions
+
+        actions = _extract_pending_actions([
+            "I'll review the code",
+            "I'll review the code",
+        ])
+        assert actions.count(actions[0]) == 1 if actions else True
+
+    def test_caps_at_5_actions(self) -> None:
+        from luke.app import _extract_pending_actions
+
+        texts = [f"I'll do action number {i} right now" for i in range(10)]
+        actions = _extract_pending_actions(texts)
+        assert len(actions) <= 5
+
+    def test_empty_input(self) -> None:
+        from luke.app import _extract_pending_actions
+
+        assert _extract_pending_actions([]) == []
+
+    def test_no_match_returns_empty(self) -> None:
+        from luke.app import _extract_pending_actions
+
+        actions = _extract_pending_actions(["Just a plain statement with no action."])
+        assert actions == []
