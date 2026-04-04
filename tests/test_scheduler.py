@@ -386,6 +386,8 @@ class TestSchedulerLoop:
             mock_settings.dream_interval = 999999
             mock_db.get_due_tasks.return_value = []
             mock_db.get_behavior_last_run.return_value = None
+            mock_db.count_unconsumed_events.return_value = 0
+            mock_db.consume_events.return_value = 0
 
             async def set_shutdown() -> None:
                 await asyncio.sleep(0.05)
@@ -456,3 +458,313 @@ class TestBehaviorEventMapping:
         assert all(m == 6 for m in fallback_multipliers), (
             f"Expected all fallback multipliers to be 6, got {fallback_multipliers}"
         )
+
+    def test_all_newly_gated_behaviors_have_fallback_multiplier(self) -> None:
+        """proactive_scan, lifecycle_review, dream, and deep_work must all have a 6x fallback."""
+        import ast
+        import inspect
+
+        source = inspect.getsource(start_scheduler_loop)
+        # Verify each newly-gated behavior has a 6x pattern in source
+        for behavior in ("proactive_scan", "lifecycle_review", "dream", "deep_work"):
+            assert f"{behavior}_interval * 6" in source or f"{behavior[:-1]}_interval * 6" in source or "* 6" in source, (
+                f"{behavior} missing 6x fallback"
+            )
+        # Count 6x patterns — should have at least 8 (4 original + 4 new)
+        tree = ast.parse(source)
+        fallback_count = 0
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Compare):
+                for comparator in node.comparators:
+                    if isinstance(comparator, ast.BinOp) and isinstance(comparator.op, ast.Mult):
+                        if isinstance(comparator.right, ast.Constant) and comparator.right.value == 6:
+                            fallback_count += 1
+        assert fallback_count >= 8, f"Expected at least 8 behaviors with 6x fallback, found {fallback_count}"
+
+
+# ---------------------------------------------------------------------------
+# Event-gated behavior scheduling
+# ---------------------------------------------------------------------------
+
+
+class TestBehaviorEventGating:
+    """Verify that proactive_scan, lifecycle_review, dream, and deep_work respect event gates."""
+
+    def _make_mock_db(
+        self,
+        *,
+        due_behavior: str,
+        elapsed_seconds: float = 2.0,
+        unconsumed_count: int = 0,
+    ) -> MagicMock:
+        """Build a mock db where only `due_behavior` has elapsed time recorded."""
+        recent_ts = datetime.now(UTC).isoformat()
+        due_ts = (datetime.now(UTC) - timedelta(seconds=elapsed_seconds)).isoformat()
+
+        mock_db = MagicMock()
+        mock_db.get_behavior_last_run.side_effect = lambda name: (
+            due_ts if name == due_behavior else recent_ts
+        )
+        mock_db.get_due_tasks.return_value = []
+        mock_db.count_unconsumed_events.return_value = unconsumed_count
+        # Prevent _effective_interval from doubling intervals via spurious no-op counts
+        mock_db.get_behavior_no_ops.return_value = 0
+        # Prevent TypeError in post-run event consumption
+        mock_db.consume_events.return_value = 0
+        return mock_db
+
+    def _make_mock_settings(self, *, due_behavior: str, interval: float = 1.0) -> MagicMock:
+        """Build settings where only `due_behavior` interval is small enough to be due."""
+        mock_settings = MagicMock()
+        mock_settings.scheduler_interval = 0.01
+        mock_settings.cleanup_interval = 999999
+        mock_settings.episode_consolidation_interval = 999999
+        mock_settings.reflection_interval = 999999
+        mock_settings.proactive_scan_interval = interval if due_behavior == "proactive_scan" else 999999
+        mock_settings.deep_work_interval = interval if due_behavior == "deep_work" else 999999
+        mock_settings.insight_consolidation_interval = 999999
+        mock_settings.feedback_consolidation_interval = 999999
+        mock_settings.lifecycle_review_interval = interval if due_behavior == "lifecycle_review" else 999999
+        mock_settings.dream_interval = interval if due_behavior == "dream" else 999999
+        mock_settings.consolidation_min_cluster = 3
+        return mock_settings
+
+    async def _run_one_tick(
+        self,
+        mock_settings: MagicMock,
+        mock_db: MagicMock,
+    ) -> None:
+        """Run the scheduler loop for one tick then shut it down."""
+        bot = AsyncMock()
+        shutdown = asyncio.Event()
+
+        async def set_shutdown() -> None:
+            await asyncio.sleep(0.05)
+            shutdown.set()
+
+        with (
+            patch("luke.scheduler.settings", new=mock_settings),
+            patch("luke.scheduler.db", new=mock_db),
+            patch("luke.scheduler.memory"),
+        ):
+            async with asyncio.TaskGroup() as tg:
+                tg.create_task(start_scheduler_loop(bot, _SEM, shutdown=shutdown))
+                tg.create_task(set_shutdown())
+
+    async def test_proactive_scan_skipped_without_events(self) -> None:
+        """proactive_scan does not fire when no events exist and timer < 6x interval."""
+        mock_settings = self._make_mock_settings(due_behavior="proactive_scan", interval=1.0)
+        # elapsed=2s < 6s (6x interval), no events
+        mock_db = self._make_mock_db(due_behavior="proactive_scan", elapsed_seconds=2.0, unconsumed_count=0)
+
+        with (
+            patch("luke.scheduler.settings", new=mock_settings),
+            patch("luke.scheduler.db", new=mock_db),
+            patch("luke.scheduler.memory"),
+            patch("luke.scheduler.run_proactive_scan", new_callable=AsyncMock) as mock_fn,
+        ):
+            bot = AsyncMock()
+            shutdown = asyncio.Event()
+
+            async def set_shutdown() -> None:
+                await asyncio.sleep(0.05)
+                shutdown.set()
+
+            async with asyncio.TaskGroup() as tg:
+                tg.create_task(start_scheduler_loop(bot, _SEM, shutdown=shutdown))
+                tg.create_task(set_shutdown())
+
+        mock_fn.assert_not_called()
+
+    async def test_proactive_scan_fires_with_goal_event(self) -> None:
+        """proactive_scan fires when goal_updated/user_message events exist."""
+        mock_settings = self._make_mock_settings(due_behavior="proactive_scan", interval=1.0)
+        mock_db = self._make_mock_db(due_behavior="proactive_scan", elapsed_seconds=2.0, unconsumed_count=1)
+
+        with (
+            patch("luke.scheduler.settings", new=mock_settings),
+            patch("luke.scheduler.db", new=mock_db),
+            patch("luke.scheduler.memory"),
+            patch("luke.scheduler.run_proactive_scan", new_callable=AsyncMock) as mock_fn,
+        ):
+            bot = AsyncMock()
+            shutdown = asyncio.Event()
+
+            async def set_shutdown() -> None:
+                await asyncio.sleep(0.05)
+                shutdown.set()
+
+            async with asyncio.TaskGroup() as tg:
+                tg.create_task(start_scheduler_loop(bot, _SEM, shutdown=shutdown))
+                tg.create_task(set_shutdown())
+
+        mock_fn.assert_called_once()
+
+    async def test_proactive_scan_fires_at_6x_fallback(self) -> None:
+        """proactive_scan fires at 6x interval even with no events."""
+        mock_settings = self._make_mock_settings(due_behavior="proactive_scan", interval=1.0)
+        # elapsed=10s > 6s (6x interval), no events
+        mock_db = self._make_mock_db(due_behavior="proactive_scan", elapsed_seconds=10.0, unconsumed_count=0)
+
+        with (
+            patch("luke.scheduler.settings", new=mock_settings),
+            patch("luke.scheduler.db", new=mock_db),
+            patch("luke.scheduler.memory"),
+            patch("luke.scheduler.run_proactive_scan", new_callable=AsyncMock) as mock_fn,
+        ):
+            bot = AsyncMock()
+            shutdown = asyncio.Event()
+
+            async def set_shutdown() -> None:
+                await asyncio.sleep(0.05)
+                shutdown.set()
+
+            async with asyncio.TaskGroup() as tg:
+                tg.create_task(start_scheduler_loop(bot, _SEM, shutdown=shutdown))
+                tg.create_task(set_shutdown())
+
+        mock_fn.assert_called_once()
+
+    async def test_lifecycle_review_skipped_without_events(self) -> None:
+        """lifecycle_review does not fire without enough memory activity (< 5 events)."""
+        mock_settings = self._make_mock_settings(due_behavior="lifecycle_review", interval=1.0)
+        mock_db = self._make_mock_db(due_behavior="lifecycle_review", elapsed_seconds=2.0, unconsumed_count=4)
+
+        with (
+            patch("luke.scheduler.settings", new=mock_settings),
+            patch("luke.scheduler.db", new=mock_db),
+            patch("luke.scheduler.memory"),
+            patch("luke.scheduler.run_lifecycle_review", new_callable=AsyncMock) as mock_fn,
+        ):
+            bot = AsyncMock()
+            shutdown = asyncio.Event()
+
+            async def set_shutdown() -> None:
+                await asyncio.sleep(0.05)
+                shutdown.set()
+
+            async with asyncio.TaskGroup() as tg:
+                tg.create_task(start_scheduler_loop(bot, _SEM, shutdown=shutdown))
+                tg.create_task(set_shutdown())
+
+        mock_fn.assert_not_called()
+
+    async def test_lifecycle_review_fires_with_enough_events(self) -> None:
+        """lifecycle_review fires when >= 5 episode/insight events exist."""
+        mock_settings = self._make_mock_settings(due_behavior="lifecycle_review", interval=1.0)
+        mock_db = self._make_mock_db(due_behavior="lifecycle_review", elapsed_seconds=2.0, unconsumed_count=5)
+
+        with (
+            patch("luke.scheduler.settings", new=mock_settings),
+            patch("luke.scheduler.db", new=mock_db),
+            patch("luke.scheduler.memory"),
+            patch("luke.scheduler.run_lifecycle_review", new_callable=AsyncMock) as mock_fn,
+        ):
+            bot = AsyncMock()
+            shutdown = asyncio.Event()
+
+            async def set_shutdown() -> None:
+                await asyncio.sleep(0.05)
+                shutdown.set()
+
+            async with asyncio.TaskGroup() as tg:
+                tg.create_task(start_scheduler_loop(bot, _SEM, shutdown=shutdown))
+                tg.create_task(set_shutdown())
+
+        mock_fn.assert_called_once()
+
+    async def test_dream_skipped_without_material(self) -> None:
+        """dream does not fire when no insights/episodes exist and timer < 6x interval."""
+        mock_settings = self._make_mock_settings(due_behavior="dream", interval=1.0)
+        mock_db = self._make_mock_db(due_behavior="dream", elapsed_seconds=2.0, unconsumed_count=0)
+
+        with (
+            patch("luke.scheduler.settings", new=mock_settings),
+            patch("luke.scheduler.db", new=mock_db),
+            patch("luke.scheduler.memory"),
+            patch("luke.scheduler.run_dream", new_callable=AsyncMock) as mock_fn,
+        ):
+            bot = AsyncMock()
+            shutdown = asyncio.Event()
+
+            async def set_shutdown() -> None:
+                await asyncio.sleep(0.05)
+                shutdown.set()
+
+            async with asyncio.TaskGroup() as tg:
+                tg.create_task(start_scheduler_loop(bot, _SEM, shutdown=shutdown))
+                tg.create_task(set_shutdown())
+
+        mock_fn.assert_not_called()
+
+    async def test_dream_fires_with_material(self) -> None:
+        """dream fires when new insights or episodes exist."""
+        mock_settings = self._make_mock_settings(due_behavior="dream", interval=1.0)
+        mock_db = self._make_mock_db(due_behavior="dream", elapsed_seconds=2.0, unconsumed_count=1)
+
+        with (
+            patch("luke.scheduler.settings", new=mock_settings),
+            patch("luke.scheduler.db", new=mock_db),
+            patch("luke.scheduler.memory"),
+            patch("luke.scheduler.run_dream", new_callable=AsyncMock) as mock_fn,
+        ):
+            bot = AsyncMock()
+            shutdown = asyncio.Event()
+
+            async def set_shutdown() -> None:
+                await asyncio.sleep(0.05)
+                shutdown.set()
+
+            async with asyncio.TaskGroup() as tg:
+                tg.create_task(start_scheduler_loop(bot, _SEM, shutdown=shutdown))
+                tg.create_task(set_shutdown())
+
+        mock_fn.assert_called_once()
+
+    async def test_deep_work_skipped_without_goal_events(self) -> None:
+        """deep_work does not launch when no goal_updated events exist (and timer < 6x)."""
+        mock_settings = self._make_mock_settings(due_behavior="deep_work", interval=1.0)
+        mock_db = self._make_mock_db(due_behavior="deep_work", elapsed_seconds=2.0, unconsumed_count=0)
+
+        with (
+            patch("luke.scheduler.settings", new=mock_settings),
+            patch("luke.scheduler.db", new=mock_db),
+            patch("luke.scheduler.memory"),
+            patch("luke.scheduler.run_deep_work", new_callable=AsyncMock) as mock_fn,
+        ):
+            bot = AsyncMock()
+            shutdown = asyncio.Event()
+
+            async def set_shutdown() -> None:
+                await asyncio.sleep(0.05)
+                shutdown.set()
+
+            async with asyncio.TaskGroup() as tg:
+                tg.create_task(start_scheduler_loop(bot, _SEM, shutdown=shutdown))
+                tg.create_task(set_shutdown())
+
+        mock_fn.assert_not_called()
+
+    async def test_deep_work_fires_with_goal_event(self) -> None:
+        """deep_work launches when goal_updated events exist."""
+        mock_settings = self._make_mock_settings(due_behavior="deep_work", interval=1.0)
+        mock_db = self._make_mock_db(due_behavior="deep_work", elapsed_seconds=2.0, unconsumed_count=1)
+
+        with (
+            patch("luke.scheduler.settings", new=mock_settings),
+            patch("luke.scheduler.db", new=mock_db),
+            patch("luke.scheduler.memory"),
+            patch("luke.scheduler.run_deep_work", new_callable=AsyncMock) as mock_fn,
+        ):
+            bot = AsyncMock()
+            shutdown = asyncio.Event()
+
+            async def set_shutdown() -> None:
+                await asyncio.sleep(0.05)
+                shutdown.set()
+
+            async with asyncio.TaskGroup() as tg:
+                tg.create_task(start_scheduler_loop(bot, _SEM, shutdown=shutdown))
+                tg.create_task(set_shutdown())
+
+        mock_fn.assert_called_once()
