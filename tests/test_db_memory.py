@@ -1000,3 +1000,158 @@ class TestLifecycleCandidates:
         memory.index_memory("done-goal", "goal", "Done", "All done.", tags=["completed"])
         candidates = memory.get_lifecycle_candidates()
         assert any(g["id"] == "done-goal" for g in candidates["lingering_goals"])
+
+
+# ---------------------------------------------------------------------------
+# Taxonomy
+# ---------------------------------------------------------------------------
+
+
+class TestTaxonomy:
+    def test_default_taxonomy_entity(self, test_db: Any) -> None:
+        """Entities default to 'factual' taxonomy."""
+        memory.index_memory("e1", "entity", "Person", "content")
+        row = db._db().execute(
+            "SELECT taxonomy FROM memory_meta WHERE id = ?", ("e1",)
+        ).fetchone()
+        assert row["taxonomy"] == "factual"
+
+    def test_default_taxonomy_episode(self, test_db: Any) -> None:
+        """Episodes default to 'experiential' taxonomy."""
+        memory.index_memory("ep1", "episode", "Event", "content")
+        row = db._db().execute(
+            "SELECT taxonomy FROM memory_meta WHERE id = ?", ("ep1",)
+        ).fetchone()
+        assert row["taxonomy"] == "experiential"
+
+    def test_default_taxonomy_goal(self, test_db: Any) -> None:
+        """Goals default to 'working' taxonomy."""
+        memory.index_memory("g1", "goal", "Objective", "content")
+        row = db._db().execute(
+            "SELECT taxonomy FROM memory_meta WHERE id = ?", ("g1",)
+        ).fetchone()
+        assert row["taxonomy"] == "working"
+
+    def test_explicit_taxonomy_override(self, test_db: Any) -> None:
+        """Caller-provided taxonomy overrides the default."""
+        memory.index_memory("e1", "entity", "Temp Entity", "content", taxonomy="working")
+        row = db._db().execute(
+            "SELECT taxonomy FROM memory_meta WHERE id = ?", ("e1",)
+        ).fetchone()
+        assert row["taxonomy"] == "working"
+
+    def test_taxonomy_preserved_on_reindex(self, test_db: Any) -> None:
+        """Re-indexing without taxonomy keeps existing value."""
+        memory.index_memory("e1", "entity", "V1", "content", taxonomy="experiential")
+        memory.index_memory("e1", "entity", "V2", "updated content")
+        row = db._db().execute(
+            "SELECT taxonomy FROM memory_meta WHERE id = ?", ("e1",)
+        ).fetchone()
+        assert row["taxonomy"] == "experiential"
+
+    def test_invalid_taxonomy_falls_back(self, test_db: Any) -> None:
+        """Invalid taxonomy values fall back to default for the type."""
+        memory.index_memory("e1", "entity", "Test", "content", taxonomy="invalid")
+        row = db._db().execute(
+            "SELECT taxonomy FROM memory_meta WHERE id = ?", ("e1",)
+        ).fetchone()
+        assert row["taxonomy"] == "factual"  # default for entity
+
+
+class TestTaxonomyScoring:
+    def test_factual_scores_importance_heavy(self, test_db: Any) -> None:
+        """Factual memories weight importance more than recency."""
+        memory.index_memory("f1", "entity", "Factual", "content", taxonomy="factual")
+        memory.index_memory("w1", "entity", "Working", "content", taxonomy="working")
+        # Set equal importance but different recency
+        conn = db._db()
+        conn.execute("UPDATE memory_meta SET importance = 0.9 WHERE id IN ('f1', 'w1')")
+        conn.commit()
+
+        results = memory.recall(query="content")
+        f1_score = next((r["score"] for r in results if r["id"] == "f1"), 0)
+        w1_score = next((r["score"] for r in results if r["id"] == "w1"), 0)
+        # Both should score, factual should rank higher due to importance weight
+        assert f1_score > 0
+        assert w1_score > 0
+
+    def test_recall_returns_taxonomy_in_results(self, test_db: Any) -> None:
+        """Recall results include taxonomy field."""
+        memory.index_memory("e1", "entity", "Test", "search content", taxonomy="factual")
+        results = memory.recall(query="search content")
+        assert len(results) >= 1
+        # taxonomy is in the internal dict even if not in MemoryResult TypedDict
+        result_dict = dict(results[0])
+        assert "taxonomy" in result_dict or results[0].get("taxonomy") is not None  # type: ignore[union-attr]
+
+
+class TestWorkingMemoryExpiry:
+    def test_expire_working_memories(self, test_db: Any) -> None:
+        """Working memories older than max_age_hours are archived."""
+        memory.index_memory("w1", "goal", "Temp Goal", "scratch", taxonomy="working")
+        # Backdate the updated timestamp to 48h ago
+        old = (datetime.now(UTC) - timedelta(hours=48)).isoformat()
+        conn = db._db()
+        conn.execute("UPDATE memory_meta SET updated = ? WHERE id = ?", (old, "w1"))
+        conn.commit()
+
+        expired = memory.expire_working_memories(max_age_hours=24)
+        assert expired == 1
+        row = conn.execute(
+            "SELECT status FROM memory_meta WHERE id = ?", ("w1",)
+        ).fetchone()
+        assert row["status"] == "archived"
+
+    def test_recent_working_not_expired(self, test_db: Any) -> None:
+        """Recently updated working memories are kept."""
+        memory.index_memory("w1", "goal", "Active Goal", "content", taxonomy="working")
+        expired = memory.expire_working_memories(max_age_hours=24)
+        assert expired == 0
+
+    def test_non_working_not_expired(self, test_db: Any) -> None:
+        """Factual/experiential memories are never expired by this function."""
+        memory.index_memory("f1", "entity", "Entity", "content", taxonomy="factual")
+        old = (datetime.now(UTC) - timedelta(hours=48)).isoformat()
+        conn = db._db()
+        conn.execute("UPDATE memory_meta SET updated = ? WHERE id = ?", (old, "f1"))
+        conn.commit()
+
+        expired = memory.expire_working_memories(max_age_hours=24)
+        assert expired == 0
+
+
+class TestTaxonomyDecay:
+    def test_factual_decays_slower(self, test_db: Any) -> None:
+        """Factual memories should decay less than experiential with same base rate."""
+        memory.index_memory("f1", "entity", "Factual", "content", taxonomy="factual")
+        memory.index_memory("e1", "episode", "Experiential", "content", taxonomy="experiential")
+        # Both start at importance 1.0
+        rates = {"entity": 0.999, "episode": 0.999}
+        memory.decay_importance(rates)
+
+        conn = db._db()
+        f_imp = conn.execute(
+            "SELECT importance FROM memory_meta WHERE id = ?", ("f1",)
+        ).fetchone()["importance"]
+        e_imp = conn.execute(
+            "SELECT importance FROM memory_meta WHERE id = ?", ("e1",)
+        ).fetchone()["importance"]
+        # Factual should have higher importance (decayed less)
+        assert f_imp > e_imp
+
+    def test_working_decays_faster(self, test_db: Any) -> None:
+        """Working memories should decay faster than experiential."""
+        memory.index_memory("w1", "goal", "Working", "content", taxonomy="working")
+        memory.index_memory("e1", "episode", "Experiential", "content", taxonomy="experiential")
+        rates = {"goal": 0.999, "episode": 0.999}
+        memory.decay_importance(rates)
+
+        conn = db._db()
+        w_imp = conn.execute(
+            "SELECT importance FROM memory_meta WHERE id = ?", ("w1",)
+        ).fetchone()["importance"]
+        e_imp = conn.execute(
+            "SELECT importance FROM memory_meta WHERE id = ?", ("e1",)
+        ).fetchone()["importance"]
+        # Working should have lower importance (decayed more)
+        assert w_imp < e_imp

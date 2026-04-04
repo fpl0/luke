@@ -82,15 +82,18 @@ async def _run_behavior(
 
 
 async def run_consolidation(bot: Bot, sem: asyncio.Semaphore) -> None:
-    """Find episode clusters and consolidate them into insights via agent."""
+    """Taxonomy-aware memory consolidation.
+
+    - experiential: cluster related episodes into synthesized insights (default behavior)
+    - factual: merge semantically duplicate factual memories into authoritative versions
+    - working: auto-expired by hourly maintenance (no consolidation needed)
+    """
     if not settings.chat_id:
         return
 
+    # --- Experiential consolidation: cluster episodes into insights ---
     clusters = memory.get_consolidation_candidates(settings.consolidation_min_cluster)
-    if not clusters:
-        return
-
-    for cluster in clusters[: settings.max_consolidation_clusters]:
+    for cluster in (clusters or [])[: settings.max_consolidation_clusters]:
         episode_ids = [ep["id"] for ep in cluster]
         contents: list[str] = []
         for ep in cluster:
@@ -100,7 +103,7 @@ async def run_consolidation(bot: Bot, sem: asyncio.Semaphore) -> None:
         if not contents:
             continue
         prompt = (
-            "Memory consolidation task. Review these related episodes and:\n"
+            "Memory consolidation task (experiential). Review these related episodes and:\n"
             "1. Create an insight that captures the common pattern\n"
             "2. Connect the new insight to relevant entities\n"
             "3. Archive redundant episodes with 'forget'\n\n" + "\n---\n".join(contents)
@@ -113,6 +116,37 @@ async def run_consolidation(bot: Bot, sem: asyncio.Semaphore) -> None:
             model=settings.consolidation_model,
             max_sends=0,
             episodes=episode_ids,
+        )
+
+    # --- Factual consolidation: merge duplicate factual memories ---
+    factual_clusters = memory.get_factual_duplicate_candidates()
+    for cluster in (factual_clusters or [])[: settings.max_consolidation_clusters]:
+        mem_ids = [m["id"] for m in cluster]
+        contents = []
+        for m in cluster:
+            body = read_memory_body(m["type"], m["id"], 500)
+            if body:
+                contents.append(f"[{m['id']}] ({m['type']}): {body}")
+        if not contents:
+            continue
+        prompt = (
+            "Memory consolidation task (factual). These factual memories overlap "
+            "significantly and should be merged:\n\n"
+            + "\n---\n".join(contents)
+            + "\n\nSteps:\n"
+            "1. Create ONE authoritative memory that combines all information\n"
+            "2. Preserve the most specific/accurate details from each source\n"
+            "3. Use 'connect' to link the new memory to relevant entities\n"
+            "4. Archive the redundant duplicates with 'forget'\n"
+        )
+        await _run_behavior(
+            "consolidation_factual",
+            prompt,
+            bot,
+            sem,
+            model=settings.consolidation_model,
+            max_sends=0,
+            factual_memories=mem_ids,
         )
 
 
