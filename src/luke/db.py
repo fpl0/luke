@@ -177,6 +177,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
 CREATE TABLE IF NOT EXISTS memory_meta (
     id            TEXT PRIMARY KEY,
     type          TEXT NOT NULL,
+    taxonomy      TEXT NOT NULL DEFAULT '',
     created       TEXT NOT NULL,
     updated       TEXT NOT NULL,
     access_count  INTEGER NOT NULL DEFAULT 0,
@@ -193,6 +194,7 @@ CREATE INDEX IF NOT EXISTS idx_memory_meta_created ON memory_meta(created);
 CREATE INDEX IF NOT EXISTS idx_memory_meta_status ON memory_meta(status);
 CREATE INDEX IF NOT EXISTS idx_memory_meta_type_status
     ON memory_meta(type, status, updated DESC);
+CREATE INDEX IF NOT EXISTS idx_memory_meta_taxonomy ON memory_meta(taxonomy);
 
 CREATE TABLE IF NOT EXISTS reaction_feedback (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -306,6 +308,28 @@ _MIGRATIONS: list[tuple[int, str, list[str]]] = [
         "add consecutive_no_ops to behavior_state for smart backoff",
         [
             "ALTER TABLE behavior_state ADD COLUMN consecutive_no_ops INTEGER NOT NULL DEFAULT 0",
+        ],
+    ),
+    (
+        5,
+        "add deep_work_quality table for session quality tracking",
+        [
+            """CREATE TABLE IF NOT EXISTS deep_work_quality (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                goal_id      TEXT NOT NULL,
+                rating       INTEGER NOT NULL CHECK (rating BETWEEN 1 AND 5),
+                session_date TEXT NOT NULL DEFAULT (datetime('now')),
+                created      TEXT NOT NULL DEFAULT (datetime('now'))
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_dwq_goal ON deep_work_quality(goal_id, created DESC)",
+        ],
+    ),
+    (
+        6,
+        "add taxonomy column to memory_meta for factual/experiential/working classification",
+        [
+            "ALTER TABLE memory_meta ADD COLUMN taxonomy TEXT NOT NULL DEFAULT ''",
+            "CREATE INDEX IF NOT EXISTS idx_memory_meta_taxonomy ON memory_meta(taxonomy)",
         ],
     ),
 ]
@@ -1053,9 +1077,56 @@ def get_daily_deep_work_cost() -> float:
         _db()
         .execute(
             "SELECT COALESCE(SUM(cost_usd), 0) AS total "
-            "FROM cost_log WHERE source = 'behavior:deep_work' "
+            "FROM cost_log WHERE source LIKE 'behavior:deep_work%' "
             "AND timestamp >= date('now')",
         )
         .fetchone()
     )
     return float(row["total"]) if row else 0.0
+
+
+# ---------------------------------------------------------------------------
+# Deep Work Quality Tracking
+# ---------------------------------------------------------------------------
+
+
+def log_deep_work_quality(goal_id: str, rating: int) -> None:
+    """Record a deep work session quality rating (1-5) for a goal."""
+    if not 1 <= rating <= 5:
+        return
+    conn = _db()
+    conn.execute(
+        "INSERT INTO deep_work_quality (goal_id, rating) VALUES (?, ?)",
+        (goal_id, rating),
+    )
+    _commit(conn)
+
+
+def get_recent_quality_scores(goal_id: str, n: int = 3) -> list[int]:
+    """Return the last n quality ratings for a goal, newest first."""
+    rows = (
+        _db()
+        .execute(
+            "SELECT rating FROM deep_work_quality WHERE goal_id = ? "
+            "ORDER BY id DESC LIMIT ?",
+            (goal_id, n),
+        )
+        .fetchall()
+    )
+    return [int(r["rating"]) for r in rows]
+
+
+def get_quality_blocked_goals(threshold: float = 2.0, window: int = 3) -> list[str]:
+    """Return goal IDs where avg of last `window` ratings is below threshold."""
+    # Get all goals with enough ratings
+    rows = _db().execute(
+        "SELECT goal_id FROM deep_work_quality "
+        "GROUP BY goal_id HAVING COUNT(*) >= ?",
+        (window,),
+    ).fetchall()
+    blocked: list[str] = []
+    for row in rows:
+        scores = get_recent_quality_scores(row["goal_id"], window)
+        if scores and sum(scores) / len(scores) < threshold:
+            blocked.append(row["goal_id"])
+    return blocked
