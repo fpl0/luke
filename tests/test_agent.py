@@ -1,23 +1,25 @@
-"""Tests for luke.agent — send_long_message, _send_chunk, _stop_hook, tools."""
+"""Tests for luke.agent — send_long_message, _send_chunk, _build_stop_hook, tools."""
 
 from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from aiogram import Bot
 
 from luke.agent import (
+    _AUTO_SKILL_THRESHOLD,
     _INTERNAL_RE,
     _VALID_MEMORY_TYPES,
     AgentResult,
+    _build_stop_hook,
     _ok,
-    _stop_hook,
     send_long_message,
 )
+from claude_agent_sdk.types import SyncHookJSONOutput
 from luke.config import settings
 
 # ---------------------------------------------------------------------------
@@ -141,15 +143,32 @@ class TestSendChunk:
 
 
 # ---------------------------------------------------------------------------
-# _stop_hook
+# _build_stop_hook
 # ---------------------------------------------------------------------------
 
 
-class TestStopHook:
+class TestBuildStopHook:
+    async def _call(self, tool_count: int, autonomous: bool) -> SyncHookJSONOutput:
+        hook = _build_stop_hook({"n": tool_count}, autonomous)
+        return cast(SyncHookJSONOutput, await hook(MagicMock(), None, MagicMock()))
+
     async def test_returns_system_message(self) -> None:
-        result = await _stop_hook(MagicMock(), None, MagicMock())
+        result = await self._call(0, False)
         assert "systemMessage" in result
         assert "remember" in result["systemMessage"]
+
+    async def test_no_skill_prompt_below_threshold(self) -> None:
+        result = await self._call(_AUTO_SKILL_THRESHOLD - 1, False)
+        assert "Skill extraction" not in result["systemMessage"]
+
+    async def test_skill_prompt_at_threshold(self) -> None:
+        result = await self._call(_AUTO_SKILL_THRESHOLD, False)
+        assert "Skill extraction" in result["systemMessage"]
+        assert "procedure" in result["systemMessage"]
+
+    async def test_no_skill_prompt_for_autonomous_runs(self) -> None:
+        result = await self._call(_AUTO_SKILL_THRESHOLD + 10, True)
+        assert "Skill extraction" not in result["systemMessage"]
 
 
 # ---------------------------------------------------------------------------
@@ -162,6 +181,7 @@ class TestAgentResult:
         r = AgentResult()
         assert r.texts == []
         assert r.session_id is None
+        assert r.tool_uses == 0
 
 
 # ---------------------------------------------------------------------------
