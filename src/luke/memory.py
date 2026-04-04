@@ -36,6 +36,18 @@ MEMORY_DIRS: dict[str, str] = {
 }
 _DIR_TO_TYPE: dict[str, str] = {v: k for k, v in MEMORY_DIRS.items()}
 
+# Taxonomy classification: factual, experiential, working
+TAXONOMY_VALUES: frozenset[str] = frozenset({"factual", "experiential", "working"})
+
+# Default taxonomy per memory type — used when caller doesn't specify
+_DEFAULT_TAXONOMY: dict[str, str] = {
+    "entity": "factual",
+    "procedure": "factual",
+    "insight": "factual",
+    "episode": "experiential",
+    "goal": "working",
+}
+
 # Causal labels — prioritized in graph traversal for "why" queries
 CAUSAL_RELATIONSHIPS: frozenset[str] = frozenset(
     {"caused", "derived_from", "supersedes", "contradicts", "supports", "blocked_by", "enables"}
@@ -398,6 +410,7 @@ def index_memory(
     tags: list[str] | None = None,
     links: list[str] | None = None,
     importance: float | None = None,
+    taxonomy: str | None = None,
 ) -> list[float] | None:
     # Frontmatter may store tags/links as JSON strings — parse them
     if isinstance(tags, str):
@@ -416,9 +429,15 @@ def index_memory(
         (mem_id, mem_type, title, content, " ".join(tags)),
     )
 
+    # Resolve taxonomy: caller-provided > existing > default for type
+    resolved_taxonomy = taxonomy or ""
+    if resolved_taxonomy and resolved_taxonomy not in TAXONOMY_VALUES:
+        log.warning("invalid_taxonomy", taxonomy=resolved_taxonomy, mem_id=mem_id)
+        resolved_taxonomy = ""
+
     # Upsert metadata — read existing values BEFORE INSERT OR REPLACE deletes the row
     existing = db.execute(
-        "SELECT created, access_count, useful_count, importance, last_accessed"
+        "SELECT created, access_count, useful_count, importance, last_accessed, taxonomy"
         " FROM memory_meta WHERE id = ?",
         (mem_id,),
     ).fetchone()
@@ -429,18 +448,24 @@ def index_memory(
     # Use caller-provided importance, then existing, then default 1.0
     if importance is None:
         importance = existing["importance"] if existing else 1.0
+    # Taxonomy: caller > existing > default for type
+    if not resolved_taxonomy:
+        resolved_taxonomy = (existing["taxonomy"] if existing and existing["taxonomy"] else "")
+    if not resolved_taxonomy:
+        resolved_taxonomy = _DEFAULT_TAXONOMY.get(mem_type, "")
     tags_json = json.dumps(tags)
     links_json = json.dumps(links)
     is_private = 1 if "private" in tags else 0
     db.execute(
         """INSERT OR REPLACE INTO memory_meta
-           (id, type, created, updated,
+           (id, type, taxonomy, created, updated,
             access_count, useful_count, importance, status,
             tags_json, links_json, is_private, last_accessed)
-           VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)""",
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)""",
         (
             mem_id,
             mem_type,
+            resolved_taxonomy,
             created,
             now,
             access_count,
@@ -527,7 +552,8 @@ def recall(
             type_params: tuple[str, ...] = (mem_type,) if mem_type else ()
             rows = db.execute(
                 f"""SELECT f.id, f.type, f.title, rank,
-                           m.importance, m.access_count, m.useful_count, m.updated
+                           m.importance, m.access_count, m.useful_count, m.updated,
+                           m.taxonomy
                     FROM memory_fts f
                     JOIN memory_meta m ON f.id = m.id
                     WHERE memory_fts MATCH ? AND m.status = 'active'
@@ -551,6 +577,7 @@ def recall(
                 "access_count": r["access_count"],
                 "useful_count": r["useful_count"],
                 "updated": r["updated"],
+                "taxonomy": r["taxonomy"],
             }
 
     # --- Strategy 2: Semantic search (embedding-based) ---
