@@ -235,6 +235,26 @@ class TestRunProactiveScan:
 
         mock_agent.assert_called_once()
 
+    async def test_proactive_scan_passes_urgent_true(self, tmp_settings: Any) -> None:
+        """Proactive scan must pass urgent=True so it can draw from the attention reserve."""
+        from luke.behaviors import run_proactive_scan
+
+        goals = [{"id": "g1", "type": "goal", "title": "Goal 1", "score": 1.0}]
+
+        with (
+            patch("luke.behaviors.db") as mock_db,
+            patch("luke.behaviors.memory") as mock_memory,
+            patch("luke.behaviors.read_memory_body", return_value="Goal content"),
+            patch("luke.behaviors.run_agent", new_callable=AsyncMock) as mock_agent,
+        ):
+            mock_memory.recall.side_effect = [goals, [], []]
+            mock_db.get_message_summaries.return_value = []
+            mock_agent.return_value = MagicMock(texts=[])
+            await run_proactive_scan(AsyncMock(), _SEM)
+
+        call_kwargs = mock_agent.call_args.kwargs
+        assert call_kwargs.get("urgent") is True
+
     async def test_agent_exception_handled(self) -> None:
         from luke.behaviors import run_proactive_scan
 
@@ -312,6 +332,8 @@ class TestRunDeepWork:
             patch("luke.behaviors.run_agent", new_callable=AsyncMock) as mock_agent,
         ):
             mock_db.get_daily_deep_work_cost.return_value = 0.0
+            mock_db.get_quality_blocked_goals.return_value = []
+            mock_db.get_recent_quality_scores.return_value = []
             mock_memory.recall.return_value = goals
             mock_agent.return_value = MagicMock(texts=[])
             await run_deep_work(AsyncMock(), _SEM)
@@ -321,6 +343,8 @@ class TestRunDeepWork:
         call_kwargs = mock_agent.call_args.kwargs
         assert call_kwargs["max_turns"] == tmp_settings.deep_work_max_turns
         assert call_kwargs["max_sends"] == 1
+        # Deep work is non-urgent — must not draw from the attention reserve
+        assert not call_kwargs.get("urgent", False)
 
     async def test_agent_exception_handled(self) -> None:
         from luke.behaviors import run_deep_work
@@ -340,6 +364,8 @@ class TestRunDeepWork:
             mock_settings.deep_work_max_budget_usd = 3.0
             mock_settings.workspace_dir = Path("/tmp/test_workspace")
             mock_db.get_daily_deep_work_cost.return_value = 0.0
+            mock_db.get_quality_blocked_goals.return_value = []
+            mock_db.get_recent_quality_scores.return_value = []
             mock_memory.recall.return_value = [
                 {"id": "g1", "type": "goal", "title": "G1", "score": 1.0}
             ]
@@ -360,6 +386,8 @@ class TestRunDeepWork:
             mock_settings.daily_deep_work_budget_usd = 60.0
             mock_settings.workspace_dir = Path("/tmp/test_workspace")
             mock_db.get_daily_deep_work_cost.return_value = 0.0
+            mock_db.get_quality_blocked_goals.return_value = []
+            mock_db.get_recent_quality_scores.return_value = []
             mock_memory.recall.return_value = [
                 {"id": "g1", "type": "goal", "title": "G1", "score": 1.0}
             ]
