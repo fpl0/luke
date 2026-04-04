@@ -209,6 +209,7 @@ async def start_scheduler_loop(
             pruned_logs = db.cleanup_task_logs()
             pruned_outbound = db.cleanup_outbound_log()
             pruned_events = db.cleanup_events()
+            expired_working = memory.expire_working_memories()
             db.set_behavior_last_run("cleanup", datetime.now(UTC).isoformat())
             log.info(
                 "hourly_maintenance",
@@ -217,6 +218,7 @@ async def start_scheduler_loop(
                 task_logs_pruned=pruned_logs,
                 outbound_pruned=pruned_outbound,
                 events_pruned=pruned_events,
+                working_expired=expired_working,
             )
 
         # Step 1: Collect and run due maintenance behaviors (short-lived, awaited)

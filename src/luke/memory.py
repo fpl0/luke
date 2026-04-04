@@ -242,7 +242,8 @@ def _semantic_search(
 
     meta_rows = db.execute(
         f"""SELECT m.id, m.type, f.title,
-                   m.importance, m.access_count, m.useful_count, m.updated
+                   m.importance, m.access_count, m.useful_count, m.updated,
+                   m.taxonomy
             FROM memory_meta m
             JOIN memory_fts f ON m.id = f.id
             WHERE m.id IN ({mid_placeholders}) AND {filter_clause}""",
@@ -263,6 +264,7 @@ def _semantic_search(
                 "access_count": r["access_count"],
                 "useful_count": r["useful_count"],
                 "updated": r["updated"],
+                "taxonomy": r["taxonomy"],
             }
         )
     scored.sort(key=lambda x: x["score"], reverse=True)
@@ -296,15 +298,40 @@ def detect_changes(mem_id: str, new_content: str, new_title: str) -> list[str]:
 
 
 def decay_importance(rates: dict[str, float]) -> int:
-    """Apply type-aware importance decay modulated by access_count. Returns updated count."""
+    """Apply type-aware importance decay modulated by access_count and taxonomy.
+
+    Working-taxonomy memories decay 3x faster than their type's base rate.
+    Factual-taxonomy memories decay at half the base rate (more stable).
+    """
     db = _db()
     total = 0
     for mem_type, base_rate in rates.items():
+        # Default decay for memories without taxonomy or experiential taxonomy
         cur = db.execute(
             """UPDATE memory_meta
                SET importance = importance * (1.0 - (1.0 - ?) / (1.0 + access_count * 0.1))
-               WHERE type = ? AND status = 'active'""",
+               WHERE type = ? AND status = 'active'
+               AND taxonomy NOT IN ('factual', 'working')""",
             (base_rate, mem_type),
+        )
+        total += cur.rowcount
+        # Factual: slower decay (half rate — stable knowledge)
+        factual_rate = 1.0 - (1.0 - base_rate) * 0.5
+        cur = db.execute(
+            """UPDATE memory_meta
+               SET importance = importance * (1.0 - (1.0 - ?) / (1.0 + access_count * 0.1))
+               WHERE type = ? AND status = 'active' AND taxonomy = 'factual'""",
+            (factual_rate, mem_type),
+        )
+        total += cur.rowcount
+        # Working: faster decay (3x rate — ephemeral)
+        working_rate = 1.0 - (1.0 - base_rate) * 3.0
+        working_rate = max(working_rate, 0.5)  # floor at 0.5 to avoid instant zeroing
+        cur = db.execute(
+            """UPDATE memory_meta
+               SET importance = importance * (1.0 - (1.0 - ?) / (1.0 + access_count * 0.1))
+               WHERE type = ? AND status = 'active' AND taxonomy = 'working'""",
+            (working_rate, mem_type),
         )
         total += cur.rowcount
     _commit(db)
@@ -384,6 +411,64 @@ def get_consolidation_candidates(min_shared: int = 3) -> list[list[dict[str, Any
             if shared_tags >= min_shared or shared_links >= 2:
                 cluster.append(other)
         if len(cluster) >= min_shared:
+            for c in cluster:
+                used.add(c["id"])
+            clusters.append(cluster)
+
+    return clusters
+
+
+def get_factual_duplicate_candidates(
+    similarity_threshold: float = 0.7,
+) -> list[list[dict[str, Any]]]:
+    """Find factual-taxonomy memories with high semantic overlap for merging.
+
+    Groups factual memories (entities, procedures, insights) that are semantically
+    similar enough to warrant deduplication. Returns clusters of 2+ similar memories.
+    """
+    db = _db()
+    rows = db.execute(
+        """SELECT m.id, m.type, f.title
+           FROM memory_meta m
+           JOIN memory_fts f ON m.id = f.id
+           WHERE m.taxonomy = 'factual' AND m.status = 'active'""",
+    ).fetchall()
+
+    if len(rows) < 2:
+        return []
+
+    # Build embedding map
+    id_set = {r["id"] for r in rows}
+    embedding_rows = db.execute(
+        f"""SELECT memory_id, embedding FROM memory_vec
+            WHERE memory_id IN ({",".join("?" for _ in id_set)})""",
+        list(id_set),
+    ).fetchall()
+
+    embeddings: dict[str, list[float]] = {}
+    for row in embedding_rows:
+        if row["embedding"]:
+            vec = list(struct.unpack(f"{len(row['embedding']) // 4}f", row["embedding"]))
+            embeddings[row["memory_id"]] = vec
+
+    # Find similar pairs via semantic search
+    clusters: list[list[dict[str, Any]]] = []
+    used: set[str] = set()
+    meta_map = {r["id"]: dict(r) for r in rows}
+
+    for mid in id_set:
+        if mid in used or mid not in embeddings:
+            continue
+        neighbors = _semantic_search(
+            embeddings[mid], mem_type=None, limit=6, include_private=True
+        )
+        cluster = [meta_map[mid]]
+        for n in neighbors:
+            nid = n["id"]
+            eligible = nid != mid and nid in id_set and nid not in used
+            if eligible and n["score"] >= similarity_threshold:
+                cluster.append(meta_map[nid])
+        if len(cluster) >= 2:
             for c in cluster:
                 used.add(c["id"])
             clusters.append(cluster)
@@ -626,7 +711,8 @@ def recall(
 
         rows = db.execute(
             f"""SELECT m.id, m.type, f.title,
-                       m.importance, m.access_count, m.useful_count, m.updated
+                       m.importance, m.access_count, m.useful_count, m.updated,
+                       m.taxonomy
                 FROM memory_meta m
                 JOIN memory_fts f ON m.id = f.id
                 WHERE {" AND ".join(conditions)}{priv_clause}
@@ -645,6 +731,7 @@ def recall(
                     "access_count": r["access_count"],
                     "useful_count": r["useful_count"],
                     "updated": r["updated"],
+                    "taxonomy": r["taxonomy"],
                 }
 
     # --- Strategy 4: Multi-hop graph traversal (BFS, depth up to graph_max_depth) ---
@@ -679,7 +766,8 @@ def recall(
     if mem_type and not query and not after and not before and not related_to:
         rows = db.execute(
             f"""SELECT m.id, m.type, f.title,
-                       m.importance, m.access_count, m.useful_count, m.updated
+                       m.importance, m.access_count, m.useful_count, m.updated,
+                       m.taxonomy
                 FROM memory_meta m
                 JOIN memory_fts f ON m.id = f.id
                 WHERE m.type = ? AND m.status = 'active'{priv_clause}
@@ -697,6 +785,7 @@ def recall(
                 "access_count": r["access_count"],
                 "useful_count": r["useful_count"],
                 "updated": r["updated"],
+                "taxonomy": r["taxonomy"],
             }
 
     # Apply type filter to combined results
@@ -738,7 +827,8 @@ def _get_neighbors_batch(
         rel_params = tuple(relationship_filter)
     rows = db.execute(
         f"""SELECT ml.to_id AS id, m.type, f.title, ml.relationship, ml.weight,
-                   m.importance, m.access_count, m.useful_count, m.updated
+                   m.importance, m.access_count, m.useful_count, m.updated,
+                   m.taxonomy
             FROM memory_links ml
             JOIN memory_meta m ON ml.to_id = m.id
             JOIN memory_fts f ON ml.to_id = f.id
@@ -746,7 +836,8 @@ def _get_neighbors_batch(
             {valid_clause} {rel_clause}
             UNION
             SELECT ml.from_id AS id, m.type, f.title, ml.relationship, ml.weight,
-                   m.importance, m.access_count, m.useful_count, m.updated
+                   m.importance, m.access_count, m.useful_count, m.updated,
+                   m.taxonomy
             FROM memory_links ml
             JOIN memory_meta m ON ml.from_id = m.id
             JOIN memory_fts f ON ml.from_id = f.id
@@ -769,8 +860,13 @@ def _recency_score(updated_iso: str) -> float:
 def _apply_composite_scores(results: dict[str, dict[str, Any]]) -> None:
     """Apply composite scoring (relevance * importance * recency * access) in place.
 
-    Metadata (importance, access_count, useful_count, updated) is expected to be
-    pre-fetched in each entry dict by the query strategies in recall().
+    Metadata (importance, access_count, useful_count, updated, taxonomy) is expected to
+    be pre-fetched in each entry dict by the query strategies in recall().
+
+    Taxonomy adjusts the weight distribution:
+    - factual: importance-heavy (stable facts matter most)
+    - experiential: recency-heavy (recent experiences matter most)
+    - working: recency-dominant (ephemeral, expire fast)
     """
     if not results:
         return
@@ -778,9 +874,18 @@ def _apply_composite_scores(results: dict[str, dict[str, Any]]) -> None:
     # Loop-invariant constants
     context_denom = 1.0 - settings.score_weight_relevance
     log_101 = math.log(101)
-    w_imp = settings.score_weight_importance
-    w_rec = settings.score_weight_recency
-    w_acc = settings.score_weight_access
+
+    # Base weights (used when taxonomy is empty/unset)
+    base_w_imp = settings.score_weight_importance
+    base_w_rec = settings.score_weight_recency
+    base_w_acc = settings.score_weight_access
+
+    # Taxonomy-specific weight overrides (importance, recency, access)
+    _TAXONOMY_WEIGHTS: dict[str, tuple[float, float, float]] = {
+        "factual": (0.40, 0.10, 0.10),       # importance-heavy: stable facts
+        "experiential": (0.15, 0.35, 0.10),   # recency-heavy: recent experiences
+        "working": (0.05, 0.45, 0.10),        # recency-dominant: ephemeral
+    }
 
     for entry in results.values():
         relevance = entry.get("score", 0)
@@ -788,11 +893,17 @@ def _apply_composite_scores(results: dict[str, dict[str, Any]]) -> None:
         access_count: int = entry["access_count"]
         useful_count: int = entry["useful_count"]
         updated: str = entry["updated"]
+        taxonomy: str = entry.get("taxonomy", "")
         recency = _recency_score(updated)
         access_score = math.log(1 + access_count) / log_101  # ~1.0 at 100 accesses
         # Utility modulation: penalize memories that get accessed but never used
         utility_rate = useful_count / max(access_count, 1)
         access_score *= settings.utility_floor + settings.utility_weight * utility_rate
+
+        # Select weights based on taxonomy
+        w_imp, w_rec, w_acc = _TAXONOMY_WEIGHTS.get(
+            taxonomy, (base_w_imp, base_w_rec, base_w_acc)
+        )
 
         # Context quality: importance, recency, and access frequency
         context = w_imp * importance + w_rec * min(recency, 1.0) + w_acc * min(access_score, 1.0)
@@ -1010,6 +1121,37 @@ def prune_old_fts_entries(retention_days: int) -> int:
     )
     conn.execute(f"DELETE FROM memory_fts WHERE id IN ({placeholders})", ids)
     _commit(conn)
+    return len(ids)
+
+
+def expire_working_memories(max_age_hours: int = 24) -> int:
+    """Auto-archive working-taxonomy memories older than max_age_hours.
+
+    Working memories are ephemeral by design — they represent transient context
+    (scratch notes, in-progress state, temporary plans) that should not persist.
+    Returns the number of archived memories.
+    """
+    if max_age_hours <= 0:
+        return 0
+    cutoff = (datetime.now(UTC) - timedelta(hours=max_age_hours)).isoformat()
+    conn = _db()
+    rows = conn.execute(
+        """SELECT id FROM memory_meta
+           WHERE taxonomy = 'working' AND status = 'active'
+           AND updated < ?""",
+        (cutoff,),
+    ).fetchall()
+    if not rows:
+        return 0
+    ids = [r["id"] for r in rows]
+    placeholders = ",".join("?" for _ in ids)
+    conn.execute(
+        f"UPDATE memory_meta SET status = 'archived' WHERE id IN ({placeholders})",
+        ids,
+    )
+    conn.execute(f"DELETE FROM memory_fts WHERE id IN ({placeholders})", ids)
+    _commit(conn)
+    log.info("working_memories_expired", count=len(ids))
     return len(ids)
 
 
