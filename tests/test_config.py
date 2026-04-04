@@ -104,3 +104,11 @@ class TestCachedProperties:
     def test_consolidation_min_cluster(self) -> None:
         s = _make()
         assert s.consolidation_min_cluster == 2
+
+    def test_attention_urgent_reserve_default(self) -> None:
+        s = _make()
+        assert s.attention_urgent_reserve == 2
+
+    def test_attention_urgent_reserve_override(self) -> None:
+        s = _make(attention_urgent_reserve=5)
+        assert s.attention_urgent_reserve == 5

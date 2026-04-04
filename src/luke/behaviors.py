@@ -31,6 +31,7 @@ async def _run_behavior(
     max_turns: int | None = None,
     max_budget_usd: float | None = None,
     max_sends: int | None = None,
+    urgent: bool = False,
     **log_fields: Any,
 ) -> AgentResult | None:
     """Run an agent behavior with standard timeout, logging, and error handling."""
@@ -56,6 +57,7 @@ async def _run_behavior(
                     max_sends=max_sends,
                     effort="high",
                     autonomous=True,
+                    urgent=urgent,
                 ),
                 timeout=settings.agent_timeout,
             )
@@ -289,8 +291,24 @@ async def run_proactive_scan(bot: Bot, sem: asyncio.Semaphore) -> None:
         sem,
         model=settings.proactive_scan_model,
         max_sends=2,
+        urgent=True,
         sections=len(sections),
     )
+
+
+def _parse_plan_status(goal_id: str) -> str | None:
+    """Read a plan file and return its status (in_progress, blocked, paused, completed)."""
+    plan_path = settings.workspace_dir / "plans" / f"{sanitize_memory_id(goal_id)}.md"
+    if not plan_path.exists():
+        return None
+    try:
+        text = plan_path.read_text(encoding="utf-8")[:2000]  # only need frontmatter
+        import re
+
+        m = re.search(r"\*\*Status:\*\*\s*(\S+)", text)
+        return m.group(1).strip().lower() if m else None
+    except Exception:
+        return None
 
 
 async def run_deep_work(bot: Bot, sem: asyncio.Semaphore) -> None:
@@ -308,11 +326,31 @@ async def run_deep_work(bot: Bot, sem: asyncio.Semaphore) -> None:
     if not goals:
         return
 
+    # Quality gate: get goals blocked by low quality scores
+    quality_blocked = set(db.get_quality_blocked_goals())
+
     goal_sections: list[str] = []
+    skipped_goals: list[str] = []
     for g in goals:
+        gid = g["id"]
+
+        # Skip goals whose plans are paused or completed
+        plan_st = _parse_plan_status(gid)
+        if plan_st in ("paused", "completed"):
+            skipped_goals.append(f"{gid} (plan {plan_st})")
+            continue
+
+        # Skip goals blocked by quality scores
+        if gid in quality_blocked:
+            skipped_goals.append(f"{gid} (quality avg < 2.0 over last 3 sessions)")
+            continue
+
         body = read_memory_body(g["type"], g["id"], 1000)
         if body:
-            goal_sections.append(f"[{g['id']}]:\n{body}")
+            goal_sections.append(f"[{gid}]:\n{body}")
+
+    if skipped_goals:
+        log.info("deep_work_goals_skipped", skipped=skipped_goals)
 
     if not goal_sections:
         return
@@ -324,7 +362,19 @@ async def run_deep_work(bot: Bot, sem: asyncio.Semaphore) -> None:
     for g in goals:
         plan_path = plans_dir / f"{sanitize_memory_id(g['id'])}.md"
         if plan_path.exists():
-            plan_status.append(f"[{g['id']}]: plan exists at workspace/plans/{plan_path.name}")
+            status = _parse_plan_status(g["id"])
+            plan_status.append(
+                f"[{g['id']}]: plan exists at workspace/plans/{plan_path.name}"
+                + (f" (status: {status})" if status else "")
+            )
+
+    # Include quality history context
+    quality_context: list[str] = []
+    for g in goals:
+        scores = db.get_recent_quality_scores(g["id"], 5)
+        if scores:
+            avg = sum(scores) / len(scores)
+            quality_context.append(f"[{g['id']}]: last {len(scores)} ratings: {scores} (avg: {avg:.1f})")
 
     remaining = settings.daily_deep_work_budget_usd - daily_cost
     now_str = datetime.now(UTC).isoformat(timespec="minutes")
@@ -335,6 +385,11 @@ async def run_deep_work(bot: Bot, sem: asyncio.Semaphore) -> None:
         "Active goals (priority order):\n"
         + "\n\n".join(goal_sections)
         + ("\n\nExisting work plans:\n" + "\n".join(plan_status) if plan_status else "")
+        + (
+            "\n\nQuality history:\n" + "\n".join(quality_context)
+            if quality_context
+            else ""
+        )
         + "\n\n"
         "Phase 1 — PLAN (do this first):\n"
         "1. Pick the highest-priority goal\n"
@@ -357,6 +412,7 @@ async def run_deep_work(bot: Bot, sem: asyncio.Semaphore) -> None:
         "   - Is this advancing the goal meaningfully, or is it busywork?\n"
         "   - Rate this session 1-5: 1=wasted, 3=okay, 5=substantial progress\n"
         "   Add the rating to your plan file under '## Session Quality'\n"
+        "   IMPORTANT: Also call log_deep_work_quality(goal_id, rating) to record it.\n"
         "   If the last 3 sessions average below 2: pause the goal and note why.\n\n"
         "Phase 4 — WRAP UP:\n"
         "10. If the goal is complete: update plan status to completed, update goal memory\n"
