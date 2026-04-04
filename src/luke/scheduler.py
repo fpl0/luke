@@ -243,13 +243,15 @@ async def start_scheduler_loop(
                 last_consolidation = now_mono
                 maintenance_coros.append(("consolidation", run_consolidation(bot, sem)))
 
-        # Proactive scan: time-based (keeps fallback) + any event
+        # Proactive scan: time-based + needs goal or user activity
         proactive_interval = _effective_interval(
             "proactive_scan", settings.proactive_scan_interval
         )
         if now_mono - last_proactive >= proactive_interval:
-            last_proactive = now_mono
-            maintenance_coros.append(("proactive_scan", run_proactive_scan(bot, sem)))
+            has_activity = db.count_unconsumed_events("goal_updated", "user_message") >= 1
+            if has_activity or now_mono - last_proactive >= proactive_interval * 6:
+                last_proactive = now_mono
+                maintenance_coros.append(("proactive_scan", run_proactive_scan(bot, sem)))
 
         # Reflection: time-based + needs user interaction or feedback
         reflection_interval = _effective_interval("reflection", settings.reflection_interval)
@@ -289,15 +291,19 @@ async def start_scheduler_loop(
                     ("feedback_consolidation", run_feedback_consolidation(bot, sem))
                 )
 
-        # Lifecycle review: purely time-based (inherently periodic)
+        # Lifecycle review: time-based + needs accumulated memory activity
         if now_mono - last_lifecycle_review >= settings.lifecycle_review_interval:
-            last_lifecycle_review = now_mono
-            maintenance_coros.append(("lifecycle_review", run_lifecycle_review(bot, sem)))
+            has_activity = db.count_unconsumed_events("new_episode", "new_insight") >= 5
+            if has_activity or now_mono - last_lifecycle_review >= settings.lifecycle_review_interval * 6:
+                last_lifecycle_review = now_mono
+                maintenance_coros.append(("lifecycle_review", run_lifecycle_review(bot, sem)))
 
-        # Dream: autonomous thinking periods (quiet-gated internally)
+        # Dream: autonomous thinking periods (quiet-gated internally + needs mental material)
         if now_mono - last_dream >= settings.dream_interval:
-            last_dream = now_mono
-            maintenance_coros.append(("dream", run_dream(bot, sem)))
+            has_material = db.count_unconsumed_events("new_insight", "new_episode") >= 1
+            if has_material or now_mono - last_dream >= settings.dream_interval * 6:
+                last_dream = now_mono
+                maintenance_coros.append(("dream", run_dream(bot, sem)))
 
         if maintenance_coros:
             names = [name for name, _ in maintenance_coros]
@@ -342,25 +348,27 @@ async def start_scheduler_loop(
         # Step 2: Launch deep work as background task (long-lived, NOT awaited)
         deep_work_running = _deep_work_task is not None and not _deep_work_task.done()
         if not deep_work_running and now_mono - last_deep_work >= settings.deep_work_interval:
-            last_deep_work = now_mono
-            db.set_behavior_last_run("deep_work", datetime.now(UTC).isoformat())
-            _deep_work_task = asyncio.create_task(
-                _limit_behavior(_behavior_sem, run_deep_work(bot, sem))
-            )
+            has_goal_activity = db.count_unconsumed_events("goal_updated") >= 1
+            if has_goal_activity or now_mono - last_deep_work >= settings.deep_work_interval * 6:
+                last_deep_work = now_mono
+                db.set_behavior_last_run("deep_work", datetime.now(UTC).isoformat())
+                _deep_work_task = asyncio.create_task(
+                    _limit_behavior(_behavior_sem, run_deep_work(bot, sem))
+                )
 
-            def _on_deep_work_done(fut: asyncio.Task[None]) -> None:
-                exc = fut.exception() if not fut.cancelled() else None
-                if exc:
-                    log.exception("deep_work_task_error", exc_info=exc)
-                else:
-                    # Consume goal events that deep work acts on
-                    consumed = db.consume_events("goal_updated")
-                    if consumed > 0:
-                        db.reset_behavior_no_ops("deep_work")
-                    log.info("deep_work_events_consumed", consumed=consumed)
+                def _on_deep_work_done(fut: asyncio.Task[None]) -> None:
+                    exc = fut.exception() if not fut.cancelled() else None
+                    if exc:
+                        log.exception("deep_work_task_error", exc_info=exc)
+                    else:
+                        # Consume goal events that deep work acts on
+                        consumed = db.consume_events("goal_updated")
+                        if consumed > 0:
+                            db.reset_behavior_no_ops("deep_work")
+                        log.info("deep_work_events_consumed", consumed=consumed)
 
-            _deep_work_task.add_done_callback(_on_deep_work_done)
-            log.info("deep_work_launched")
+                _deep_work_task.add_done_callback(_on_deep_work_done)
+                log.info("deep_work_launched")
 
         try:
             now = datetime.now(UTC)
