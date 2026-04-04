@@ -380,11 +380,41 @@ def get_schema_version() -> int:
     return int(row[0]) if row[0] is not None else 0
 
 
+def _ensure_required_columns(db: sqlite3.Connection) -> None:
+    """Guarantee critical columns exist, regardless of migration version tracking.
+
+    Fixes ghost-recorded migrations where schema_version was updated but
+    the ALTER TABLE never applied.  Safe to run repeatedly.
+    """
+    required: list[tuple[str, str, str]] = [
+        # (table, column, ddl)
+        (
+            "behavior_state",
+            "consecutive_no_ops",
+            "ALTER TABLE behavior_state ADD COLUMN consecutive_no_ops INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "memory_meta",
+            "taxonomy",
+            "ALTER TABLE memory_meta ADD COLUMN taxonomy TEXT NOT NULL DEFAULT ''",
+        ),
+    ]
+    for table, column, ddl in required:
+        cols = {
+            r[1] for r in db.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        if column not in cols:
+            log.warning("missing_column_repair", table=table, column=column)
+            db.execute(ddl)
+            db.commit()
+
+
 def init() -> None:
     """Create tables (including sqlite-vec virtual table) and run migrations."""
     db = _db()
     db.executescript(_SCHEMA)
     _run_migrations(db)
+    _ensure_required_columns(db)
 
 
 # ---------------------------------------------------------------------------
