@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.luke.watchdog</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/filipelm/Code/luke/watchdog.sh</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/filipelm/Code/luke</string>
+    <key>StartInterval</key>
+    <integer>120</integer>
+    <key>StandardOutPath</key>
+    <string>/Users/filipelm/Luke/watchdog.out</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/filipelm/Luke/watchdog.err</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin:/Users/filipelm/.local/bin</string>
+        <key>LUKE_DIR</key>
+        <string>/Users/filipelm/Luke</string>
+    </dict>
+</dict>
+</plist>

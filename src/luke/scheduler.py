@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from collections.abc import Coroutine
 from datetime import UTC, datetime
@@ -29,6 +30,22 @@ from .config import settings
 from .db import TaskRecord, ensure_utc
 
 log: BoundLogger = structlog.get_logger()
+
+
+def write_heartbeat(status: str = "idle") -> None:
+    """Write a heartbeat file so the external watchdog knows we're alive.
+
+    File format: ``<unix_timestamp> <pid> <status>``
+    Written atomically (write-to-tmp + rename) to avoid partial reads.
+    """
+    heartbeat_path = settings.store_dir / "heartbeat"
+    tmp_path = settings.store_dir / "heartbeat.tmp"
+    try:
+        content = f"{int(time.time())} {os.getpid()} {status}\n"
+        tmp_path.write_text(content)
+        tmp_path.rename(heartbeat_path)
+    except OSError:
+        pass  # best effort — don't crash the scheduler over a heartbeat
 
 # Track long-running deep work task across scheduler ticks
 _deep_work_task: asyncio.Task[None] | None = None
@@ -184,6 +201,8 @@ async def start_scheduler_loop(
     last_skill_extraction = _load_offset("skill_extraction", settings.skill_extraction_interval)
     last_dream = _load_offset("dream", settings.dream_interval)
 
+    write_heartbeat("startup")
+
     while not (shutdown and shutdown.is_set()):
         # Use wait with timeout so we wake up promptly on shutdown
         if shutdown:
@@ -195,6 +214,7 @@ async def start_scheduler_loop(
         else:
             await asyncio.sleep(settings.scheduler_interval)
         now_mono = time.monotonic()
+        write_heartbeat("tick")
 
         # Hourly: FTS cleanup + adaptive importance decay + session cleanup
         if now_mono - last_cleanup >= settings.cleanup_interval:
@@ -233,7 +253,7 @@ async def start_scheduler_loop(
             """Apply exponential backoff based on consecutive no-op runs."""
             try:
                 no_ops = int(db.get_behavior_no_ops(name))
-            except TypeError, ValueError:
+            except (TypeError, ValueError):
                 no_ops = 0
             return float(base * (2 ** min(no_ops, 4)))  # caps at 16x base interval
 
