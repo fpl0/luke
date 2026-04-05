@@ -352,20 +352,30 @@ async def process(chat_id: str) -> None:
         word_count = sum(len(m.content.split()) for m in messages)
         db.emit_event("user_message", f'{{"word_count": {word_count}}}')
 
-        # Run build_prompt, memory recall, and conversation state concurrently
+        # --- Enrichment phase (graceful degradation) ---
+        # If prompt building or memory recall fails, fall back to raw text
+        # so a single bad message doesn't permanently wedge the queue.
         combined_text = " ".join(m.content for m in messages)
         _recalled: list[MemoryResult] = []
-        if _needs_recall(combined_text):
-            prompt, (memory_context, _recalled), conv_state = await asyncio.gather(
-                build_prompt(messages, chat_id),
-                _auto_recall(combined_text, chat_id),
-                _get_conversation_state(chat_id),
-            )
-            # Prepend conversation state before recalled memories for priority
-            memory_context = conv_state + memory_context
-        else:
-            prompt = await build_prompt(messages, chat_id)
+        memory_context = ""
+        prompt: str | list[dict[str, Any]] = combined_text  # fallback default
+
+        try:
+            if _needs_recall(combined_text):
+                prompt, (memory_context, _recalled), conv_state = await asyncio.gather(
+                    build_prompt(messages, chat_id),
+                    _auto_recall(combined_text, chat_id),
+                    _get_conversation_state(chat_id),
+                )
+                memory_context = conv_state + memory_context
+            else:
+                prompt = await build_prompt(messages, chat_id)
+        except Exception:
+            log.exception("enrichment_failed", chat_id=chat_id)
+            # Degrade: use raw text, skip memory context
+            prompt = combined_text
             memory_context = ""
+            _recalled = []
 
         # Classify effort and select model tier dynamically
         effort, thinking, routed_model = _classify_effort(prompt)
@@ -480,92 +490,105 @@ async def process(chat_id: str) -> None:
             db.advance_cursor(chat_id, messages[-1].id)
         _retry_counts.pop(chat_id, None)
 
-        # Upgrade utility for auto-recalled memories the agent actually referenced
-        if _recalled:
-            recalled_ids = [m["id"] for m in _recalled]
-            combined_response = " ".join(result.texts)
-            # Single compiled regex to find all referenced memory IDs at once
-            pattern = re.compile(r"\b(" + "|".join(re.escape(mid) for mid in recalled_ids) + r")\b")
-            found = set(pattern.findall(combined_response))
-            referenced = [mid for mid in recalled_ids if mid in found]
-            if referenced:
-                _fire_and_forget(asyncio.to_thread(touch_memories, referenced, useful_only=True))
-
-        # Memory reconsolidation: detect and apply corrections
-        if _recalled and result.texts:
-            recalled_ids = [m["id"] for m in _recalled]
-            combined_response = " ".join(result.texts)
-            corrections = detect_corrections(recalled_ids, combined_response)
-            for correction in corrections:
-                confidence = correction["confidence"]
-                mem_id = correction["memory_id"]
-                corrected = correction["corrected"]
-                src = correction["source"]
-                if confidence >= 0.7:
-
-                    async def _apply_corr(
-                        _mid: str = mem_id,
-                        _cor: str = corrected,
-                        _conf: float = confidence,
-                        _src: str = src,
-                    ) -> None:
-                        await asyncio.to_thread(
-                            apply_correction,
-                            _mid,
-                            _cor,
-                            confidence=_conf,
-                            source=_src,
-                        )
-
-                    _fire_and_forget(_apply_corr())
-                elif confidence >= 0.5:
-
-                    async def _flag_corr(
-                        _mid: str = mem_id,
-                        _cor: str = corrected,
-                        _conf: float = confidence,
-                        _src: str = src,
-                    ) -> None:
-                        await asyncio.to_thread(
-                            flag_for_review,
-                            _mid,
-                            _cor,
-                            confidence=_conf,
-                            source=_src,
-                        )
-
-                    _fire_and_forget(_flag_corr())
-
-        # Session loss detection
-        if session_id and result.session_id != session_id:
-            log.warning(
-                "session_changed",
-                chat_id=chat_id,
-                old=session_id[:8],
-                new=result.session_id[:8] if result.session_id else "none",
-            )
-            _session_lost[chat_id] = True
-
-        # Cost anomaly detection
-        if result.cost_usd > _COST_ANOMALY_MIN:
-            avg = db.get_rolling_avg_cost(days=7)
-            if avg > 0 and result.cost_usd > avg * _COST_ANOMALY_MULTIPLIER:
-                log.warning(
-                    "cost_anomaly",
-                    chat_id=chat_id,
-                    cost=result.cost_usd,
-                    rolling_avg=round(avg, 4),
-                )
-
-        if result.session_id:
-            db.set_session(chat_id, result.session_id)
-        # Update model ratchet after successful run
-        _session_models[chat_id] = model
-
-        # Only send result text if the agent didn't already message via MCP tools
+        # Send result text first — this is the user-facing response and must
+        # not be blocked by non-critical post-processing failures.
         if result.sent_messages == 0:
             for text in result.texts:
                 await send_long_message(bot, chat_id=int(chat_id), text=text)
+
+        # --- Post-agent bookkeeping (non-critical) ---
+        # Failures here are logged but must never prevent the response above.
+        try:
+            # Upgrade utility for auto-recalled memories the agent actually referenced
+            if _recalled:
+                recalled_ids = [m["id"] for m in _recalled]
+                combined_response = " ".join(result.texts)
+                pattern = re.compile(
+                    r"\b(" + "|".join(re.escape(mid) for mid in recalled_ids) + r")\b"
+                )
+                found = set(pattern.findall(combined_response))
+                referenced = [mid for mid in recalled_ids if mid in found]
+                if referenced:
+                    _fire_and_forget(
+                        asyncio.to_thread(touch_memories, referenced, useful_only=True)
+                    )
+
+            # Memory reconsolidation: detect and apply corrections
+            if _recalled and result.texts:
+                recalled_ids = [m["id"] for m in _recalled]
+                combined_response = " ".join(result.texts)
+                corrections = detect_corrections(recalled_ids, combined_response)
+                for correction in corrections:
+                    confidence = correction["confidence"]
+                    mem_id = correction["memory_id"]
+                    corrected = correction["corrected"]
+                    src = correction["source"]
+                    if confidence >= 0.7:
+
+                        async def _apply_corr(
+                            _mid: str = mem_id,
+                            _cor: str = corrected,
+                            _conf: float = confidence,
+                            _src: str = src,
+                        ) -> None:
+                            await asyncio.to_thread(
+                                apply_correction,
+                                _mid,
+                                _cor,
+                                confidence=_conf,
+                                source=_src,
+                            )
+
+                        _fire_and_forget(_apply_corr())
+                    elif confidence >= 0.5:
+
+                        async def _flag_corr(
+                            _mid: str = mem_id,
+                            _cor: str = corrected,
+                            _conf: float = confidence,
+                            _src: str = src,
+                        ) -> None:
+                            await asyncio.to_thread(
+                                flag_for_review,
+                                _mid,
+                                _cor,
+                                confidence=_conf,
+                                source=_src,
+                            )
+
+                        _fire_and_forget(_flag_corr())
+
+            # Session loss detection
+            if session_id and result.session_id != session_id:
+                log.warning(
+                    "session_changed",
+                    chat_id=chat_id,
+                    old=session_id[:8],
+                    new=result.session_id[:8] if result.session_id else "none",
+                )
+                _session_lost[chat_id] = True
+
+            # Cost anomaly detection
+            if result.cost_usd > _COST_ANOMALY_MIN:
+                avg = db.get_rolling_avg_cost(days=7)
+                if avg > 0 and result.cost_usd > avg * _COST_ANOMALY_MULTIPLIER:
+                    log.warning(
+                        "cost_anomaly",
+                        chat_id=chat_id,
+                        cost=result.cost_usd,
+                        rolling_avg=round(avg, 4),
+                    )
+
+            if result.session_id:
+                db.set_session(chat_id, result.session_id)
+            _session_models[chat_id] = model
+        except Exception:
+            log.exception("post_agent_bookkeeping_failed", chat_id=chat_id)
+            # Best-effort: still save session/model even if something above failed
+            with contextlib.suppress(Exception):
+                if result.session_id:
+                    db.set_session(chat_id, result.session_id)
+                _session_models[chat_id] = model
 
         # Save conversation state for continuity (non-trivial conversations only)
         if effort != "low":
@@ -1458,8 +1481,7 @@ async def _send_crash_notifications() -> None:
             )
         elif event_type == "revert_failed":
             parts.append(
-                f"Crash loop on <code>{old_sha}</code> — revert failed. "
-                "Manual fix needed."
+                f"Crash loop on <code>{old_sha}</code> — revert failed. Manual fix needed."
             )
         elif event_type == "rollback_limit":
             parts.append(f"Too many rollbacks on <code>{old_sha}</code>. {detail}")
@@ -1601,7 +1623,7 @@ def _write_crash_breadcrumb(exc: BaseException) -> None:
     crash_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%S")
     crash_file = crash_dir / f"crash-{ts}-{os.getpid()}.txt"
-    try:
+    with contextlib.suppress(OSError):
         crash_file.write_text(
             f"pid: {os.getpid()}\n"
             f"time: {datetime.now(UTC).isoformat()}\n"
@@ -1609,8 +1631,6 @@ def _write_crash_breadcrumb(exc: BaseException) -> None:
             f"message: {exc}\n"
             f"traceback:\n{''.join(tb_mod.format_exception(exc))}\n"
         )
-    except OSError:
-        pass  # best-effort — don't crash the crash handler
 
 
 def _get_last_crash_summary() -> str | None:
@@ -1632,8 +1652,10 @@ def _get_last_crash_summary() -> str | None:
         content = crashes[0].read_text()
         # Extract type and message lines
         lines = content.splitlines()
-        exc_type = next((l.split(": ", 1)[1] for l in lines if l.startswith("type: ")), "Unknown")
-        exc_msg = next((l.split(": ", 1)[1] for l in lines if l.startswith("message: ")), "")
+        exc_type = next(
+            (ln.split(": ", 1)[1] for ln in lines if ln.startswith("type: ")), "Unknown"
+        )
+        exc_msg = next((ln.split(": ", 1)[1] for ln in lines if ln.startswith("message: ")), "")
         return f"{exc_type}: {exc_msg[:200]}"
     except Exception:
         return "Unknown crash (breadcrumb unreadable)"
