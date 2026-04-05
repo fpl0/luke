@@ -14,7 +14,7 @@ LUKE_DIR="${LUKE_DIR:-$HOME/.luke}"
 HEARTBEAT_FILE="$LUKE_DIR/heartbeat"
 WATCHDOG_LOG="$LUKE_DIR/watchdog.log"
 SERVICE="gui/$(id -u)/com.luke"
-MAX_STALE=300  # 5 minutes — heartbeat should update every 60s
+MAX_STALE=1800  # 30 minutes — conservative to avoid false restarts
 
 log() {
     echo "[watchdog $(date -Iseconds)] $*" >> "$WATCHDOG_LOG"
