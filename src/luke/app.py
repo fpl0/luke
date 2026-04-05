@@ -1275,6 +1275,7 @@ async def main() -> None:
     _guardian_mark_healthy()
     await _send_crash_notifications()
     write_heartbeat("online")
+    _fire_and_forget(_mark_known_good_after_delay())
     _mark("online")
 
     # Replay pending messages from before restart
@@ -1412,6 +1413,25 @@ async def _send_crash_notifications() -> None:
 
     # Clear the file after sending
     notify_file.unlink(missing_ok=True)
+
+
+async def _mark_known_good_after_delay(delay: int = 600) -> None:
+    """After stable uptime, mark this commit as known-good for rollback.
+
+    Waits *delay* seconds (default 10 min) then writes the current SHA to
+    ``~/.luke/known_good_commit``. The guardian uses this as the rollback
+    target instead of blindly reverting HEAD.
+    """
+    await asyncio.sleep(delay)
+    sha = _get_git_sha()
+    if sha == "unknown":
+        return
+    known_good_file = settings.store_dir / "known_good_commit"
+    try:
+        known_good_file.write_text(sha)
+        log.info("known_good_marked", sha=sha, after_s=delay)
+    except Exception:
+        pass  # best effort
 
 
 def _guardian_mark_healthy() -> None:

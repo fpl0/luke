@@ -66,22 +66,40 @@ if (( crash_count >= MAX_CRASHES )); then
         exit 1
     fi
 
-    # Try to revert
-    if git revert --no-edit HEAD 2>/dev/null; then
-        new_sha=$(git rev-parse --short HEAD)
-        git push origin main 2>/dev/null || true
-        echo "[guardian $(date -Iseconds)] Rolled back $sha → $new_sha" >&2
-        echo "$now rolled_back $sha to $new_sha" >> "$ROLLBACK_LOG"
-        # Notify on next startup
-        echo "rollback|$sha|$new_sha|$crash_count crashes in ${WINDOW}s" >> "$LUKE_DIR/crash_notifications"
-        # Reset crash state
-        : > "$STATE_FILE"
-    else
-        echo "[guardian $(date -Iseconds)] Revert failed (conflicts?) — stopping. Manual fix needed." >&2
-        echo "$now revert_failed $sha" >> "$ROLLBACK_LOG"
-        echo "revert_failed|$sha||Revert failed (conflicts?) — manual fix needed" >> "$LUKE_DIR/crash_notifications"
-        sleep 600
-        exit 1
+    # Try to recover: prefer known-good commit, fall back to revert HEAD
+    known_good=$(cat "$LUKE_DIR/known_good_commit" 2>/dev/null || echo "")
+    rolled_back=false
+
+    if [[ -n "$known_good" ]] && [[ "$known_good" != "$sha" ]]; then
+        # Restore working tree to known-good state (preserves history)
+        if git checkout "$known_good" -- . 2>/dev/null && \
+           git commit -m "guardian: restore to known-good $known_good (crash loop on $sha)" 2>/dev/null; then
+            new_sha=$(git rev-parse --short HEAD)
+            git push origin main 2>/dev/null || true
+            echo "[guardian $(date -Iseconds)] Restored to known-good $known_good (was $sha) → $new_sha" >&2
+            echo "$now restored $sha to_known_good $known_good" >> "$ROLLBACK_LOG"
+            echo "rollback|$sha|$known_good|Restored to known-good commit ($crash_count crashes in ${WINDOW}s)" >> "$LUKE_DIR/crash_notifications"
+            : > "$STATE_FILE"
+            rolled_back=true
+        fi
+    fi
+
+    if [[ "$rolled_back" == "false" ]]; then
+        # Fallback: simple revert of HEAD
+        if git revert --no-edit HEAD 2>/dev/null; then
+            new_sha=$(git rev-parse --short HEAD)
+            git push origin main 2>/dev/null || true
+            echo "[guardian $(date -Iseconds)] Rolled back $sha → $new_sha" >&2
+            echo "$now rolled_back $sha to $new_sha" >> "$ROLLBACK_LOG"
+            echo "rollback|$sha|$new_sha|$crash_count crashes in ${WINDOW}s" >> "$LUKE_DIR/crash_notifications"
+            : > "$STATE_FILE"
+        else
+            echo "[guardian $(date -Iseconds)] Revert failed (conflicts?) — stopping. Manual fix needed." >&2
+            echo "$now revert_failed $sha" >> "$ROLLBACK_LOG"
+            echo "revert_failed|$sha||Revert failed (conflicts?) — manual fix needed" >> "$LUKE_DIR/crash_notifications"
+            sleep 600
+            exit 1
+        fi
     fi
 fi
 
