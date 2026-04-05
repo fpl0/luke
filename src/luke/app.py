@@ -1241,6 +1241,54 @@ def _ensure_dirs() -> None:
             shutil.copy2(template, persona_dest)
 
 
+def _startup_self_test() -> None:
+    """Validate critical subsystems before going online.
+
+    Runs after dirs, DB, and memory sync but before Telegram. If any check
+    fails, raises RuntimeError so the guardian can detect a crash loop and
+    roll back if this commit is the cause.
+    """
+    failures: list[str] = []
+
+    # 1. DB: verify we can query and schema is current
+    try:
+        ver = db.get_schema_version()
+        if ver < 1:
+            failures.append("DB schema_version is 0 — migrations may have failed")
+        else:
+            log.info("self_test_ok", check="db", schema_version=ver)
+    except Exception as exc:
+        failures.append(f"DB query failed: {exc}")
+
+    # 2. Memory dirs: verify writable
+    for name, subdir in MEMORY_DIRS.items():
+        d = settings.memory_dir / subdir
+        if not d.is_dir():
+            failures.append(f"Memory dir missing: {name} ({d})")
+        else:
+            test_file = d / ".self_test"
+            try:
+                test_file.write_text("ok")
+                test_file.unlink()
+            except OSError as exc:
+                failures.append(f"Memory dir not writable: {name} — {exc}")
+
+    # 3. Store dir: verify writable (guardian state, heartbeat, etc.)
+    test_file = settings.store_dir / ".self_test"
+    try:
+        test_file.write_text("ok")
+        test_file.unlink()
+    except OSError as exc:
+        failures.append(f"Store dir not writable: {exc}")
+
+    if failures:
+        for f in failures:
+            log.error("self_test_failed", check=f)
+        raise RuntimeError(f"Startup self-test failed: {'; '.join(failures)}")
+
+    log.info("self_test_passed", checks=3)
+
+
 async def main() -> None:
     t0 = time.monotonic()
     timings: dict[str, float] = {}
@@ -1260,6 +1308,9 @@ async def main() -> None:
 
     await asyncio.to_thread(memory.sync_memory_index)
     _mark("memory_sync")
+
+    _startup_self_test()
+    _mark("self_test")
 
     await bot.set_my_commands(
         [
