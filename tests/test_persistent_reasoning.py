@@ -1,9 +1,8 @@
 """Tests for persistent reasoning features."""
+
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
-
-import pytest
+from unittest.mock import MagicMock
 
 from luke.app import _extract_pending_actions, _extract_topics
 
@@ -34,17 +33,17 @@ class TestExtractPendingActions:
         assert len(result) <= 5
 
     def test_dedup(self) -> None:
-        result = _extract_pending_actions([
-            "I'll fix the dashboard. I'll fix the dashboard again."
-        ])
+        result = _extract_pending_actions(["I'll fix the dashboard. I'll fix the dashboard again."])
         # Should not have duplicates
         assert len(result) == len(set(result))
 
     def test_multiple_texts(self) -> None:
-        result = _extract_pending_actions([
-            "I'll handle the first thing.",
-            "Next step: handle the second thing.",
-        ])
+        result = _extract_pending_actions(
+            [
+                "I'll handle the first thing.",
+                "Next step: handle the second thing.",
+            ]
+        )
         assert len(result) >= 2
 
 

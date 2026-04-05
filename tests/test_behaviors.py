@@ -31,6 +31,7 @@ class TestRunConsolidation:
         ):
             mock_settings.chat_id = "12345"
             mock_settings.consolidation_min_cluster = 3
+            mock_memory.recluster_offline.return_value = {"n_clusters": 0}
             mock_memory.get_consolidation_candidates.return_value = []
             await run_consolidation(AsyncMock(), _SEM)
 
@@ -54,6 +55,7 @@ class TestRunConsolidation:
             patch("luke.behaviors.memory") as mock_memory,
             patch("luke.behaviors.run_agent", new_callable=AsyncMock) as mock_agent,
         ):
+            mock_memory.recluster_offline.return_value = {"n_clusters": 0}
             mock_memory.get_consolidation_candidates.return_value = [cluster]
             mock_agent.return_value = MagicMock(texts=[])
             await run_consolidation(AsyncMock(), _SEM)
@@ -78,6 +80,7 @@ class TestRunConsolidation:
             mock_settings.consolidation_min_cluster = 3
             mock_settings.max_consolidation_clusters = 3
             mock_settings.agent_timeout = 10
+            mock_memory.recluster_offline.return_value = {"n_clusters": 0}
             mock_memory.get_consolidation_candidates.return_value = [cluster]
             # Should not raise
             await run_consolidation(AsyncMock(), _SEM)
@@ -99,6 +102,7 @@ class TestRunConsolidation:
             mock_settings.chat_id = "12345"
             mock_settings.consolidation_min_cluster = 3
             mock_settings.max_consolidation_clusters = 3
+            mock_memory.recluster_offline.return_value = {"n_clusters": 0}
             mock_memory.get_consolidation_candidates.return_value = [cluster]
             await run_consolidation(AsyncMock(), _SEM)
 
@@ -149,7 +153,11 @@ class TestRunReflection:
             ]
             mock_db.get_reactions.return_value = []
             mock_db.get_reaction_summary.return_value = {
-                "total": 0, "sentiments": {}, "top_emojis": [], "by_sender": {}, "period_days": 7,
+                "total": 0,
+                "sentiments": {},
+                "top_emojis": [],
+                "by_sender": {},
+                "period_days": 7,
             }
             mock_agent.return_value = MagicMock(texts=[])
             await run_reflection(AsyncMock(), _SEM)
@@ -175,7 +183,11 @@ class TestRunReflection:
             mock_db.get_recent_messages.return_value = []
             mock_db.get_reactions.return_value = []
             mock_db.get_reaction_summary.return_value = {
-                "total": 0, "sentiments": {}, "top_emojis": [], "by_sender": {}, "period_days": 7,
+                "total": 0,
+                "sentiments": {},
+                "top_emojis": [],
+                "by_sender": {},
+                "period_days": 7,
             }
             await run_reflection(AsyncMock(), _SEM)
 
@@ -272,6 +284,66 @@ class TestRunProactiveScan:
             ]
             mock_db.get_message_summaries.return_value = []
             await run_proactive_scan(AsyncMock(), _SEM)
+
+
+# ---------------------------------------------------------------------------
+# run_skill_extraction
+# ---------------------------------------------------------------------------
+
+
+class TestRunSkillExtraction:
+    async def test_no_chat_id(self) -> None:
+        from luke.behaviors import run_skill_extraction
+
+        with patch("luke.behaviors.settings") as mock_settings:
+            mock_settings.chat_id = ""
+            await run_skill_extraction(AsyncMock(), _SEM)
+
+    async def test_skips_when_too_few_episode_bodies(self) -> None:
+        from luke.behaviors import run_skill_extraction
+
+        with (
+            patch("luke.behaviors.memory") as mock_memory,
+            patch("luke.behaviors.read_memory_body", side_effect=["episode one", ""]),
+            patch("luke.behaviors._run_behavior", new_callable=AsyncMock) as mock_run_behavior,
+            patch("luke.behaviors.settings") as mock_settings,
+        ):
+            mock_settings.chat_id = "12345"
+            mock_memory.recall.return_value = [
+                {"id": "ep1", "type": "episode", "title": "Ep1", "score": 1.0},
+                {"id": "ep2", "type": "episode", "title": "Ep2", "score": 1.0},
+            ]
+            await run_skill_extraction(AsyncMock(), _SEM)
+
+        mock_run_behavior.assert_not_called()
+
+    async def test_runs_with_recent_episodes(self) -> None:
+        from luke.behaviors import run_skill_extraction
+
+        with (
+            patch("luke.behaviors.memory") as mock_memory,
+            patch(
+                "luke.behaviors.read_memory_body",
+                side_effect=["episode one", "episode two", "existing procedure"],
+            ),
+            patch("luke.behaviors._run_behavior", new_callable=AsyncMock) as mock_run_behavior,
+            patch("luke.behaviors.settings") as mock_settings,
+        ):
+            mock_settings.chat_id = "12345"
+            mock_settings.consolidation_model = "sonnet"
+            mock_memory.recall.side_effect = [
+                [
+                    {"id": "ep1", "type": "episode", "title": "Ep1", "score": 1.0},
+                    {"id": "ep2", "type": "episode", "title": "Ep2", "score": 1.0},
+                ],
+                [
+                    {"id": "proc1", "type": "procedure", "title": "Proc1", "score": 1.0},
+                ],
+            ]
+            await run_skill_extraction(AsyncMock(), _SEM)
+
+        mock_run_behavior.assert_called_once()
+        assert mock_run_behavior.call_args.args[0] == "skill_extraction"
 
 
 # ---------------------------------------------------------------------------

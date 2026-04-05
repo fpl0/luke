@@ -2,11 +2,7 @@
 
 from __future__ import annotations
 
-import re
-from pathlib import Path
 from typing import Any
-
-import pytest
 
 
 class TestLogDeepWorkQuality:
@@ -120,9 +116,7 @@ class TestParsePlanStatus:
 
         plans_dir = tmp_settings.workspace_dir / "plans"
         plans_dir.mkdir(parents=True, exist_ok=True)
-        (plans_dir / "goal-test.md").write_text(
-            "# Test Plan\n\n**Status:** paused\n"
-        )
+        (plans_dir / "goal-test.md").write_text("# Test Plan\n\n**Status:** paused\n")
         assert _parse_plan_status("goal-test") == "paused"
 
     def test_completed(self, tmp_settings: Any) -> None:
@@ -130,9 +124,7 @@ class TestParsePlanStatus:
 
         plans_dir = tmp_settings.workspace_dir / "plans"
         plans_dir.mkdir(parents=True, exist_ok=True)
-        (plans_dir / "goal-test.md").write_text(
-            "# Test Plan\n\n**Status:** completed\n"
-        )
+        (plans_dir / "goal-test.md").write_text("# Test Plan\n\n**Status:** completed\n")
         assert _parse_plan_status("goal-test") == "completed"
 
     def test_no_plan_file(self, tmp_settings: Any) -> None:

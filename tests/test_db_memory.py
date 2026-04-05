@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -1011,50 +1012,38 @@ class TestTaxonomy:
     def test_default_taxonomy_entity(self, test_db: Any) -> None:
         """Entities default to 'factual' taxonomy."""
         memory.index_memory("e1", "entity", "Person", "content")
-        row = db._db().execute(
-            "SELECT taxonomy FROM memory_meta WHERE id = ?", ("e1",)
-        ).fetchone()
+        row = db._db().execute("SELECT taxonomy FROM memory_meta WHERE id = ?", ("e1",)).fetchone()
         assert row["taxonomy"] == "factual"
 
     def test_default_taxonomy_episode(self, test_db: Any) -> None:
         """Episodes default to 'experiential' taxonomy."""
         memory.index_memory("ep1", "episode", "Event", "content")
-        row = db._db().execute(
-            "SELECT taxonomy FROM memory_meta WHERE id = ?", ("ep1",)
-        ).fetchone()
+        row = db._db().execute("SELECT taxonomy FROM memory_meta WHERE id = ?", ("ep1",)).fetchone()
         assert row["taxonomy"] == "experiential"
 
     def test_default_taxonomy_goal(self, test_db: Any) -> None:
         """Goals default to 'working' taxonomy."""
         memory.index_memory("g1", "goal", "Objective", "content")
-        row = db._db().execute(
-            "SELECT taxonomy FROM memory_meta WHERE id = ?", ("g1",)
-        ).fetchone()
+        row = db._db().execute("SELECT taxonomy FROM memory_meta WHERE id = ?", ("g1",)).fetchone()
         assert row["taxonomy"] == "working"
 
     def test_explicit_taxonomy_override(self, test_db: Any) -> None:
         """Caller-provided taxonomy overrides the default."""
         memory.index_memory("e1", "entity", "Temp Entity", "content", taxonomy="working")
-        row = db._db().execute(
-            "SELECT taxonomy FROM memory_meta WHERE id = ?", ("e1",)
-        ).fetchone()
+        row = db._db().execute("SELECT taxonomy FROM memory_meta WHERE id = ?", ("e1",)).fetchone()
         assert row["taxonomy"] == "working"
 
     def test_taxonomy_preserved_on_reindex(self, test_db: Any) -> None:
         """Re-indexing without taxonomy keeps existing value."""
         memory.index_memory("e1", "entity", "V1", "content", taxonomy="experiential")
         memory.index_memory("e1", "entity", "V2", "updated content")
-        row = db._db().execute(
-            "SELECT taxonomy FROM memory_meta WHERE id = ?", ("e1",)
-        ).fetchone()
+        row = db._db().execute("SELECT taxonomy FROM memory_meta WHERE id = ?", ("e1",)).fetchone()
         assert row["taxonomy"] == "experiential"
 
     def test_invalid_taxonomy_falls_back(self, test_db: Any) -> None:
         """Invalid taxonomy values fall back to default for the type."""
         memory.index_memory("e1", "entity", "Test", "content", taxonomy="invalid")
-        row = db._db().execute(
-            "SELECT taxonomy FROM memory_meta WHERE id = ?", ("e1",)
-        ).fetchone()
+        row = db._db().execute("SELECT taxonomy FROM memory_meta WHERE id = ?", ("e1",)).fetchone()
         assert row["taxonomy"] == "factual"  # default for entity
 
 
@@ -1097,9 +1086,7 @@ class TestWorkingMemoryExpiry:
 
         expired = memory.expire_working_memories(max_age_hours=24)
         assert expired == 1
-        row = conn.execute(
-            "SELECT status FROM memory_meta WHERE id = ?", ("w1",)
-        ).fetchone()
+        row = conn.execute("SELECT status FROM memory_meta WHERE id = ?", ("w1",)).fetchone()
         assert row["status"] == "archived"
 
     def test_recent_working_not_expired(self, test_db: Any) -> None:
@@ -1130,12 +1117,12 @@ class TestTaxonomyDecay:
         memory.decay_importance(rates)
 
         conn = db._db()
-        f_imp = conn.execute(
-            "SELECT importance FROM memory_meta WHERE id = ?", ("f1",)
-        ).fetchone()["importance"]
-        e_imp = conn.execute(
-            "SELECT importance FROM memory_meta WHERE id = ?", ("e1",)
-        ).fetchone()["importance"]
+        f_imp = conn.execute("SELECT importance FROM memory_meta WHERE id = ?", ("f1",)).fetchone()[
+            "importance"
+        ]
+        e_imp = conn.execute("SELECT importance FROM memory_meta WHERE id = ?", ("e1",)).fetchone()[
+            "importance"
+        ]
         # Factual should have higher importance (decayed less)
         assert f_imp > e_imp
 
@@ -1147,11 +1134,100 @@ class TestTaxonomyDecay:
         memory.decay_importance(rates)
 
         conn = db._db()
-        w_imp = conn.execute(
-            "SELECT importance FROM memory_meta WHERE id = ?", ("w1",)
-        ).fetchone()["importance"]
-        e_imp = conn.execute(
-            "SELECT importance FROM memory_meta WHERE id = ?", ("e1",)
-        ).fetchone()["importance"]
+        w_imp = conn.execute("SELECT importance FROM memory_meta WHERE id = ?", ("w1",)).fetchone()[
+            "importance"
+        ]
+        e_imp = conn.execute("SELECT importance FROM memory_meta WHERE id = ?", ("e1",)).fetchone()[
+            "importance"
+        ]
         # Working should have lower importance (decayed more)
         assert w_imp < e_imp
+
+
+class TestSkillLoop:
+    def test_index_memory_stores_skill_meta_and_trigger(self, test_db: Any) -> None:
+        memory.index_memory(
+            "proc-deploy",
+            "procedure",
+            "Deploy",
+            "How to deploy safely",
+            skill_meta={
+                "version": 1,
+                "source_tasks": ["task-1"],
+                "success_count": 0,
+                "failure_count": 0,
+                "last_applied": None,
+                "confidence": 0.7,
+                "trigger_pattern": "deploy|release",
+            },
+        )
+
+        row = (
+            db._db()
+            .execute(
+                "SELECT skill_meta FROM memory_meta WHERE id = ?",
+                ("proc-deploy",),
+            )
+            .fetchone()
+        )
+        assert row is not None
+        assert json.loads(row["skill_meta"])["source_tasks"] == ["task-1"]
+        trigger = db.get_skill_trigger("proc-deploy")
+        assert trigger is not None
+        assert trigger["trigger_pattern"] == "deploy|release"
+
+    def test_backfill_skill_meta_adds_defaults(self, test_db: Any) -> None:
+        memory.index_memory("proc-old", "procedure", "Deploy App", "How to deploy the app")
+
+        count = memory.backfill_skill_meta()
+
+        assert count == 1
+        skill_meta = memory.get_skill_meta("proc-old")
+        assert skill_meta is not None
+        assert skill_meta["confidence"] == 0.4
+        assert skill_meta["version"] == 1
+        assert db.get_skill_trigger("proc-old") is not None
+
+    def test_get_trigger_matched_skills_returns_matching_procedures(self, test_db: Any) -> None:
+        memory.index_memory(
+            "proc-release",
+            "procedure",
+            "Release",
+            "How to ship a release",
+            skill_meta={
+                "version": 1,
+                "source_tasks": [],
+                "success_count": 0,
+                "failure_count": 0,
+                "last_applied": None,
+                "confidence": 0.8,
+                "trigger_pattern": "deploy|release",
+            },
+        )
+
+        matches = memory.get_trigger_matched_skills("Please deploy this release today.")
+
+        assert [match["id"] for match in matches] == ["proc-release"]
+
+    def test_update_skill_meta_syncs_trigger_confidence(self, test_db: Any) -> None:
+        memory.index_memory(
+            "proc-deploy",
+            "procedure",
+            "Deploy",
+            "How to deploy safely",
+            skill_meta={
+                "version": 1,
+                "source_tasks": [],
+                "success_count": 0,
+                "failure_count": 0,
+                "last_applied": None,
+                "confidence": 0.5,
+                "trigger_pattern": "deploy",
+            },
+        )
+
+        memory.update_skill_meta("proc-deploy", {"confidence": 0.9})
+
+        trigger = db.get_skill_trigger("proc-deploy")
+        assert trigger is not None
+        assert trigger["confidence"] == pytest.approx(0.9)

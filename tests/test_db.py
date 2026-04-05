@@ -453,8 +453,11 @@ class TestReactionSummary:
     def test_counts_by_sentiment(self, test_db: Any) -> None:
         for i, emoji in enumerate(["\U0001f44d", "\U0001f44d", "\U0001f44e"]):
             test_db.store_reaction_feedback(
-                chat_id="12345", msg_id=i + 1, sender_id="1",
-                emoji=emoji, timestamp="2099-01-01T00:00:00",
+                chat_id="12345",
+                msg_id=i + 1,
+                sender_id="1",
+                emoji=emoji,
+                timestamp="2099-01-01T00:00:00",
             )
         result = test_db.get_reaction_summary("12345", days=365 * 100)
         assert result["total"] == 3
@@ -464,12 +467,18 @@ class TestReactionSummary:
     def test_top_emojis(self, test_db: Any) -> None:
         for i in range(5):
             test_db.store_reaction_feedback(
-                chat_id="12345", msg_id=i + 1, sender_id="1",
-                emoji="\U0001f44d", timestamp="2099-01-01T00:00:00",
+                chat_id="12345",
+                msg_id=i + 1,
+                sender_id="1",
+                emoji="\U0001f44d",
+                timestamp="2099-01-01T00:00:00",
             )
         test_db.store_reaction_feedback(
-            chat_id="12345", msg_id=10, sender_id="1",
-            emoji="\U0001f44e", timestamp="2099-01-01T00:00:00",
+            chat_id="12345",
+            msg_id=10,
+            sender_id="1",
+            emoji="\U0001f44e",
+            timestamp="2099-01-01T00:00:00",
         )
         result = test_db.get_reaction_summary("12345", days=365 * 100)
         assert result["top_emojis"][0][0] == "\U0001f44d"

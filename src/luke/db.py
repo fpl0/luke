@@ -347,6 +347,96 @@ _MIGRATIONS: list[tuple[int, str, list[str]]] = [
             "CREATE INDEX IF NOT EXISTS idx_memory_meta_taxonomy ON memory_meta(taxonomy)",
         ],
     ),
+    (
+        8,
+        "add skill_meta column and skill_triggers table for self-improving skill loop",
+        [
+            "ALTER TABLE memory_meta ADD COLUMN skill_meta TEXT",
+            """CREATE TABLE IF NOT EXISTS skill_triggers (
+                procedure_id  TEXT PRIMARY KEY REFERENCES memory_meta(id),
+                trigger_pattern TEXT NOT NULL,
+                confidence    REAL NOT NULL DEFAULT 0.5,
+                success_count INTEGER NOT NULL DEFAULT 0,
+                failure_count INTEGER NOT NULL DEFAULT 0,
+                last_applied  TEXT
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_skill_confidence ON skill_triggers(confidence DESC)",
+        ],
+    ),
+    (
+        9,
+        "add clustering columns and tables for semantic memory organization",
+        [
+            "ALTER TABLE memory_meta ADD COLUMN cluster_id INTEGER DEFAULT NULL",
+            "ALTER TABLE memory_meta ADD COLUMN cluster_updated_at TEXT DEFAULT NULL",
+            "ALTER TABLE memory_meta ADD COLUMN cluster_assignment_method TEXT DEFAULT NULL",
+            "CREATE INDEX IF NOT EXISTS idx_memory_meta_cluster ON memory_meta(cluster_id)",
+            """CREATE TABLE IF NOT EXISTS cluster_centroids (
+                cluster_id INTEGER PRIMARY KEY,
+                centroid_embedding BLOB,
+                member_count INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                method TEXT NOT NULL DEFAULT 'birch'
+            )""",
+            """CREATE TABLE IF NOT EXISTS cluster_summaries (
+                cluster_id INTEGER PRIMARY KEY,
+                summary_text TEXT NOT NULL,
+                summary_embedding BLOB,
+                memory_count INTEGER NOT NULL,
+                type_distribution TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (cluster_id) REFERENCES cluster_centroids(cluster_id)
+            )""",
+        ],
+    ),
+    (
+        10,
+        "add pending_corrections table and enhance memory_history with content snapshots",
+        [
+            """CREATE TABLE IF NOT EXISTS pending_corrections (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                mem_id          TEXT NOT NULL,
+                corrected_content TEXT NOT NULL,
+                confidence      REAL NOT NULL,
+                source          TEXT NOT NULL DEFAULT 'auto_detection',
+                status          TEXT NOT NULL DEFAULT 'pending',
+                created_at      TEXT NOT NULL,
+                resolved_at     TEXT
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_pc_mem ON pending_corrections(mem_id)",
+            "CREATE INDEX IF NOT EXISTS idx_pc_status ON pending_corrections(status)",
+            "ALTER TABLE memory_history ADD COLUMN old_content TEXT",
+            "ALTER TABLE memory_history ADD COLUMN new_content TEXT",
+            "ALTER TABLE memory_history ADD COLUMN change_type TEXT",
+            "ALTER TABLE memory_history ADD COLUMN source TEXT",
+            "ALTER TABLE memory_history ADD COLUMN confidence REAL",
+        ],
+    ),
+    (
+        10,
+        "add pending_corrections table and enhance memory_history with content snapshots",
+        [
+            """CREATE TABLE IF NOT EXISTS pending_corrections (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                mem_id          TEXT NOT NULL,
+                corrected_content TEXT NOT NULL,
+                confidence      REAL NOT NULL,
+                source          TEXT NOT NULL DEFAULT 'auto_detection',
+                status          TEXT NOT NULL DEFAULT 'pending',
+                created_at      TEXT NOT NULL,
+                resolved_at     TEXT
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_pc_mem ON pending_corrections(mem_id)",
+            "CREATE INDEX IF NOT EXISTS idx_pc_status ON pending_corrections(status)",
+            "ALTER TABLE memory_history ADD COLUMN old_content TEXT",
+            "ALTER TABLE memory_history ADD COLUMN new_content TEXT",
+            "ALTER TABLE memory_history ADD COLUMN change_type TEXT",
+            "ALTER TABLE memory_history ADD COLUMN source TEXT",
+            "ALTER TABLE memory_history ADD COLUMN confidence REAL",
+        ],
+    ),
 ]
 
 
@@ -385,6 +475,78 @@ def init() -> None:
     db = _db()
     db.executescript(_SCHEMA)
     _run_migrations(db)
+
+
+# ---------------------------------------------------------------------------
+# Skill triggers
+# ---------------------------------------------------------------------------
+
+
+def upsert_skill_trigger(
+    procedure_id: str,
+    trigger_pattern: str,
+    confidence: float = 0.5,
+    success_count: int = 0,
+    failure_count: int = 0,
+) -> None:
+    """Insert or update a skill trigger entry for a procedure memory."""
+    conn = _db()
+    conn.execute(
+        """INSERT INTO skill_triggers
+           (procedure_id, trigger_pattern, confidence, success_count, failure_count)
+           VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT(procedure_id) DO UPDATE SET
+             trigger_pattern = excluded.trigger_pattern,
+             confidence = excluded.confidence,
+             success_count = excluded.success_count,
+             failure_count = excluded.failure_count""",
+        (procedure_id, trigger_pattern, confidence, success_count, failure_count),
+    )
+    _commit(conn)
+
+
+def get_matching_skill_triggers(text: str) -> list[dict[str, Any]]:
+    """Return skill triggers whose regex pattern matches the given text.
+
+    Only returns triggers with confidence >= 0.2 (above retirement threshold).
+    Results sorted by confidence descending.
+    """
+    import re as _re
+
+    conn = _db()
+    rows = conn.execute(
+        """SELECT st.procedure_id, st.trigger_pattern, st.confidence,
+                  st.success_count, st.failure_count, st.last_applied
+           FROM skill_triggers st
+           JOIN memory_meta m ON st.procedure_id = m.id
+           WHERE m.status = 'active' AND st.confidence >= 0.2
+           ORDER BY st.confidence DESC""",
+    ).fetchall()
+    matches: list[dict[str, Any]] = []
+    for r in rows:
+        try:
+            if _re.search(r["trigger_pattern"], text, _re.IGNORECASE):
+                matches.append(dict(r))
+        except _re.error:
+            pass  # skip invalid regex patterns
+    return matches
+
+
+def get_skill_trigger(procedure_id: str) -> dict[str, Any] | None:
+    """Get skill trigger for a procedure, or None."""
+    row = (
+        _db()
+        .execute("SELECT * FROM skill_triggers WHERE procedure_id = ?", (procedure_id,))
+        .fetchone()
+    )
+    return dict(row) if row else None
+
+
+def delete_skill_trigger(procedure_id: str) -> None:
+    """Remove a skill trigger entry."""
+    conn = _db()
+    conn.execute("DELETE FROM skill_triggers WHERE procedure_id = ?", (procedure_id,))
+    _commit(conn)
 
 
 # ---------------------------------------------------------------------------
@@ -811,9 +973,11 @@ def set_behavior_last_run(name: str, timestamp: str) -> None:
 
 def get_behavior_no_ops(name: str) -> int:
     """Return consecutive no-op count for a behavior."""
-    row = _db().execute(
-        "SELECT consecutive_no_ops FROM behavior_state WHERE name = ?", (name,)
-    ).fetchone()
+    row = (
+        _db()
+        .execute("SELECT consecutive_no_ops FROM behavior_state WHERE name = ?", (name,))
+        .fetchone()
+    )
     return int(row["consecutive_no_ops"]) if row and row["consecutive_no_ops"] else 0
 
 
@@ -1122,8 +1286,7 @@ def get_recent_quality_scores(goal_id: str, n: int = 3) -> list[int]:
     rows = (
         _db()
         .execute(
-            "SELECT rating FROM deep_work_quality WHERE goal_id = ? "
-            "ORDER BY id DESC LIMIT ?",
+            "SELECT rating FROM deep_work_quality WHERE goal_id = ? ORDER BY id DESC LIMIT ?",
             (goal_id, n),
         )
         .fetchall()
@@ -1134,11 +1297,14 @@ def get_recent_quality_scores(goal_id: str, n: int = 3) -> list[int]:
 def get_quality_blocked_goals(threshold: float = 2.0, window: int = 3) -> list[str]:
     """Return goal IDs where avg of last `window` ratings is below threshold."""
     # Get all goals with enough ratings
-    rows = _db().execute(
-        "SELECT goal_id FROM deep_work_quality "
-        "GROUP BY goal_id HAVING COUNT(*) >= ?",
-        (window,),
-    ).fetchall()
+    rows = (
+        _db()
+        .execute(
+            "SELECT goal_id FROM deep_work_quality GROUP BY goal_id HAVING COUNT(*) >= ?",
+            (window,),
+        )
+        .fetchall()
+    )
     blocked: list[str] = []
     for row in rows:
         scores = get_recent_quality_scores(row["goal_id"], window)

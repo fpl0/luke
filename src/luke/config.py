@@ -71,6 +71,9 @@ class Settings(BaseSettings):
     dream_max_budget_usd: float = 2.0  # per-session cap
     dream_quiet_hours: float = 2.0  # only dream if user inactive this long
 
+    # Skill extraction
+    skill_extraction_interval: float = 21600.0  # 6h between extraction runs
+
     # Autonomous goal loop (replaces goal_execution)
     deep_work_interval: float = 14400.0  # 4h between sessions
     deep_work_max_turns: int = 500
@@ -116,6 +119,14 @@ class Settings(BaseSettings):
     # Graph traversal
     graph_max_depth: int = 2
     graph_decay_per_hop: float = 0.5
+
+    # Semantic clustering
+    birch_threshold: float = 0.3
+    birch_branching_factor: int = 50
+    hdbscan_min_cluster_size: int = 5
+    hdbscan_min_samples: int = 10
+    cluster_retrieval_threshold: float = 0.4
+    max_relevant_clusters: int = 5
 
     @field_validator("telegram_bot_token")
     @classmethod

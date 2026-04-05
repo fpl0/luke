@@ -545,6 +545,50 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
 
         tags: list[str] = args.get("tags", [])
         links: list[str] = args.get("links", [])
+        raw_imp = args.get("importance")
+        imp: float | None = max(0.1, min(2.0, float(raw_imp))) if raw_imp is not None else None
+        existing_skill_meta = memory.get_skill_meta(mem_id) if mem_type == "procedure" else None
+        skill_meta = existing_skill_meta
+        if mem_type == "procedure" and ("skill" in tags or "auto-extracted" in tags):
+            import re as _re
+
+            steps = _re.findall(r"^\s*\d+\.\s+.+$", args["content"], _re.MULTILINE)
+            passed, reason = memory.skill_gate(
+                args["content"],
+                steps,
+                exclude_id=mem_id if path.exists() else None,
+            )
+            if not passed:
+                return _ok(f"Skill rejected: {reason}")
+
+            trigger_pattern = ""
+            content_text = args["content"]
+            when_match = _re.search(
+                r"## When to Use\s*\n(.+?)(?=\n## |\Z)", content_text, _re.DOTALL
+            )
+            if when_match:
+                words = _re.findall(r"\b[a-z]{4,}\b", when_match.group(1).lower())
+                if words:
+                    trigger_pattern = "|".join(set(words[:8]))
+            skill_meta = {
+                "version": (existing_skill_meta["version"] + 1) if existing_skill_meta else 1,
+                "source_tasks": (
+                    existing_skill_meta.get("source_tasks", []) if existing_skill_meta else []
+                ),
+                "success_count": (
+                    existing_skill_meta.get("success_count", 0) if existing_skill_meta else 0
+                ),
+                "failure_count": (
+                    existing_skill_meta.get("failure_count", 0) if existing_skill_meta else 0
+                ),
+                "last_applied": (
+                    existing_skill_meta.get("last_applied") if existing_skill_meta else None
+                ),
+                "confidence": (
+                    existing_skill_meta.get("confidence", 0.6) if existing_skill_meta else 0.6
+                ),
+                "trigger_pattern": trigger_pattern,
+            }
         fm: dict[str, Any] = {
             "id": mem_id,
             "type": mem_type,
@@ -553,6 +597,8 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
             "updated": now,
             "links": links,
         }
+        if skill_meta is not None:
+            fm["skill_meta"] = skill_meta
         body = yaml.dump(fm, default_flow_style=False)
         path.write_text(f"---\n{body}---\n\n# {title}\n\n{args['content']}\n")
 
@@ -563,8 +609,6 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
             if changes:
                 change_note = " Changes: " + "; ".join(changes)
                 memory.record_memory_change(mem_id, changes)
-        raw_imp = args.get("importance")
-        imp: float | None = max(0.1, min(2.0, float(raw_imp))) if raw_imp is not None else None
         emb = await asyncio.to_thread(
             memory.index_memory,
             mem_id,
@@ -574,6 +618,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
             tags,
             links,
             imp,
+            skill_meta=skill_meta,
         )
         # Linking is a graph-write, not retrieval — track access but not utility
         if links:
@@ -756,6 +801,61 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
             lines.append(f"[{entry['timestamp']}] {changes}")
         return _ok("\n".join(lines))
 
+    # --- Correction review (1 tool) ---
+
+    @tool(
+        "review_corrections",
+        "Review pending memory corrections detected automatically. "
+        "Returns pending corrections with original content, proposed correction, "
+        "and confidence score. Use action: approve, reject, or modify with corrected_content.",
+        {"action": str, "correction_id": int, "corrected_content": str},
+        annotations=_DESTRUCTIVE,
+    )
+    async def mem_review_corrections(args: dict[str, Any]) -> dict[str, Any]:
+        action = args.get("action", "list")
+        if action == "list":
+            pending = memory.get_pending_corrections(limit=5)
+            if not pending:
+                return _ok("No pending corrections to review.")
+            lines: list[str] = []
+            for p in pending:
+                lines.append(
+                    f"**Correction #{p['id']}** (confidence: {p['confidence']:.2f})\n"
+                    f"Memory: {p['mem_id']}\n"
+                    f"Proposed: {p['corrected_content'][:200]}\n"
+                    f"Detected: {p['created_at']}\n"
+                    f"Actions: approve (id={p['id']}), reject (id={p['id']}), "
+                    f"modify (id={p['id']}, corrected_content=...)"
+                )
+            return _ok("\n---\n".join(lines))
+        elif action in ("approve", "applied"):
+            correction_id = args.get("correction_id")
+            if not correction_id:
+                return _ok("Error: correction_id required for approve/reject")
+            result = memory.resolve_correction(correction_id, action)
+            return _ok(f"Correction #{correction_id}: {result['status']}")
+        elif action == "reject":
+            correction_id = args.get("correction_id")
+            if not correction_id:
+                return _ok("Error: correction_id required for approve/reject")
+            result = memory.resolve_correction(correction_id, "rejected")
+            return _ok(f"Correction #{correction_id}: rejected")
+        elif action == "modify":
+            correction_id = args.get("correction_id")
+            corrected_content = args.get("corrected_content")
+            if not correction_id or not corrected_content:
+                return _ok("Error: correction_id and corrected_content required for modify")
+            result = memory.apply_correction(
+                correction_id,
+                corrected_content,
+                confidence=0.85,
+                source="agent_review",
+            )
+            memory.resolve_correction(correction_id, "applied")
+            return _ok(f"Correction #{correction_id}: modified and applied ({result['status']})")
+        else:
+            return _ok(f"Unknown action: {action}. Use: list, approve, reject, modify")
+
     # --- Cost (1 tool) ---
 
     @tool(
@@ -785,10 +885,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
         db.log_deep_work_quality(goal_id, rating)
         scores = db.get_recent_quality_scores(goal_id, 3)
         avg = sum(scores) / len(scores) if scores else 0
-        return _ok(
-            f"Quality logged: {rating}/5 for {goal_id}. "
-            f"Last {len(scores)} avg: {avg:.1f}"
-        )
+        return _ok(f"Quality logged: {rating}/5 for {goal_id}. Last {len(scores)} avg: {avg:.1f}")
 
     # --- Browser (1 tool) ---
 
@@ -885,9 +982,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
 # ---------------------------------------------------------------------------
 
 
-def _build_stop_hook(
-    tool_count: dict[str, int], autonomous: bool
-) -> HookCallback:
+def _build_stop_hook(tool_count: dict[str, int], autonomous: bool) -> HookCallback:
     """Factory returning a Stop hook closure with access to the run's tool count."""
 
     async def _stop_hook(
@@ -899,11 +994,13 @@ def _build_stop_hook(
         if not autonomous and tool_count["n"] >= _AUTO_SKILL_THRESHOLD:
             skill_prompt = (
                 f"\n8. Skill extraction: this conversation used {tool_count['n']} tool calls "
-                "— it was complex. Before stopping, check whether a reusable procedure can be extracted:\n"
+                "— it was complex. Before stopping, check whether a reusable "
+                "procedure can be extracted:\n"
                 "   - Did you solve something that is likely to come up again?\n"
                 "   - Is there a clear sequence of steps that another session could follow?\n"
                 "   If yes, save a procedure memory (type: procedure):\n"
-                "     - ID: descriptive kebab-case (e.g. how-to-deploy-app, research-flight-options)\n"
+                "     - ID: descriptive kebab-case "
+                "(e.g. how-to-deploy-app, research-flight-options)\n"
                 "     - Include: trigger condition, step-by-step approach, gotchas, example\n"
                 "   If no clear reusable pattern exists, skip this — don't save noise."
             )
@@ -912,8 +1009,9 @@ def _build_stop_hook(
                 "Session ending. Before you stop:\n"
                 "1. Did you learn anything new about the user? Save it with 'remember'.\n"
                 "2. Did any entity (person, project) change? Update their db.\n"
-                "3. Was this conversation significant? Save an episode — include your reasoning: "
-                "what approaches you considered, why you chose your solution, what worked or didn't.\n"
+                "3. Was this conversation significant? Save an episode — "
+                "include your reasoning: what approaches you considered, "
+                "why you chose your solution, what worked or didn't.\n"
                 "4. Did you notice a pattern or preference? Save an insight.\n"
                 "5. Is there anything pending that needs follow-up? Schedule a reminder.\n"
                 "6. Did the user mention wanting to achieve something? Create or update a goal.\n"
@@ -921,6 +1019,14 @@ def _build_stop_hook(
                 "user's mood/energy, anything unresolved or promised, what's likely to "
                 "come up next. Keep under 200 words. Overwrite the previous one if it exists."
                 + skill_prompt
+                + (
+                    "\n8. Correction check: did any recalled information get corrected "
+                    "during this conversation? If the user corrected a fact you remembered, "
+                    "or you realized something you stored was wrong, use the remember tool "
+                    "to update the entity with the corrected content. Corrections include: "
+                    "factual updates, changed preferences, outdated information, "
+                    "or anything you previously stored that is no longer accurate."
+                )
             )
         }
 
@@ -1085,7 +1191,9 @@ async def run_agent(
     # Load constitutional layer — non-compressible behavioral anchors
     constitutional_path = root / "constitutional.yaml"
     if constitutional_path.exists():
-        persona += "\n\n<constitutional>\n" + constitutional_path.read_text() + "\n</constitutional>"
+        persona += (
+            "\n\n<constitutional>\n" + constitutional_path.read_text() + "\n</constitutional>"
+        )
 
     # Per-run counters (closed over by PreToolUse hook)
     send_count = {"n": 0}

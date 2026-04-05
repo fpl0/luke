@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from aiogram import Bot
+from claude_agent_sdk.types import SyncHookJSONOutput
 
 from luke.agent import (
     _AUTO_SKILL_THRESHOLD,
@@ -19,7 +20,6 @@ from luke.agent import (
     _ok,
     send_long_message,
 )
-from claude_agent_sdk.types import SyncHookJSONOutput
 from luke.config import settings
 
 # ---------------------------------------------------------------------------
@@ -438,6 +438,108 @@ class TestBuildTools:
                 {"id": "test-mem", "type": "entity", "title": "Test", "content": "body"}
             )
         assert "Remembered" in result["content"][0]["text"]
+
+    async def test_remember_procedure_persists_skill_meta_frontmatter(
+        self, tmp_settings: Any, test_db: Any
+    ) -> None:
+        from luke import memory
+        from luke.agent import _build_tools
+
+        captured_tools: list[Any] = []
+
+        def fake_tool(name: str, desc: str, params: dict[str, Any], **_kw: Any) -> Any:
+            def decorator(fn: Any) -> Any:
+                fn._tool_name = name
+                return fn
+
+            return decorator
+
+        def fake_create_server(**kwargs: Any) -> list[Any]:
+            captured_tools.extend(kwargs["tools"])
+            return captured_tools
+
+        mock_bot = AsyncMock(spec=Bot)
+        with (
+            patch("luke.agent.tool", fake_tool),
+            patch("luke.agent.create_sdk_mcp_server", fake_create_server),
+            patch("luke.agent.settings", tmp_settings),
+            patch("luke.agent.db.store_message"),
+            patch("luke.agent.db.is_duplicate_outbound", return_value=False),
+            patch("luke.agent.db.log_outbound"),
+        ):
+            _build_tools("12345", mock_bot)
+            tools = {t._tool_name: t for t in captured_tools if hasattr(t, "_tool_name")}
+            remember = tools["remember"]
+            await remember(
+                {
+                    "id": "deploy-docs",
+                    "type": "procedure",
+                    "title": "Deploy Docs",
+                    "content": (
+                        "## When to Use\n"
+                        "Deploy docs after editing the site.\n\n"
+                        "## Steps\n"
+                        "1. Build the site\n"
+                        "2. Publish the build\n"
+                        "3. Verify production\n"
+                    ),
+                    "tags": ["skill", "docs"],
+                }
+            )
+
+        path = tmp_settings.memory_dir / "procedures" / "deploy-docs.md"
+        frontmatter = memory.read_frontmatter(path)
+        assert frontmatter["skill_meta"]["confidence"] == 0.6
+        assert "deploy" in frontmatter["skill_meta"]["trigger_pattern"]
+
+    async def test_remember_rejects_non_trivial_auto_extracted_skill(
+        self, tmp_settings: Any, test_db: Any
+    ) -> None:
+        from luke.agent import _build_tools
+
+        captured_tools: list[Any] = []
+
+        def fake_tool(name: str, desc: str, params: dict[str, Any], **_kw: Any) -> Any:
+            def decorator(fn: Any) -> Any:
+                fn._tool_name = name
+                return fn
+
+            return decorator
+
+        def fake_create_server(**kwargs: Any) -> list[Any]:
+            captured_tools.extend(kwargs["tools"])
+            return captured_tools
+
+        mock_bot = AsyncMock(spec=Bot)
+        with (
+            patch("luke.agent.tool", fake_tool),
+            patch("luke.agent.create_sdk_mcp_server", fake_create_server),
+            patch("luke.agent.settings", tmp_settings),
+            patch("luke.agent.db.store_message"),
+            patch("luke.agent.db.is_duplicate_outbound", return_value=False),
+            patch("luke.agent.db.log_outbound"),
+        ):
+            _build_tools("12345", mock_bot)
+            tools = {t._tool_name: t for t in captured_tools if hasattr(t, "_tool_name")}
+            remember = tools["remember"]
+            result = await remember(
+                {
+                    "id": "tiny-skill",
+                    "type": "procedure",
+                    "title": "Tiny Skill",
+                    "content": (
+                        "## When to Use\n"
+                        "When you need a tiny skill.\n\n"
+                        "## Steps\n"
+                        "1. Do one thing\n"
+                        "2. Do the second thing\n"
+                    ),
+                    "tags": ["skill", "auto-extracted"],
+                }
+            )
+
+        assert "Skill rejected" in result["content"][0]["text"]
+        assert not (tmp_settings.memory_dir / "procedures" / "tiny-skill.md").exists()
 
     async def test_remember_invalid_type(self, tool_env: dict[str, Any]) -> None:
         remember = tool_env["tools"]["remember"]
