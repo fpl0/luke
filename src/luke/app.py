@@ -1242,13 +1242,24 @@ def _ensure_dirs() -> None:
 
 
 async def main() -> None:
+    t0 = time.monotonic()
+    timings: dict[str, float] = {}
+
+    def _mark(phase: str) -> None:
+        elapsed = time.monotonic() - t0
+        timings[phase] = elapsed
+        log.info("startup_phase", phase=phase, elapsed_s=round(elapsed, 3))
+
     log.info("starting", phase="init")
     _ensure_dirs()
+    _mark("dirs")
+
     db.init()
     db.clear_sessions()  # no session survives process restart
-    log.info("starting", phase="memory_sync")
+    _mark("db")
+
     await asyncio.to_thread(memory.sync_memory_index)
-    log.info("started", chat_id=settings.chat_id)
+    _mark("memory_sync")
 
     await bot.set_my_commands(
         [
@@ -1258,16 +1269,29 @@ async def main() -> None:
             BotCommand(command="restart", description="Restart Luke"),
         ]
     )
+    _mark("bot_commands")
 
     await _notify_main("Back online.")
     _guardian_mark_healthy()
+    _mark("online")
 
     # Replay pending messages from before restart
+    replay_count = 0
     if settings.chat_id:
         pending = db.get_pending_messages(settings.chat_id)
         if pending:
-            log.info("startup_replay", chat_id=settings.chat_id, count=len(pending))
+            replay_count = len(pending)
+            log.info("startup_replay", chat_id=settings.chat_id, count=replay_count)
             _dispatch(settings.chat_id)
+    _mark("replay")
+
+    total = time.monotonic() - t0
+    log.info(
+        "startup_complete",
+        total_s=round(total, 3),
+        timings={k: round(v, 3) for k, v in timings.items()},
+        replayed=replay_count,
+    )
 
     loop = asyncio.get_running_loop()
     shutdown_event = asyncio.Event()
@@ -1426,10 +1450,7 @@ def _acquire_lock() -> None:
 
 
 _CRASH_DIR_NAME = "crashes"
-_CRASH_LOOP_WINDOW = 300  # seconds — 5 minute window
-_CRASH_LOOP_THRESHOLD = 3  # crashes within window triggers rollback
-_KNOWN_GOOD_MARKER = "known_good_commit"
-_STABLE_UPTIME = 300  # seconds before marking commit as "known good"
+_CRASH_BREADCRUMB_RETENTION = 86400  # 24 hours
 
 
 def _crash_dir() -> Path:
@@ -1456,116 +1477,53 @@ def _write_crash_breadcrumb(exc: BaseException) -> None:
         pass  # best-effort — don't crash the crash handler
 
 
-def _count_recent_crashes() -> int:
-    """Count crash breadcrumbs within the crash loop window."""
+def _get_last_crash_summary() -> str | None:
+    """Read the most recent crash breadcrumb and return a summary."""
     crash_dir = _crash_dir()
     if not crash_dir.is_dir():
-        return 0
-    cutoff = time.time() - _CRASH_LOOP_WINDOW
-    count = 0
-    for f in crash_dir.iterdir():
-        if f.name.startswith("crash-") and f.stat().st_mtime > cutoff:
-            count += 1
-    return count
-
-
-def _get_known_good_commit() -> str | None:
-    """Read the last known-good commit SHA."""
-    marker = settings.store_dir / _KNOWN_GOOD_MARKER
-    if marker.is_file():
-        sha = marker.read_text().strip()
-        return sha if sha else None
-    return None
-
-
-def _mark_known_good() -> None:
-    """Mark the current commit as known-good after stable uptime."""
-    import subprocess
-
+        return None
+    crashes = sorted(
+        (f for f in crash_dir.iterdir() if f.name.startswith("crash-")),
+        key=lambda f: f.stat().st_mtime,
+        reverse=True,
+    )
+    if not crashes:
+        return None
+    # Only report crashes from the last 10 minutes (likely the crash we just recovered from)
+    if time.time() - crashes[0].stat().st_mtime > 600:
+        return None
     try:
-        sha = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"],
-            cwd=Path(__file__).resolve().parent.parent.parent,
-            text=True,
-        ).strip()
-        marker = settings.store_dir / _KNOWN_GOOD_MARKER
-        marker.write_text(sha + "\n")
-        log.info("marked_known_good", sha=sha[:8])
+        content = crashes[0].read_text()
+        # Extract type and message lines
+        lines = content.splitlines()
+        exc_type = next((l.split(": ", 1)[1] for l in lines if l.startswith("type: ")), "Unknown")
+        exc_msg = next((l.split(": ", 1)[1] for l in lines if l.startswith("message: ")), "")
+        return f"{exc_type}: {exc_msg[:200]}"
     except Exception:
-        log.exception("failed_to_mark_known_good")
+        return "Unknown crash (breadcrumb unreadable)"
 
 
-def _auto_rollback() -> bool:
-    """Attempt auto-rollback to the known-good commit. Returns True if rollback was performed."""
-    import subprocess
-
-    repo_dir = Path(__file__).resolve().parent.parent.parent
-    known_good = _get_known_good_commit()
-
-    try:
-        current = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], cwd=repo_dir, text=True,
-        ).strip()
-    except Exception:
-        log.exception("rollback_git_failed")
-        return False
-
-    if known_good and known_good != current:
-        target = known_good
-        log.warning("crash_loop_rollback", target=target[:8], current=current[:8])
-    else:
-        # No known-good or same as current — try HEAD~1
-        try:
-            target = subprocess.check_output(
-                ["git", "rev-parse", "HEAD~1"], cwd=repo_dir, text=True,
-            ).strip()
-        except Exception:
-            log.error("rollback_no_target")
-            return False
-
-    try:
-        subprocess.check_call(["git", "checkout", target], cwd=repo_dir)
-        log.warning("rollback_complete", from_sha=current[:8], to_sha=target[:8])
-        # Clean crash breadcrumbs so we don't immediately rollback again
-        _cleanup_crash_breadcrumbs()
-        return True
-    except Exception:
-        log.exception("rollback_checkout_failed")
-        return False
-
-
-def _cleanup_crash_breadcrumbs() -> None:
-    """Remove all crash breadcrumb files."""
+def _cleanup_old_breadcrumbs() -> None:
+    """Remove crash breadcrumbs older than retention period."""
     crash_dir = _crash_dir()
     if not crash_dir.is_dir():
         return
+    cutoff = time.time() - _CRASH_BREADCRUMB_RETENTION
     for f in crash_dir.iterdir():
-        if f.name.startswith("crash-"):
+        if f.name.startswith("crash-") and f.stat().st_mtime < cutoff:
             with contextlib.suppress(OSError):
                 f.unlink()
 
 
 def cli() -> None:
-    """Entry point for `pyproject.toml` [project.scripts]."""
+    """Entry point for `pyproject.toml` [project.scripts].
+
+    Crash loop detection is handled by guardian.sh (the outer wrapper).
+    This function handles crash breadcrumbs for diagnostics.
+    """
     _configure_logging()
     _acquire_lock()
-
-    # Crash loop detection: check if we've been crashing repeatedly
-    recent_crashes = _count_recent_crashes()
-    if recent_crashes >= _CRASH_LOOP_THRESHOLD:
-        log.critical(
-            "crash_loop_detected",
-            recent_crashes=recent_crashes,
-            window_seconds=_CRASH_LOOP_WINDOW,
-        )
-        if _auto_rollback():
-            log.warning("crash_loop_rollback_done", msg="Restarting with rolled-back code")
-            # Exit so launchd restarts us with the rolled-back code
-            raise SystemExit(2)
-        else:
-            log.error("crash_loop_rollback_failed", msg="Proceeding anyway — manual intervention needed")
-            # Sleep to avoid hammering in a tight crash loop
-            time.sleep(30)
+    _cleanup_old_breadcrumbs()
 
     try:
         asyncio.run(main())
