@@ -933,7 +933,13 @@ async def _handle_media(
         )
         _dispatch(str(msg.chat.id))
         return
-    extra = await post_download(dest) if post_download else ""
+    extra = ""
+    if post_download:
+        try:
+            extra = await post_download(dest)
+        except Exception:
+            log.exception("post_download_failed", filename=filename)
+            extra = "\n[Post-processing failed]"
     _store(
         msg,
         content.format(dest=dest) + extra,
@@ -1217,7 +1223,8 @@ async def on_edit(msg: types.Message) -> None:
 
 @dp.callback_query()
 async def on_callback(cb: types.CallbackQuery) -> None:
-    await cb.answer()
+    with contextlib.suppress(Exception):
+        await cb.answer()
     if cb.data and cb.message and isinstance(cb.message, types.Message):
         sender_name = cb.from_user.full_name if cb.from_user else "Unknown"
         sender_id = str(cb.from_user.id) if cb.from_user else ""
@@ -1232,6 +1239,26 @@ async def on_callback(cb: types.CallbackQuery) -> None:
         )
         if stored:
             _dispatch(str(cb.message.chat.id))
+
+
+# ---------------------------------------------------------------------------
+# Global error handler — prevent handler exceptions from crashing polling
+# ---------------------------------------------------------------------------
+
+
+@dp.errors()
+async def on_error(event: types.ErrorEvent) -> bool:
+    """Catch-all for unhandled exceptions in any handler.
+
+    Logs the error and returns True to signal aiogram that the error is handled,
+    preventing the exception from propagating to the polling loop.
+    """
+    log.error(
+        "handler_error",
+        handler=event.update.event_type if event.update else "unknown",
+        exc_info=event.exception,
+    )
+    return True
 
 
 # ---------------------------------------------------------------------------
