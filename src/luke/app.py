@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import fcntl
+import json
 import os
 import re
 import shutil
@@ -67,6 +68,21 @@ _MODEL_RANK: dict[str, int] = {"haiku": 0, "sonnet": 1, "opus": 2}
 _session_models: dict[str, str] = {}  # chat_id → highest model used in session
 
 _session_lost: dict[str, bool] = {}  # chat_id → whether last session was lost
+
+# Crash context: tracks what the system is doing for richer crash breadcrumbs
+_start_time: float = time.monotonic()
+_crash_context: dict[str, Any] = {}
+
+
+def _set_crash_context(**kwargs: Any) -> None:
+    """Update the crash context with the current operation state."""
+    _crash_context.update(kwargs)
+
+
+def _clear_crash_context(*keys: str) -> None:
+    """Remove keys from crash context when an operation completes."""
+    for k in keys:
+        _crash_context.pop(k, None)
 
 
 _TRIVIAL_WORDS = frozenset(
@@ -348,6 +364,12 @@ async def process(chat_id: str) -> None:
         if not messages:
             return
 
+        _set_crash_context(
+            processing_chat=chat_id,
+            processing_msg_count=len(messages),
+            processing_started=datetime.now(UTC).isoformat(timespec="seconds"),
+        )
+
         # Emit user_message event for event-driven behavior triggers
         word_count = sum(len(m.content.split()) for m in messages)
         db.emit_event("user_message", f'{{"word_count": {word_count}}}')
@@ -460,6 +482,7 @@ async def process(chat_id: str) -> None:
                 # Exponential backoff: 30s, 60s, 120s, ...
                 delay = 30.0 * (2 ** (count - 1))
                 asyncio.get_running_loop().call_later(delay, _dispatch, chat_id)
+            _clear_crash_context("processing_chat", "processing_msg_count", "processing_started")
             return
         finally:
             typing_task.cancel()
@@ -593,6 +616,8 @@ async def process(chat_id: str) -> None:
         # Save conversation state for continuity (non-trivial conversations only)
         if effort != "low":
             _fire_and_forget(asyncio.to_thread(_save_conv_state, messages, result.texts))
+
+        _clear_crash_context("processing_chat", "processing_msg_count", "processing_started")
 
 
 def _extract_topics(messages: list[db.StoredMessage], agent_texts: list[str]) -> list[str]:
@@ -851,6 +876,7 @@ def _on_task_done(task: asyncio.Task[None]) -> None:
     _background_tasks.discard(task)
     if not task.cancelled() and (exc := task.exception()):
         log.error("process() failed", exc_info=exc)
+        _write_crash_breadcrumb(exc, source=f"background_task:{task.get_name()}")
 
 
 def _fire_and_forget(coro: Awaitable[None]) -> None:
@@ -1642,22 +1668,35 @@ def _crash_dir() -> Path:
     return settings.store_dir / _CRASH_DIR_NAME
 
 
-def _write_crash_breadcrumb(exc: BaseException) -> None:
-    """Write a crash breadcrumb file with timestamp and traceback."""
+def _write_crash_breadcrumb(exc: BaseException, *, source: str = "main") -> None:
+    """Write a structured crash breadcrumb with full operational context."""
     import traceback as tb_mod
 
     crash_dir = _crash_dir()
     crash_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%S")
-    crash_file = crash_dir / f"crash-{ts}-{os.getpid()}.txt"
+    crash_file = crash_dir / f"crash-{ts}-{os.getpid()}.json"
+    uptime_s = round(time.monotonic() - _start_time, 1)
+    breadcrumb: dict[str, Any] = {
+        "pid": os.getpid(),
+        "time": datetime.now(UTC).isoformat(),
+        "uptime_s": uptime_s,
+        "git_sha": _get_git_sha(),
+        "source": source,
+        "exception": {
+            "type": type(exc).__name__,
+            "message": str(exc)[:500],
+            "traceback": tb_mod.format_exception(exc),
+        },
+        "context": dict(_crash_context) if _crash_context else {},
+        "state": {
+            "active_locks": list(_active.keys()),
+            "background_tasks": len(_background_tasks),
+            "retry_counts": dict(_retry_counts),
+        },
+    }
     with contextlib.suppress(OSError):
-        crash_file.write_text(
-            f"pid: {os.getpid()}\n"
-            f"time: {datetime.now(UTC).isoformat()}\n"
-            f"type: {type(exc).__name__}\n"
-            f"message: {exc}\n"
-            f"traceback:\n{''.join(tb_mod.format_exception(exc))}\n"
-        )
+        crash_file.write_text(json.dumps(breadcrumb, indent=2, default=str))
 
 
 def _get_last_crash_summary() -> str | None:
@@ -1677,7 +1716,20 @@ def _get_last_crash_summary() -> str | None:
         return None
     try:
         content = crashes[0].read_text()
-        # Extract type and message lines
+        # JSON format (new structured breadcrumbs)
+        if crashes[0].suffix == ".json":
+            data = json.loads(content)
+            exc_info = data.get("exception", {})
+            exc_type = exc_info.get("type", "Unknown")
+            exc_msg = exc_info.get("message", "")
+            source = data.get("source", "unknown")
+            uptime = data.get("uptime_s", "?")
+            ctx = data.get("context", {})
+            summary = f"{exc_type}: {exc_msg[:200]} (source={source}, uptime={uptime}s)"
+            if ctx.get("processing_chat"):
+                summary += f" [processing chat {ctx['processing_chat']}]"
+            return summary
+        # Legacy plain-text format
         lines = content.splitlines()
         exc_type = next(
             (ln.split(": ", 1)[1] for ln in lines if ln.startswith("type: ")), "Unknown"
@@ -1695,7 +1747,8 @@ def _cleanup_old_breadcrumbs() -> None:
         return
     cutoff = time.time() - _CRASH_BREADCRUMB_RETENTION
     for f in crash_dir.iterdir():
-        if f.name.startswith("crash-") and f.stat().st_mtime < cutoff:
+        is_breadcrumb = f.name.startswith("crash-") and f.suffix in (".txt", ".json")
+        if is_breadcrumb and f.stat().st_mtime < cutoff:
             with contextlib.suppress(OSError):
                 f.unlink()
 
