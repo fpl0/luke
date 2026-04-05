@@ -1358,8 +1358,15 @@ async def main() -> None:
         loop.add_signal_handler(sig, _on_signal)
 
     async def _resilient_polling() -> None:
-        """Run polling in a loop, restarting on unexpected exits."""
+        """Run polling in a loop, restarting on unexpected exits.
+
+        Uses exponential backoff (5s → 10s → ... → 300s) when polling
+        dies repeatedly.  Resets to 5s after a stable run (>60s uptime).
+        """
+        backoff = 5.0
+        max_backoff = 300.0  # 5 minutes
         while not shutdown_event.is_set():
+            run_start = time.monotonic()
             try:
                 await dp.start_polling(
                     bot,
@@ -1370,8 +1377,12 @@ async def main() -> None:
                 log.exception("polling_crashed")
             if shutdown_event.is_set():
                 break
-            log.warning("polling_died_restarting", delay=5)
-            await asyncio.sleep(5)
+            # Reset backoff if polling ran stably (>60s)
+            if time.monotonic() - run_start > 60:
+                backoff = 5.0
+            log.warning("polling_died_restarting", delay=backoff)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, max_backoff)
 
     async with asyncio.TaskGroup() as tg:
         tg.create_task(_resilient_polling())
