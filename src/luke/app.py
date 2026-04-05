@@ -1260,6 +1260,7 @@ async def main() -> None:
     )
 
     await _notify_main("Back online.")
+    _guardian_mark_healthy()
 
     # Replay pending messages from before restart
     if settings.chat_id:
@@ -1283,7 +1284,9 @@ async def main() -> None:
         while not shutdown_event.is_set():
             try:
                 await dp.start_polling(
-                    bot, handle_signals=False, close_bot_session=False,
+                    bot,
+                    handle_signals=False,
+                    close_bot_session=False,
                 )
             except Exception:
                 log.exception("polling_crashed")
@@ -1331,6 +1334,37 @@ def _configure_logging() -> None:
         logger_factory=_structlog.PrintLoggerFactory(),
         cache_logger_on_first_use=True,
     )
+
+
+def _guardian_mark_healthy() -> None:
+    """Clear the guardian crash counter on successful startup.
+
+    Called after "Back online." to signal that this commit boots cleanly.
+    The guardian.sh wrapper tracks rapid restarts and auto-reverts if a
+    crash loop is detected — this clears that state.
+    """
+    state_file = settings.store_dir / "guardian_state"
+    try:
+        state_file.write_text("")
+        log.info("guardian_healthy", sha=_get_git_sha())
+    except Exception:
+        pass  # best effort — guardian is a safety net, not critical path
+
+
+def _get_git_sha() -> str:
+    """Return the current short git SHA, or 'unknown'."""
+    import subprocess
+
+    repo_dir = Path(__file__).resolve().parent.parent.parent
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=str(repo_dir),
+            text=True,
+            timeout=5,
+        ).strip()
+    except Exception:
+        return "unknown"
 
 
 _lock_fd: int | None = None
@@ -1391,8 +1425,155 @@ def _acquire_lock() -> None:
     raise SystemExit(1)
 
 
+_CRASH_DIR_NAME = "crashes"
+_CRASH_LOOP_WINDOW = 300  # seconds — 5 minute window
+_CRASH_LOOP_THRESHOLD = 3  # crashes within window triggers rollback
+_KNOWN_GOOD_MARKER = "known_good_commit"
+_STABLE_UPTIME = 300  # seconds before marking commit as "known good"
+
+
+def _crash_dir() -> Path:
+    return settings.store_dir / _CRASH_DIR_NAME
+
+
+def _write_crash_breadcrumb(exc: BaseException) -> None:
+    """Write a crash breadcrumb file with timestamp and traceback."""
+    import traceback as tb_mod
+
+    crash_dir = _crash_dir()
+    crash_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%S")
+    crash_file = crash_dir / f"crash-{ts}-{os.getpid()}.txt"
+    try:
+        crash_file.write_text(
+            f"pid: {os.getpid()}\n"
+            f"time: {datetime.now(UTC).isoformat()}\n"
+            f"type: {type(exc).__name__}\n"
+            f"message: {exc}\n"
+            f"traceback:\n{''.join(tb_mod.format_exception(exc))}\n"
+        )
+    except OSError:
+        pass  # best-effort — don't crash the crash handler
+
+
+def _count_recent_crashes() -> int:
+    """Count crash breadcrumbs within the crash loop window."""
+    crash_dir = _crash_dir()
+    if not crash_dir.is_dir():
+        return 0
+    cutoff = time.time() - _CRASH_LOOP_WINDOW
+    count = 0
+    for f in crash_dir.iterdir():
+        if f.name.startswith("crash-") and f.stat().st_mtime > cutoff:
+            count += 1
+    return count
+
+
+def _get_known_good_commit() -> str | None:
+    """Read the last known-good commit SHA."""
+    marker = settings.store_dir / _KNOWN_GOOD_MARKER
+    if marker.is_file():
+        sha = marker.read_text().strip()
+        return sha if sha else None
+    return None
+
+
+def _mark_known_good() -> None:
+    """Mark the current commit as known-good after stable uptime."""
+    import subprocess
+
+    try:
+        sha = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=Path(__file__).resolve().parent.parent.parent,
+            text=True,
+        ).strip()
+        marker = settings.store_dir / _KNOWN_GOOD_MARKER
+        marker.write_text(sha + "\n")
+        log.info("marked_known_good", sha=sha[:8])
+    except Exception:
+        log.exception("failed_to_mark_known_good")
+
+
+def _auto_rollback() -> bool:
+    """Attempt auto-rollback to the known-good commit. Returns True if rollback was performed."""
+    import subprocess
+
+    repo_dir = Path(__file__).resolve().parent.parent.parent
+    known_good = _get_known_good_commit()
+
+    try:
+        current = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=repo_dir, text=True,
+        ).strip()
+    except Exception:
+        log.exception("rollback_git_failed")
+        return False
+
+    if known_good and known_good != current:
+        target = known_good
+        log.warning("crash_loop_rollback", target=target[:8], current=current[:8])
+    else:
+        # No known-good or same as current — try HEAD~1
+        try:
+            target = subprocess.check_output(
+                ["git", "rev-parse", "HEAD~1"], cwd=repo_dir, text=True,
+            ).strip()
+        except Exception:
+            log.error("rollback_no_target")
+            return False
+
+    try:
+        subprocess.check_call(["git", "checkout", target], cwd=repo_dir)
+        log.warning("rollback_complete", from_sha=current[:8], to_sha=target[:8])
+        # Clean crash breadcrumbs so we don't immediately rollback again
+        _cleanup_crash_breadcrumbs()
+        return True
+    except Exception:
+        log.exception("rollback_checkout_failed")
+        return False
+
+
+def _cleanup_crash_breadcrumbs() -> None:
+    """Remove all crash breadcrumb files."""
+    crash_dir = _crash_dir()
+    if not crash_dir.is_dir():
+        return
+    for f in crash_dir.iterdir():
+        if f.name.startswith("crash-"):
+            with contextlib.suppress(OSError):
+                f.unlink()
+
+
 def cli() -> None:
     """Entry point for `pyproject.toml` [project.scripts]."""
     _configure_logging()
     _acquire_lock()
-    asyncio.run(main())
+
+    # Crash loop detection: check if we've been crashing repeatedly
+    recent_crashes = _count_recent_crashes()
+    if recent_crashes >= _CRASH_LOOP_THRESHOLD:
+        log.critical(
+            "crash_loop_detected",
+            recent_crashes=recent_crashes,
+            window_seconds=_CRASH_LOOP_WINDOW,
+        )
+        if _auto_rollback():
+            log.warning("crash_loop_rollback_done", msg="Restarting with rolled-back code")
+            # Exit so launchd restarts us with the rolled-back code
+            raise SystemExit(2)
+        else:
+            log.error("crash_loop_rollback_failed", msg="Proceeding anyway — manual intervention needed")
+            # Sleep to avoid hammering in a tight crash loop
+            time.sleep(30)
+
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass  # clean shutdown via Ctrl-C
+    except SystemExit:
+        raise  # propagate sys.exit() calls
+    except BaseException as exc:
+        _write_crash_breadcrumb(exc)
+        log.critical("unhandled_crash", error=str(exc), type=type(exc).__name__)
+        raise

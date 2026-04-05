@@ -6,9 +6,7 @@
     <string>com.luke</string>
     <key>ProgramArguments</key>
     <array>
-        <string>__UV_PATH__</string>
-        <string>run</string>
-        <string>luke</string>
+        <string>__PROJECT_ROOT__/guardian.sh</string>
     </array>
     <key>WorkingDirectory</key>
     <string>__PROJECT_ROOT__</string>
