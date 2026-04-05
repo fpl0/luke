@@ -45,7 +45,7 @@ from .memory import (
     recall,
     touch_memories,
 )
-from .scheduler import start_scheduler_loop
+from .scheduler import start_scheduler_loop, write_heartbeat
 
 log: BoundLogger = structlog.get_logger()
 
@@ -1273,6 +1273,7 @@ async def main() -> None:
 
     await _notify_main("Back online.")
     _guardian_mark_healthy()
+    write_heartbeat("online")
     _mark("online")
 
     # Replay pending messages from before restart
