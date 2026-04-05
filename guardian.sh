@@ -60,6 +60,7 @@ if (( crash_count >= MAX_CRASHES )); then
 
     if (( recent_reverts >= 2 )); then
         echo "[guardian $(date -Iseconds)] Too many recent rollbacks ($recent_reverts in 30min) — stopping. Manual fix needed." >&2
+        echo "rollback_limit|$sha||Too many rollbacks ($recent_reverts in 30min) — stopped. Manual fix needed." >> "$LUKE_DIR/crash_notifications"
         # Sleep so launchd doesn't spin
         sleep 600
         exit 1
@@ -71,11 +72,14 @@ if (( crash_count >= MAX_CRASHES )); then
         git push origin main 2>/dev/null || true
         echo "[guardian $(date -Iseconds)] Rolled back $sha → $new_sha" >&2
         echo "$now rolled_back $sha to $new_sha" >> "$ROLLBACK_LOG"
+        # Notify on next startup
+        echo "rollback|$sha|$new_sha|$crash_count crashes in ${WINDOW}s" >> "$LUKE_DIR/crash_notifications"
         # Reset crash state
         : > "$STATE_FILE"
     else
         echo "[guardian $(date -Iseconds)] Revert failed (conflicts?) — stopping. Manual fix needed." >&2
         echo "$now revert_failed $sha" >> "$ROLLBACK_LOG"
+        echo "revert_failed|$sha||Revert failed (conflicts?) — manual fix needed" >> "$LUKE_DIR/crash_notifications"
         sleep 600
         exit 1
     fi

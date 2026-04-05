@@ -39,6 +39,9 @@ age=$(( now - hb_ts ))
 if (( age > MAX_STALE )); then
     log "STALE heartbeat: age=${age}s pid=$hb_pid status=$hb_status — restarting"
 
+    # Notify on next startup
+    echo "watchdog_restart|||Heartbeat stale (${age}s) — watchdog triggered restart" >> "$LUKE_DIR/crash_notifications"
+
     # Try graceful restart via launchctl first
     if launchctl kickstart -k "$SERVICE" 2>/dev/null; then
         log "Restarted via launchctl kickstart"
