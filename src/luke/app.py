@@ -1278,8 +1278,22 @@ async def main() -> None:
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, _on_signal)
 
+    async def _resilient_polling() -> None:
+        """Run polling in a loop, restarting on unexpected exits."""
+        while not shutdown_event.is_set():
+            try:
+                await dp.start_polling(
+                    bot, handle_signals=False, close_bot_session=False,
+                )
+            except Exception:
+                log.exception("polling_crashed")
+            if shutdown_event.is_set():
+                break
+            log.warning("polling_died_restarting", delay=5)
+            await asyncio.sleep(5)
+
     async with asyncio.TaskGroup() as tg:
-        tg.create_task(dp.start_polling(bot))
+        tg.create_task(_resilient_polling())
         tg.create_task(start_scheduler_loop(bot, _sem, shutdown=shutdown_event))
 
         async def _wait_for_shutdown() -> None:
@@ -1292,6 +1306,7 @@ async def main() -> None:
                 await asyncio.gather(*pending, return_exceptions=True)
             log.info("stopping", phase="notify")
             await _notify_main("Going offline.")
+            await bot.session.close()
             log.info("stopped")
 
         tg.create_task(_wait_for_shutdown())
