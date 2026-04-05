@@ -5,8 +5,6 @@ from __future__ import annotations
 import json
 from typing import Any
 
-import pytest
-
 
 class TestEmitEvent:
     def test_emit_returns_id(self, test_db: Any) -> None:
@@ -82,9 +80,7 @@ class TestCountUnconsumedEvents:
         test_db.emit_event("new_episode")
         # Backdate one event
         conn = test_db._db()
-        conn.execute(
-            "UPDATE events SET created = datetime('now', '-30 days') WHERE id = 1"
-        )
+        conn.execute("UPDATE events SET created = datetime('now', '-30 days') WHERE id = 1")
         conn.commit()
         assert test_db.count_unconsumed_events("new_episode", since=None) == 2
 
@@ -231,7 +227,6 @@ class TestCleanupEvents:
         conn.commit()
         removed = test_db.cleanup_events(retention_days=7)
         assert removed == 3
-
 
     def test_removes_stale_unconsumed(self, test_db: Any) -> None:
         """Unconsumed events older than 4x retention are cleaned as a safety net."""

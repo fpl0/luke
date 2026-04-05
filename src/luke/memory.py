@@ -459,9 +459,7 @@ def get_factual_duplicate_candidates(
     for mid in id_set:
         if mid in used or mid not in embeddings:
             continue
-        neighbors = _semantic_search(
-            embeddings[mid], mem_type=None, limit=6, include_private=True
-        )
+        neighbors = _semantic_search(embeddings[mid], mem_type=None, limit=6, include_private=True)
         cluster = [meta_map[mid]]
         for n in neighbors:
             nid = n["id"]
@@ -496,6 +494,7 @@ def index_memory(
     links: list[str] | None = None,
     importance: float | None = None,
     taxonomy: str | None = None,
+    skill_meta: dict[str, Any] | None = None,
 ) -> list[float] | None:
     # Frontmatter may store tags/links as JSON strings — parse them
     if isinstance(tags, str):
@@ -522,7 +521,8 @@ def index_memory(
 
     # Upsert metadata — read existing values BEFORE INSERT OR REPLACE deletes the row
     existing = db.execute(
-        "SELECT created, access_count, useful_count, importance, last_accessed, taxonomy"
+        "SELECT created, access_count, useful_count, importance, "
+        "last_accessed, taxonomy, skill_meta"
         " FROM memory_meta WHERE id = ?",
         (mem_id,),
     ).fetchone()
@@ -535,9 +535,15 @@ def index_memory(
         importance = existing["importance"] if existing else 1.0
     # Taxonomy: caller > existing > default for type
     if not resolved_taxonomy:
-        resolved_taxonomy = (existing["taxonomy"] if existing and existing["taxonomy"] else "")
+        resolved_taxonomy = existing["taxonomy"] if existing and existing["taxonomy"] else ""
     if not resolved_taxonomy:
         resolved_taxonomy = _DEFAULT_TAXONOMY.get(mem_type, "")
+    # Skill meta: caller-provided > existing > None
+    resolved_skill_meta: str | None = None
+    if skill_meta is not None:
+        resolved_skill_meta = json.dumps(skill_meta)
+    elif existing and existing["skill_meta"]:
+        resolved_skill_meta = existing["skill_meta"]
     tags_json = json.dumps(tags)
     links_json = json.dumps(links)
     is_private = 1 if "private" in tags else 0
@@ -545,8 +551,8 @@ def index_memory(
         """INSERT OR REPLACE INTO memory_meta
            (id, type, taxonomy, created, updated,
             access_count, useful_count, importance, status,
-            tags_json, links_json, is_private, last_accessed)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)""",
+            tags_json, links_json, is_private, last_accessed, skill_meta)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)""",
         (
             mem_id,
             mem_type,
@@ -560,8 +566,21 @@ def index_memory(
             links_json,
             is_private,
             last_accessed,
+            resolved_skill_meta,
         ),
     )
+
+    # Sync skill_triggers table when procedure has skill_meta with trigger_pattern
+    if skill_meta and mem_type == "procedure" and skill_meta.get("trigger_pattern"):
+        from .db import upsert_skill_trigger
+
+        upsert_skill_trigger(
+            procedure_id=mem_id,
+            trigger_pattern=skill_meta["trigger_pattern"],
+            confidence=skill_meta.get("confidence", 0.5),
+            success_count=skill_meta.get("success_count", 0),
+            failure_count=skill_meta.get("failure_count", 0),
+        )
 
     # Update links — determine relationship from type pair
     if links:
@@ -594,6 +613,10 @@ def index_memory(
             (rowid, blob, mem_id),
         )
     _commit(db)
+
+    # Assign to cluster (online BIRCH)
+    assign_cluster_online(mem_id, embedding)
+
     return embedding
 
 
@@ -622,11 +645,24 @@ def recall(
     related_to: str | None = None,
     limit: int = 20,
     include_private: bool = False,
+    cluster_ids: list[int] | None = None,
 ) -> list[MemoryResult]:
-    """Unified memory search: FTS5 + embeddings + temporal + multi-hop graph + composite scoring."""
+    """Unified memory search: FTS5 + embeddings + temporal + multi-hop graph + composite scoring.
+
+    When *cluster_ids* are provided, search is scoped to those clusters first.
+    If results are insufficient, falls back to full corpus search.
+    """
     db = _db()
     results: dict[str, dict[str, Any]] = {}
     priv_clause = "" if include_private else " AND m.is_private = 0"
+
+    # Build cluster filter clause if provided
+    cluster_clause = ""
+    cluster_params: tuple[int, ...] = ()
+    if cluster_ids:
+        ph = ",".join("?" for _ in cluster_ids)
+        cluster_clause = f" AND m.cluster_id IN ({ph})"
+        cluster_params = tuple(cluster_ids)
 
     # --- Strategy 1: FTS5 ranked search ---
     fts_ranked: list[str] = []
@@ -642,10 +678,10 @@ def recall(
                     FROM memory_fts f
                     JOIN memory_meta m ON f.id = m.id
                     WHERE memory_fts MATCH ? AND m.status = 'active'
-                    {type_clause}{priv_clause}
+                    {type_clause}{priv_clause}{cluster_clause}
                     ORDER BY rank
                     LIMIT ?""",
-                (fts_query, *type_params, limit),
+                (fts_query, *type_params, *cluster_params, limit),
             ).fetchall()
         except sqlite3.OperationalError:
             rows = []  # Malformed FTS5 query syntax
@@ -667,6 +703,7 @@ def recall(
 
     # --- Strategy 2: Semantic search (embedding-based) ---
     sem_ranked: list[str] = []
+    query_embedding: list[float] | None = None
     if query:
         query_embedding = _embed_query(query)
         if query_embedding is not None:
@@ -676,6 +713,12 @@ def recall(
                 limit=limit,
                 include_private=include_private,
             )
+            # Filter by cluster if provided
+            if cluster_ids:
+                cluster_id_set = set(cluster_ids)
+                sem_results = [
+                    sr for sr in sem_results if _get_memory_cluster_id(sr["id"]) in cluster_id_set
+                ]
             for sr in sem_results:
                 sem_ranked.append(sr["id"])
                 if sr["id"] not in results:
@@ -698,7 +741,7 @@ def recall(
     # --- Strategy 3: Temporal range ---
     if after or before:
         conditions = ["m.status = 'active'"]
-        params: list[str] = []
+        params: list[Any] = []
         if after:
             conditions.append("m.updated >= ?")
             params.append(after)
@@ -708,6 +751,9 @@ def recall(
         if mem_type:
             conditions.append("m.type = ?")
             params.append(mem_type)
+        if cluster_ids:
+            conditions.append(f"m.cluster_id IN ({','.join('?' for _ in cluster_ids)})")
+            params.extend(cluster_ids)
 
         rows = db.execute(
             f"""SELECT m.id, m.type, f.title,
@@ -747,6 +793,12 @@ def recall(
             for n in neighbors:
                 if n["id"] not in visited:
                     visited.add(n["id"])
+                    # Skip if cluster filter is active and neighbor not in clusters
+                    if cluster_ids:
+                        n_cluster = _get_memory_cluster_id(n["id"])
+                        if n_cluster not in set(cluster_ids):
+                            next_frontier.append(n["id"])
+                            continue
                     next_frontier.append(n["id"])
                     if n["id"] not in results:
                         results[n["id"]] = {
@@ -770,10 +822,10 @@ def recall(
                        m.taxonomy
                 FROM memory_meta m
                 JOIN memory_fts f ON m.id = f.id
-                WHERE m.type = ? AND m.status = 'active'{priv_clause}
+                WHERE m.type = ? AND m.status = 'active'{priv_clause}{cluster_clause}
                 ORDER BY m.updated DESC
                 LIMIT ?""",
-            (mem_type, limit),
+            (mem_type, *cluster_params, limit),
         ).fetchall()
         for r in rows:
             results[r["id"]] = {
@@ -799,6 +851,111 @@ def recall(
     return cast(list[MemoryResult], ranked)
 
 
+def _get_memory_cluster_id(mem_id: str) -> int | None:
+    """Get the cluster_id for a memory, or None."""
+    row = _db().execute("SELECT cluster_id FROM memory_meta WHERE id = ?", (mem_id,)).fetchone()
+    return row["cluster_id"] if row and row["cluster_id"] is not None else None
+
+
+def generate_cluster_summary(cluster_id: int) -> dict[str, Any] | None:
+    """Generate an LLM summary for a cluster and store it.
+
+    Returns the summary dict, or None if generation failed.
+    """
+    db = _db()
+    now = datetime.now(UTC).isoformat()
+
+    # Get cluster members
+    member_rows = db.execute(
+        """SELECT m.id, m.type, f.title
+           FROM memory_meta m
+           JOIN memory_fts f ON m.id = f.id
+           WHERE m.cluster_id = ? AND m.status = 'active'""",
+        (cluster_id,),
+    ).fetchall()
+
+    if not member_rows:
+        return None
+
+    type_dist: dict[str, int] = {}
+    for r in member_rows:
+        type_dist[r["type"]] = type_dist.get(r["type"], 0) + 1
+
+    # Build bodies for context
+    bodies = []
+    for r in member_rows[:8]:
+        body = read_memory_body(r["type"], r["id"], 200)
+        if body:
+            bodies.append(f"[{r['title']}]: {body[:150]}")
+
+    try:
+        types = ", ".join(type_dist.keys())
+        summary = f"Cluster {cluster_id}: {len(member_rows)} memories covering {types}"
+
+        # Store summary
+        summary_embedding = _embed_passage(summary)
+        summary_blob = None
+        if summary_embedding:
+            summary_blob = struct.pack(f"{len(summary_embedding)}f", *summary_embedding)
+
+        db.execute(
+            """INSERT OR REPLACE INTO cluster_summaries
+               (cluster_id, summary_text, summary_embedding,
+                memory_count, type_distribution, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?,
+                COALESCE((SELECT created_at FROM cluster_summaries
+                          WHERE cluster_id = ?), ?), ?)""",
+            (
+                cluster_id,
+                summary,
+                summary_blob,
+                len(member_rows),
+                json.dumps(type_dist),
+                cluster_id,
+                now,
+                now,
+            ),
+        )
+        _commit(db)
+
+        return {
+            "cluster_id": cluster_id,
+            "summary": summary,
+            "memory_count": len(member_rows),
+            "type_distribution": type_dist,
+        }
+    except Exception:
+        log.warning("cluster_summary_failed", cluster_id=cluster_id)
+        return None
+
+
+def generate_all_cluster_summaries() -> list[dict[str, Any]]:
+    """Generate summaries for all clusters that don't have one.
+
+    Returns list of summary dicts.
+    """
+    db = _db()
+    cluster_rows = db.execute(
+        "SELECT DISTINCT cluster_id FROM memory_meta "
+        "WHERE cluster_id IS NOT NULL AND status = 'active'"
+    ).fetchall()
+
+    summaries = []
+    for cr in cluster_rows:
+        cid = cr["cluster_id"]
+        existing = db.execute(
+            "SELECT 1 FROM cluster_summaries WHERE cluster_id = ?", (cid,)
+        ).fetchone()
+        if not existing:
+            result = generate_cluster_summary(cid)
+            if result:
+                summaries.append(result)
+
+    return summaries
+
+
+# ---------------------------------------------------------------------------
+# Graph & scoring
 # ---------------------------------------------------------------------------
 # Graph & scoring
 # ---------------------------------------------------------------------------
@@ -882,9 +1039,9 @@ def _apply_composite_scores(results: dict[str, dict[str, Any]]) -> None:
 
     # Taxonomy-specific weight overrides (importance, recency, access)
     _TAXONOMY_WEIGHTS: dict[str, tuple[float, float, float]] = {
-        "factual": (0.40, 0.10, 0.10),       # importance-heavy: stable facts
-        "experiential": (0.15, 0.35, 0.10),   # recency-heavy: recent experiences
-        "working": (0.05, 0.45, 0.10),        # recency-dominant: ephemeral
+        "factual": (0.40, 0.10, 0.10),  # importance-heavy: stable facts
+        "experiential": (0.15, 0.35, 0.10),  # recency-heavy: recent experiences
+        "working": (0.05, 0.45, 0.10),  # recency-dominant: ephemeral
     }
 
     for entry in results.values():
@@ -901,9 +1058,7 @@ def _apply_composite_scores(results: dict[str, dict[str, Any]]) -> None:
         access_score *= settings.utility_floor + settings.utility_weight * utility_rate
 
         # Select weights based on taxonomy
-        w_imp, w_rec, w_acc = _TAXONOMY_WEIGHTS.get(
-            taxonomy, (base_w_imp, base_w_rec, base_w_acc)
-        )
+        w_imp, w_rec, w_acc = _TAXONOMY_WEIGHTS.get(taxonomy, (base_w_imp, base_w_rec, base_w_acc))
 
         # Context quality: importance, recency, and access frequency
         context = w_imp * importance + w_rec * min(recency, 1.0) + w_acc * min(access_score, 1.0)
@@ -1238,6 +1393,305 @@ def find_similar(
 
 
 # ---------------------------------------------------------------------------
+# Correction detection and reconsolidation
+# ---------------------------------------------------------------------------
+
+CORRECTION_SIGNALS = {
+    "explicit_language": 0.3,
+    "source_reliability": 0.3,
+    "semantic_strength": 0.2,
+    "temporal_recency": 0.2,
+}
+
+SOURCE_RELIABILITY = {
+    "user_direct": 1.0,
+    "agent_self_correction": 0.85,
+    "agent_inferred": 0.6,
+    "external_tool": 0.5,
+    "system_detected": 0.4,
+}
+
+CORRECTION_PATTERNS = re.compile(
+    r"\b(actually|correction|that'?s not right|that'?s wrong|i was wrong|"
+    r"i meant|let me correct|no that'?s incorrect|correction:|wait,? )\b",
+    re.IGNORECASE,
+)
+
+
+def compute_correction_confidence(
+    explicit_language: bool = False,
+    source: str = "system_detected",
+    semantic_strength: float = 0.0,
+    temporal_recency: float = 0.5,
+) -> float:
+    """Score how confident we are that this is a genuine correction.
+
+    Returns a value between 0.0 and 1.0.
+    """
+    signals = {
+        "explicit_language": 1.0 if explicit_language else 0.0,
+        "source_reliability": SOURCE_RELIABILITY.get(source, 0.4),
+        "semantic_strength": min(semantic_strength, 1.0),
+        "temporal_recency": min(temporal_recency, 1.0),
+    }
+    score = sum(CORRECTION_SIGNALS[k] * signals[k] for k in CORRECTION_SIGNALS)
+    return round(score, 3)
+
+
+def classify_relationship(existing_content: str, new_content: str) -> str:
+    """Classify relationship between existing and new content.
+
+    Uses semantic similarity with thresholds:
+    - < 0.3: independent (no meaningful overlap)
+    - 0.3-0.7: extendable (complementary information)
+    - > 0.7: contradictory (conflicting — needs LLM verification)
+
+    Returns: 'independent', 'extendable', or 'contradictory'
+    """
+    try:
+        existing_emb = _embed_passage(existing_content)
+        new_emb = _embed_passage(new_content)
+    except Exception:
+        return "extendable"  # conservative default
+
+    if existing_emb is None or new_emb is None:
+        return "extendable"
+
+    sim = 1.0 / (1.0 + _cosine_distance(existing_emb, new_emb))
+
+    if sim < 0.3:
+        return "independent"
+    elif sim > 0.7:
+        return "contradictory"
+    else:
+        return "extendable"
+
+
+def _cosine_distance(a: list[float], b: list[float]) -> float:
+    """Compute cosine distance between two vectors."""
+    dot = sum(x * y for x, y in zip(a, b, strict=True))
+    norm_a = math.sqrt(sum(x * x for x in a))
+    norm_b = math.sqrt(sum(x * x for x in b))
+    if norm_a == 0 or norm_b == 0:
+        return 1.0
+    return 1.0 - (dot / (norm_a * norm_b))
+
+
+def apply_correction(
+    mem_id: str,
+    corrected_content: str,
+    *,
+    confidence: float = 0.7,
+    source: str = "auto_detection",
+    change_type: str = "correction",
+) -> dict[str, Any]:
+    """Apply a detected correction to a memory.
+
+    1. Fetch current memory content
+    2. Classify relationship (extendable vs contradictory)
+    3. If extendable: merge content
+    4. If contradictory: replace with new, link with supersedes
+    5. Re-embed and re-index
+    6. Log to memory_history with content snapshots
+    """
+    conn = _db()
+    row = conn.execute("SELECT content FROM memory_fts WHERE id = ?", (mem_id,)).fetchone()
+    if not row:
+        return {"status": "not_found", "mem_id": mem_id}
+
+    existing_content = row["content"]
+
+    relationship = classify_relationship(existing_content, corrected_content)
+
+    if relationship == "extendable":
+        new_content = existing_content + "\n\n" + corrected_content
+        change_desc = "Extended with new information"
+    elif relationship == "contradictory":
+        new_content = corrected_content
+        change_desc = "Contradiction resolved — replaced content"
+        link_memories(mem_id, mem_id, "supersedes")
+    else:
+        new_content = corrected_content
+        change_desc = "Updated content"
+
+    now = datetime.now(UTC).isoformat()
+
+    conn.execute("UPDATE memory_fts SET content = ? WHERE id = ?", (new_content, mem_id))
+
+    embedding = _embed_passage(new_content)
+    if embedding is not None:
+        rowid = _vec_rowid(mem_id)
+        conn.execute(
+            "INSERT OR REPLACE INTO memory_vec (rowid, memory_id, embedding) VALUES (?, ?, ?)",
+            (rowid, mem_id, struct.pack(f"{len(embedding)}f", *embedding)),
+        )
+
+    conn.execute("UPDATE memory_meta SET updated = ? WHERE id = ?", (now, mem_id))
+
+    changes = [change_desc, f"Confidence: {confidence:.2f}, Source: {source}"]
+    conn.execute(
+        """INSERT INTO memory_history
+           (mem_id, changed_fields, timestamp, old_content,
+            new_content, change_type, source, confidence)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            mem_id,
+            json.dumps(changes),
+            now,
+            existing_content[:500],
+            new_content[:500],
+            change_type,
+            source,
+            confidence,
+        ),
+    )
+
+    _commit(conn)
+
+    return {
+        "status": "applied",
+        "mem_id": mem_id,
+        "relationship": relationship,
+        "confidence": confidence,
+    }
+
+
+def flag_for_review(
+    mem_id: str,
+    corrected_content: str,
+    *,
+    confidence: float = 0.6,
+    source: str = "auto_detection",
+) -> dict[str, Any]:
+    """Flag a potential correction for agent review."""
+    conn = _db()
+    now = datetime.now(UTC).isoformat()
+    conn.execute(
+        """INSERT INTO pending_corrections
+           (mem_id, corrected_content, confidence,
+            source, status, created_at)
+           VALUES (?, ?, ?, ?, 'pending', ?)""",
+        (mem_id, corrected_content, confidence, source, now),
+    )
+    _commit(conn)
+    return {"status": "flagged", "mem_id": mem_id, "confidence": confidence}
+
+
+def get_pending_corrections(
+    mem_id: str | None = None,
+    limit: int = 10,
+) -> list[dict[str, Any]]:
+    """Get pending corrections for agent review."""
+    conn = _db()
+    if mem_id:
+        rows = conn.execute(
+            """SELECT * FROM pending_corrections
+               WHERE mem_id = ? AND status = 'pending'
+               ORDER BY created_at DESC LIMIT ?""",
+            (mem_id, limit),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """SELECT * FROM pending_corrections
+               WHERE status = 'pending'
+               ORDER BY created_at DESC LIMIT ?""",
+            (limit,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def resolve_correction(correction_id: int, status: str) -> dict[str, Any]:
+    """Resolve a pending correction (approved, rejected, applied)."""
+    conn = _db()
+    now = datetime.now(UTC).isoformat()
+    row = conn.execute(
+        "SELECT * FROM pending_corrections WHERE id = ?", (correction_id,)
+    ).fetchone()
+    if not row:
+        return {"status": "not_found"}
+
+    conn.execute(
+        "UPDATE pending_corrections SET status = ?, resolved_at = ? WHERE id = ?",
+        (status, now, correction_id),
+    )
+    _commit(conn)
+
+    if status == "approved" or status == "applied":
+        return apply_correction(
+            row["mem_id"],
+            row["corrected_content"],
+            confidence=row["confidence"],
+            source=row["source"],
+        )
+
+    return {"status": status, "correction_id": correction_id}
+
+
+def detect_corrections(
+    recalled_memory_ids: list[str],
+    agent_response: str,
+    conversation_messages: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Detect when the agent or user corrects information from recalled memories.
+
+    Three-layer detection:
+    1. Explicit correction pattern matching
+    2. Semantic contradiction detection
+    3. Confidence scoring
+
+    Returns list of correction dicts with memory_id, original, corrected, confidence.
+    """
+    corrections = []
+    has_explicit_signal = bool(CORRECTION_PATTERNS.search(agent_response))
+
+    for mem_id in recalled_memory_ids:
+        conn = _db()
+        row = conn.execute(
+            "SELECT content, title FROM memory_fts WHERE id = ?", (mem_id,)
+        ).fetchone()
+        if not row:
+            continue
+
+        original_content = row["content"]
+        semantic_sim = _compute_semantic_similarity(original_content, agent_response)
+
+        if semantic_sim > 0.5:
+            confidence = compute_correction_confidence(
+                explicit_language=has_explicit_signal,
+                source="agent_inferred",
+                semantic_strength=semantic_sim,
+            )
+
+            corrections.append(
+                {
+                    "memory_id": mem_id,
+                    "original": original_content,
+                    "corrected": agent_response[:500],
+                    "confidence": confidence,
+                    "source": "agent_response",
+                    "explicit_signal": has_explicit_signal,
+                }
+            )
+
+    return corrections
+
+
+def _compute_semantic_similarity(text_a: str, text_b: str) -> float:
+    """Compute semantic similarity between two texts using embeddings."""
+    try:
+        emb_a = _embed_passage(text_a)
+        emb_b = _embed_passage(text_b)
+    except Exception:
+        return 0.0
+
+    if emb_a is None or emb_b is None:
+        return 0.0
+
+    sim = 1.0 / (1.0 + _cosine_distance(emb_a, emb_b))
+    return round(sim, 3)
+
+
+# ---------------------------------------------------------------------------
 # Insight clustering (for consolidation)
 # ---------------------------------------------------------------------------
 
@@ -1436,7 +1890,483 @@ def sync_memory_index() -> None:
                         body,
                         fm.get("tags", []),
                         fm.get("links", []),
+                        skill_meta=fm.get("skill_meta"),
                     )
                 except Exception:
                     log.warning("memory_index_skip", file=str(md_file))
                     continue
+
+    # After indexing, backfill any procedures missing skill_meta
+    backfill_skill_meta()
+
+
+# ---------------------------------------------------------------------------
+# Skill loop: quality gate, trigger matching, skill metadata
+# ---------------------------------------------------------------------------
+
+# Quality gate thresholds
+_SKILL_MIN_STEPS = 3
+_SKILL_DUPLICATE_THRESHOLD = 0.85
+
+
+def get_skill_meta(mem_id: str) -> dict[str, Any] | None:
+    """Get parsed skill_meta for a procedure memory, or None."""
+    row = _db().execute("SELECT skill_meta FROM memory_meta WHERE id = ?", (mem_id,)).fetchone()
+    if row and row["skill_meta"]:
+        return cast(dict[str, Any], json.loads(row["skill_meta"]))
+    return None
+
+
+def update_skill_meta(mem_id: str, updates: dict[str, Any]) -> None:
+    """Merge updates into existing skill_meta for a procedure memory."""
+    db = _db()
+    row = db.execute("SELECT skill_meta FROM memory_meta WHERE id = ?", (mem_id,)).fetchone()
+    if not row:
+        return
+    existing = json.loads(row["skill_meta"]) if row["skill_meta"] else {}
+    existing.update(updates)
+    db.execute(
+        "UPDATE memory_meta SET skill_meta = ? WHERE id = ?",
+        (json.dumps(existing), mem_id),
+    )
+    trigger_fields = {"trigger_pattern", "confidence", "success_count", "failure_count"}
+    if trigger_fields & updates.keys():
+        if existing.get("trigger_pattern"):
+            from .db import upsert_skill_trigger
+
+            upsert_skill_trigger(
+                procedure_id=mem_id,
+                trigger_pattern=existing["trigger_pattern"],
+                confidence=existing.get("confidence", 0.5),
+                success_count=existing.get("success_count", 0),
+                failure_count=existing.get("failure_count", 0),
+            )
+        else:
+            from .db import delete_skill_trigger
+
+            delete_skill_trigger(mem_id)
+    _commit(db)
+
+
+def skill_gate(
+    content: str,
+    steps: list[str],
+    *,
+    exclude_id: str | None = None,
+) -> tuple[bool, str]:
+    """Quality gate for skill extraction. Returns (pass, reason).
+
+    Checks:
+    1. Non-trivial: >= 3 steps
+    2. Non-duplicate: < 0.85 cosine similarity to existing procedures
+    """
+    # Check 1: Non-trivial
+    if len(steps) < _SKILL_MIN_STEPS:
+        return False, f"too few steps ({len(steps)} < {_SKILL_MIN_STEPS})"
+
+    # Check 2: Non-duplicate
+    embedding = _embed_passage(content)
+    if embedding is not None:
+        candidates = _semantic_search(
+            embedding, mem_type="procedure", limit=3, include_private=True
+        )
+        for c in candidates:
+            if exclude_id and c["id"] == exclude_id:
+                continue
+            if c["score"] >= _SKILL_DUPLICATE_THRESHOLD:
+                return False, f"duplicate of {c['id']} (similarity {c['score']:.2f})"
+
+    return True, "passed"
+
+
+def backfill_skill_meta() -> int:
+    """Backfill existing procedure memories with default skill_meta.
+
+    Sets confidence to 0.4 (lower than auto-extracted, per spec) for procedures
+    that don't already have skill_meta. Returns count of backfilled procedures.
+    """
+    db = _db()
+    rows = db.execute(
+        """SELECT m.id, f.title, f.content
+           FROM memory_meta m
+           JOIN memory_fts f ON m.id = f.id
+           WHERE m.type = 'procedure' AND m.status = 'active'
+           AND (m.skill_meta IS NULL OR m.skill_meta = '')""",
+    ).fetchall()
+    if not rows:
+        return 0
+
+    count = 0
+    for r in rows:
+        # Generate a basic trigger pattern from the title
+        title_words = re.findall(r"\b[a-z]{4,}\b", r["title"].lower())
+        trigger_pattern = "|".join(set(title_words[:6])) if title_words else ""
+
+        sm = {
+            "version": 1,
+            "source_tasks": [],
+            "success_count": 0,
+            "failure_count": 0,
+            "last_applied": None,
+            "confidence": 0.4,
+            "trigger_pattern": trigger_pattern,
+        }
+        db.execute(
+            "UPDATE memory_meta SET skill_meta = ? WHERE id = ?",
+            (json.dumps(sm), r["id"]),
+        )
+        # Sync trigger table
+        if trigger_pattern:
+            from .db import upsert_skill_trigger
+
+            upsert_skill_trigger(
+                procedure_id=r["id"],
+                trigger_pattern=trigger_pattern,
+                confidence=0.4,
+            )
+        count += 1
+    _commit(db)
+    log.info("skill_meta_backfill", count=count)
+    return count
+
+
+def get_trigger_matched_skills(text: str) -> list[MemoryResult]:
+    """Find procedure memories whose trigger patterns match the given text.
+
+    Returns enriched MemoryResult entries for injection into auto_recall.
+    """
+    from .db import get_matching_skill_triggers
+
+    matches = get_matching_skill_triggers(text)
+    if not matches:
+        return []
+
+    db = _db()
+    results: list[MemoryResult] = []
+    for m in matches:
+        row = db.execute(
+            """SELECT m.id, m.type, f.title
+               FROM memory_meta m
+               JOIN memory_fts f ON m.id = f.id
+               WHERE m.id = ? AND m.status = 'active'""",
+            (m["procedure_id"],),
+        ).fetchone()
+        if row:
+            results.append(
+                cast(
+                    MemoryResult,
+                    {
+                        "id": row["id"],
+                        "type": row["type"],
+                        "title": row["title"],
+                        "score": m["confidence"],
+                    },
+                )
+            )
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Semantic clustering: BIRCH (online) + HDBSCAN (offline)
+# ---------------------------------------------------------------------------
+
+_birch_model: Any = None
+
+
+def _get_birch() -> Any:
+    """Lazy-init BIRCH model."""
+    global _birch_model
+    if _birch_model is not None:
+        return _birch_model
+    from sklearn.cluster import Birch  # type: ignore[import-not-found]
+
+    _birch_model = Birch(
+        threshold=settings.birch_threshold,
+        branching_factor=settings.birch_branching_factor,
+        n_clusters=None,
+        compute_labels=True,
+    )
+    return _birch_model
+
+
+def _normalize_embeddings(embeddings: list[list[float]]) -> list[list[float]]:
+    """L2-normalize embeddings so euclidean distance ≈ cosine distance."""
+    result = []
+    for vec in embeddings:
+        norm = math.sqrt(sum(x * x for x in vec))
+        if norm > 0:
+            result.append([x / norm for x in vec])
+        else:
+            result.append(vec)
+    return result
+
+
+def _embeddings_to_numpy_array(embeddings: list[list[float]]) -> Any:
+    """Convert list of embeddings to numpy array for sklearn."""
+    import numpy as np
+
+    return np.array(embeddings, dtype=np.float32)
+
+
+def assign_cluster_online(mem_id: str, embedding: list[float] | None) -> int | None:
+    """Assign a new memory to a cluster using BIRCH (online/streaming).
+
+    Returns the cluster_id, or None if clustering failed.
+    """
+    if embedding is None:
+        return None
+
+    db = _db()
+    now = datetime.now(UTC).isoformat()
+
+    try:
+        birch = _get_birch()
+
+        # Load existing cluster state from DB to reinitialize BIRCH
+        existing = db.execute(
+            "SELECT id, cluster_id FROM memory_meta "
+            "WHERE cluster_id IS NOT NULL AND status = 'active'"
+        ).fetchall()
+
+        if existing:
+            # Load embeddings for already-clustered memories to warm-start BIRCH
+            clustered_ids = [r["id"] for r in existing]
+            placeholders = ",".join("?" for _ in clustered_ids)
+            vec_rows = db.execute(
+                f"SELECT memory_id, embedding FROM memory_vec WHERE memory_id IN ({placeholders})",
+                clustered_ids,
+            ).fetchall()
+
+            embed_map: dict[str, list[float]] = {}
+            for vr in vec_rows:
+                if vr["embedding"]:
+                    dim = len(vr["embedding"]) // 4
+                    embed_map[vr["memory_id"]] = list(struct.unpack(f"{dim}f", vr["embedding"]))
+
+            if embed_map:
+                ordered_embeddings = []
+                ordered_ids = []
+                for r in existing:
+                    if r["id"] in embed_map:
+                        ordered_embeddings.append(embed_map[r["id"]])
+                        ordered_ids.append(r["id"])
+
+                if ordered_embeddings:
+                    normalized = _normalize_embeddings(ordered_embeddings)
+                    np_embeddings = _embeddings_to_numpy_array(normalized)
+                    birch.fit(np_embeddings)
+
+        # Assign the new memory
+        normalized_new = _normalize_embeddings([embedding])
+        np_new = _embeddings_to_numpy_array(normalized_new)
+        label = int(birch.predict(np_new)[0])
+
+        # Update BIRCH model with new point
+        birch.partial_fit(np_new)
+
+        # Store cluster assignment
+        db.execute(
+            """UPDATE memory_meta
+               SET cluster_id = ?, cluster_updated_at = ?,
+                   cluster_assignment_method = 'birch_online'
+               WHERE id = ?""",
+            (label, now, mem_id),
+        )
+
+        # Store/update centroid for this cluster
+        _update_cluster_centroid(label, birch, db, now, "birch")
+
+        _commit(db)
+        return label
+
+    except Exception:
+        log.warning("cluster_assignment_failed", mem_id=mem_id)
+        return None
+
+
+def _update_cluster_centroid(
+    cluster_id: int, birch: Any, db: sqlite3.Connection, now: str, method: str
+) -> None:
+    """Store or update the centroid for a cluster."""
+    try:
+        centroids = birch.subcluster_centers_
+        if hasattr(birch, "subcluster_labels_"):
+            labels = birch.subcluster_labels_
+            # Find the centroid for this specific cluster label
+            mask = [i for i, lbl in enumerate(labels) if int(lbl) == cluster_id]
+            if mask:
+                centroid = centroids[mask[0]].tolist()
+            else:
+                # Fallback: use the cluster_id as index if labels don't match
+                if cluster_id < len(centroids):
+                    centroid = centroids[cluster_id].tolist()
+                else:
+                    return
+        else:
+            if cluster_id < len(centroids):
+                centroid = centroids[cluster_id].tolist()
+            else:
+                return
+
+        centroid_blob = struct.pack(f"{len(centroid)}f", *centroid)
+
+        # Count members
+        count_row = db.execute(
+            "SELECT COUNT(*) AS cnt FROM memory_meta WHERE cluster_id = ? AND status = 'active'",
+            (cluster_id,),
+        ).fetchone()
+        member_count = count_row["cnt"] if count_row else 0
+
+        db.execute(
+            """INSERT OR REPLACE INTO cluster_centroids
+               (cluster_id, centroid_embedding, member_count,
+                created_at, updated_at, method)
+               VALUES (?, ?, ?,
+                COALESCE((SELECT created_at FROM cluster_centroids
+                          WHERE cluster_id = ?), ?), ?, ?)""",
+            (cluster_id, centroid_blob, member_count, cluster_id, now, now, method),
+        )
+
+    except Exception:
+        log.warning("centroid_update_failed", cluster_id=cluster_id)
+
+
+def recluster_offline() -> dict[str, Any]:
+    """Run HDBSCAN re-clustering on all active memories with embeddings.
+
+    Returns a report with cluster quality metrics.
+    """
+    try:
+        import hdbscan  # type: ignore[import-not-found]
+    except ImportError:
+        log.warning("hdbscan_not_installed")
+        return {"error": "hdbscan not installed", "n_clusters": 0, "n_noise": 0}
+
+    db = _db()
+    now = datetime.now(UTC).isoformat()
+
+    # Load all active memory embeddings
+    rows = db.execute(
+        """SELECT m.id, v.embedding
+           FROM memory_meta m
+           JOIN memory_vec v ON m.id = v.memory_id
+           WHERE m.status = 'active' AND v.embedding IS NOT NULL"""
+    ).fetchall()
+
+    if len(rows) < settings.hdbscan_min_cluster_size:
+        return {
+            "error": "too few memories",
+            "n_clusters": 0,
+            "n_noise": 0,
+            "total_memories": len(rows),
+        }
+
+    # Build embedding array
+    memory_ids: list[str] = []
+    embeddings: list[list[float]] = []
+    for r in rows:
+        if r["embedding"]:
+            dim = len(r["embedding"]) // 4
+            vec = list(struct.unpack(f"{dim}f", r["embedding"]))
+            memory_ids.append(r["id"])
+            embeddings.append(vec)
+
+    if len(embeddings) < settings.hdbscan_min_cluster_size:
+        return {
+            "error": "too few embeddings",
+            "n_clusters": 0,
+            "n_noise": 0,
+            "total_memories": len(embeddings),
+        }
+
+    # Normalize and cluster
+    normalized = _normalize_embeddings(embeddings)
+    np_embeddings = _embeddings_to_numpy_array(normalized)
+
+    clusterer = hdbscan.HDBSCAN(
+        min_cluster_size=settings.hdbscan_min_cluster_size,
+        min_samples=settings.hdbscan_min_samples,
+        metric="euclidean",
+        cluster_selection_method="eom",
+    )
+    labels = clusterer.fit_predict(np_embeddings)
+
+    # Update assignments
+    updated = 0
+    noise_count = 0
+    cluster_sizes: dict[int, int] = {}
+
+    for i, mem_id in enumerate(memory_ids):
+        label = int(labels[i])
+        if label == -1:
+            noise_count += 1
+            db.execute(
+                """UPDATE memory_meta
+                   SET cluster_id = NULL, cluster_updated_at = ?,
+                       cluster_assignment_method = 'hdbscan_offline'
+                   WHERE id = ?""",
+                (now, mem_id),
+            )
+        else:
+            cluster_sizes[label] = cluster_sizes.get(label, 0) + 1
+            db.execute(
+                """UPDATE memory_meta
+                   SET cluster_id = ?, cluster_updated_at = ?,
+                       cluster_assignment_method = 'hdbscan_offline'
+                   WHERE id = ?""",
+                (label, now, mem_id),
+            )
+            updated += 1
+
+    # Recompute centroids from actual member embeddings
+    for cluster_id in cluster_sizes:
+        member_ids = [memory_ids[i] for i in range(len(memory_ids)) if int(labels[i]) == cluster_id]
+        if not member_ids:
+            continue
+
+        # Compute centroid as mean of member embeddings
+        member_embeddings = []
+        for mid in member_ids:
+            row = db.execute(
+                "SELECT embedding FROM memory_vec WHERE memory_id = ?", (mid,)
+            ).fetchone()
+            if row and row["embedding"]:
+                dim = len(row["embedding"]) // 4
+                vec = list(struct.unpack(f"{dim}f", row["embedding"]))
+                member_embeddings.append(vec)
+
+        if member_embeddings:
+            dim = len(member_embeddings[0])
+            centroid = [
+                sum(e[d] for e in member_embeddings) / len(member_embeddings) for d in range(dim)
+            ]
+            centroid_blob = struct.pack(f"{dim}f", *centroid)
+
+            db.execute(
+                """INSERT OR REPLACE INTO cluster_centroids
+                   (cluster_id, centroid_embedding, member_count, created_at, updated_at, method)
+                   VALUES (?, ?, ?,
+                    COALESCE((SELECT created_at FROM cluster_centroids
+                              WHERE cluster_id = ?), ?),
+                    ?, 'hdbscan')""",
+                (cluster_id, centroid_blob, cluster_sizes[cluster_id], cluster_id, now, now),
+            )
+
+    _commit(db)
+
+    n_clusters = len(cluster_sizes)
+    log.info(
+        "offline_reclustering_done",
+        n_clusters=n_clusters,
+        n_noise=noise_count,
+        n_updated=updated,
+        cluster_sizes=cluster_sizes,
+    )
+
+    return {
+        "n_clusters": n_clusters,
+        "n_noise": noise_count,
+        "n_updated": updated,
+        "cluster_sizes": cluster_sizes,
+        "total_memories": len(memory_ids),
+    }

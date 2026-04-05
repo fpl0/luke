@@ -36,7 +36,11 @@ from .media import build_prompt, extract_frame, transcribe
 from .memory import (
     MEMORY_DIRS,
     MemoryResult,
+    apply_correction,
+    detect_corrections,
+    flag_for_review,
     get_graph_neighbors,
+    get_trigger_matched_skills,
     read_frontmatter,
     recall,
     touch_memories,
@@ -111,9 +115,28 @@ _COMPLEX_KEYWORDS: frozenset[str] = frozenset(
 # Coding keywords force opus regardless of message length
 _CODE_KEYWORDS: frozenset[str] = frozenset(
     {
-        "code", "fix", "bug", "debug", "refactor", "deploy", "test", "script",
-        "function", "class", "error", "exception", "traceback", "commit", "merge",
-        "pr", "pull request", "api", "endpoint", "database", "migration", "schema",
+        "code",
+        "fix",
+        "bug",
+        "debug",
+        "refactor",
+        "deploy",
+        "test",
+        "script",
+        "function",
+        "class",
+        "error",
+        "exception",
+        "traceback",
+        "commit",
+        "merge",
+        "pr",
+        "pull request",
+        "api",
+        "endpoint",
+        "database",
+        "migration",
+        "schema",
     }
 )
 
@@ -237,14 +260,42 @@ async def _get_conversation_state(chat_id: str) -> str:
 
 
 async def _auto_recall(combined_text: str, chat_id: str) -> tuple[str, list[MemoryResult]]:
-    """Run memory recall + graph augmentation. Returns (formatted_context, raw_memories)."""
+    """Run memory recall + graph augmentation + skill trigger matching.
+
+    Trigger-matched skills get a guaranteed slot (displacing the lowest-scoring
+    non-skill memory if the limit is reached).
+    """
     recall_start = time.monotonic()
-    # Runs in thread — embedding inference is CPU-bound
-    memories = await asyncio.to_thread(
-        recall,
-        query=combined_text,
-        limit=settings.auto_recall_limit,
+    # Run recall and trigger matching concurrently
+    memories, trigger_skills = await asyncio.gather(
+        asyncio.to_thread(recall, query=combined_text, limit=settings.auto_recall_limit),
+        asyncio.to_thread(get_trigger_matched_skills, combined_text),
     )
+
+    def is_skill_memory(memory_result: MemoryResult) -> bool:
+        if memory_result.get("type") != "procedure":
+            return False
+        path = settings.memory_dir / MEMORY_DIRS["procedure"] / f"{memory_result['id']}.md"
+        tags = read_frontmatter(path).get("tags", [])
+        return isinstance(tags, list) and ("skill" in tags or "auto-extracted" in tags)
+
+    # Guarantee trigger-matched skills a slot in the recall results
+    seen_ids = {m["id"] for m in memories}
+    for skill in trigger_skills:
+        if skill["id"] not in seen_ids:
+            if len(memories) >= settings.auto_recall_limit:
+                non_skill_indexes = [
+                    idx
+                    for idx, memory_result in enumerate(memories)
+                    if not is_skill_memory(memory_result)
+                ]
+                if not non_skill_indexes:
+                    continue
+                drop_idx = min(non_skill_indexes, key=lambda idx: memories[idx].get("score", 0))
+                memories.pop(drop_idx)
+            memories.append(skill)
+            seen_ids.add(skill["id"])
+
     memory_context = ""
     seen: set[str] = set()
     if memories:
@@ -270,6 +321,7 @@ async def _auto_recall(combined_text: str, chat_id: str) -> tuple[str, list[Memo
         duration_ms=recall_ms,
         count=len(all_ids),
         ids=all_ids,
+        trigger_skills=len(trigger_skills),
     )
     return memory_context, memories
 
@@ -418,7 +470,10 @@ async def process(chat_id: str) -> None:
         # Single commit for cost log + cursor advance
         with db.batch():
             db.log_cost(
-                chat_id, result.cost_usd, result.num_turns, result.duration_api_ms,
+                chat_id,
+                result.cost_usd,
+                result.num_turns,
+                result.duration_api_ms,
                 f"message:{model}",
             )
             # Advance cursor only after successful agent run
@@ -435,6 +490,51 @@ async def process(chat_id: str) -> None:
             referenced = [mid for mid in recalled_ids if mid in found]
             if referenced:
                 _fire_and_forget(asyncio.to_thread(touch_memories, referenced, useful_only=True))
+
+        # Memory reconsolidation: detect and apply corrections
+        if _recalled and result.texts:
+            recalled_ids = [m["id"] for m in _recalled]
+            combined_response = " ".join(result.texts)
+            corrections = detect_corrections(recalled_ids, combined_response)
+            for correction in corrections:
+                confidence = correction["confidence"]
+                mem_id = correction["memory_id"]
+                corrected = correction["corrected"]
+                src = correction["source"]
+                if confidence >= 0.7:
+
+                    async def _apply_corr(
+                        _mid: str = mem_id,
+                        _cor: str = corrected,
+                        _conf: float = confidence,
+                        _src: str = src,
+                    ) -> None:
+                        await asyncio.to_thread(
+                            apply_correction,
+                            _mid,
+                            _cor,
+                            confidence=_conf,
+                            source=_src,
+                        )
+
+                    _fire_and_forget(_apply_corr())
+                elif confidence >= 0.5:
+
+                    async def _flag_corr(
+                        _mid: str = mem_id,
+                        _cor: str = corrected,
+                        _conf: float = confidence,
+                        _src: str = src,
+                    ) -> None:
+                        await asyncio.to_thread(
+                            flag_for_review,
+                            _mid,
+                            _cor,
+                            confidence=_conf,
+                            source=_src,
+                        )
+
+                    _fire_and_forget(_flag_corr())
 
         # Session loss detection
         if session_id and result.session_id != session_id:
@@ -482,21 +582,141 @@ def _extract_topics(messages: list[db.StoredMessage], agent_texts: list[str]) ->
         all_text += " " + " ".join(t.lower() for t in agent_texts)
     # Simple stopword filter + word frequency
     stopwords = {
-        "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
-        "have", "has", "had", "do", "does", "did", "will", "would", "could",
-        "should", "may", "might", "shall", "can", "need", "dare", "ought",
-        "used", "to", "of", "in", "for", "on", "with", "at", "by", "from",
-        "as", "into", "through", "during", "before", "after", "above", "below",
-        "between", "out", "off", "over", "under", "again", "further", "then",
-        "once", "here", "there", "when", "where", "why", "how", "all", "each",
-        "every", "both", "few", "more", "most", "other", "some", "such", "no",
-        "not", "only", "own", "same", "so", "than", "too", "very", "just",
-        "don", "now", "and", "but", "or", "if", "that", "this", "it", "i",
-        "you", "he", "she", "we", "they", "me", "him", "her", "us", "them",
-        "my", "your", "his", "its", "our", "their", "what", "which", "who",
-        "whom", "these", "those", "am", "about", "up", "like", "yeah", "ok",
-        "okay", "hey", "hi", "um", "uh", "well", "got", "get", "going",
-        "thing", "things", "want", "think", "know", "see", "look", "make",
+        "the",
+        "a",
+        "an",
+        "is",
+        "are",
+        "was",
+        "were",
+        "be",
+        "been",
+        "being",
+        "have",
+        "has",
+        "had",
+        "do",
+        "does",
+        "did",
+        "will",
+        "would",
+        "could",
+        "should",
+        "may",
+        "might",
+        "shall",
+        "can",
+        "need",
+        "dare",
+        "ought",
+        "used",
+        "to",
+        "of",
+        "in",
+        "for",
+        "on",
+        "with",
+        "at",
+        "by",
+        "from",
+        "as",
+        "into",
+        "through",
+        "during",
+        "before",
+        "after",
+        "above",
+        "below",
+        "between",
+        "out",
+        "off",
+        "over",
+        "under",
+        "again",
+        "further",
+        "then",
+        "once",
+        "here",
+        "there",
+        "when",
+        "where",
+        "why",
+        "how",
+        "all",
+        "each",
+        "every",
+        "both",
+        "few",
+        "more",
+        "most",
+        "other",
+        "some",
+        "such",
+        "no",
+        "not",
+        "only",
+        "own",
+        "same",
+        "so",
+        "than",
+        "too",
+        "very",
+        "just",
+        "don",
+        "now",
+        "and",
+        "but",
+        "or",
+        "if",
+        "that",
+        "this",
+        "it",
+        "i",
+        "you",
+        "he",
+        "she",
+        "we",
+        "they",
+        "me",
+        "him",
+        "her",
+        "us",
+        "them",
+        "my",
+        "your",
+        "his",
+        "its",
+        "our",
+        "their",
+        "what",
+        "which",
+        "who",
+        "whom",
+        "these",
+        "those",
+        "am",
+        "about",
+        "up",
+        "like",
+        "yeah",
+        "ok",
+        "okay",
+        "hey",
+        "hi",
+        "um",
+        "uh",
+        "well",
+        "got",
+        "get",
+        "going",
+        "thing",
+        "things",
+        "want",
+        "think",
+        "know",
+        "see",
+        "look",
+        "make",
     }
     words = [w for w in all_text.split() if len(w) > 2 and w.isalpha() and w not in stopwords]
     counter = Counter(words)
@@ -506,7 +726,11 @@ def _extract_topics(messages: list[db.StoredMessage], agent_texts: list[str]) ->
 def _extract_pending_actions(agent_texts: list[str]) -> list[str]:
     """Extract pending actions from agent responses."""
     patterns = [
-        r"(?:I'll|I will|I'm going to|next step[s]?[:\s]|still need to|working on|TODO:?|remaining:?|will follow up)\s*(.{10,100}?)(?:\.|$|\n)",
+        (
+            r"(?:I'll|I will|I'm going to|next step[s]?[:\s]|still need to|"
+            r"working on|TODO:?|remaining:?|will follow up)\s*"
+            r"(.{10,100}?)(?:\.|$|\n)"
+        ),
     ]
     actions: list[str] = []
     combined = " ".join(agent_texts)

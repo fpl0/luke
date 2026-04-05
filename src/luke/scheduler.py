@@ -23,6 +23,7 @@ from .behaviors import (
     run_lifecycle_review,
     run_proactive_scan,
     run_reflection,
+    run_skill_extraction,
 )
 from .config import settings
 from .db import TaskRecord, ensure_utc
@@ -180,6 +181,7 @@ async def start_scheduler_loop(
         "feedback_consolidation", settings.feedback_consolidation_interval
     )
     last_lifecycle_review = _load_offset("lifecycle_review", settings.lifecycle_review_interval)
+    last_skill_extraction = _load_offset("skill_extraction", settings.skill_extraction_interval)
     last_dream = _load_offset("dream", settings.dream_interval)
 
     while not (shutdown and shutdown.is_set()):
@@ -231,24 +233,24 @@ async def start_scheduler_loop(
             """Apply exponential backoff based on consecutive no-op runs."""
             try:
                 no_ops = int(db.get_behavior_no_ops(name))
-            except (TypeError, ValueError):
+            except TypeError, ValueError:
                 no_ops = 0
-            return base * (2 ** min(no_ops, 4))  # caps at 16x base interval
+            return float(base * (2 ** min(no_ops, 4)))  # caps at 16x base interval
 
         # Consolidation: time-based + needs episode events
         consol_interval = _effective_interval(
             "consolidation", settings.episode_consolidation_interval
         )
         if now_mono - last_consolidation >= consol_interval:
-            has_episodes = db.count_unconsumed_events("new_episode") >= settings.consolidation_min_cluster
+            has_episodes = (
+                db.count_unconsumed_events("new_episode") >= settings.consolidation_min_cluster
+            )
             if has_episodes or now_mono - last_consolidation >= consol_interval * 6:
                 last_consolidation = now_mono
                 maintenance_coros.append(("consolidation", run_consolidation(bot, sem)))
 
         # Proactive scan: time-based + needs goal or user activity
-        proactive_interval = _effective_interval(
-            "proactive_scan", settings.proactive_scan_interval
-        )
+        proactive_interval = _effective_interval("proactive_scan", settings.proactive_scan_interval)
         if now_mono - last_proactive >= proactive_interval:
             has_activity = db.count_unconsumed_events("goal_updated", "user_message") >= 1
             if has_activity or now_mono - last_proactive >= proactive_interval * 6:
@@ -258,9 +260,7 @@ async def start_scheduler_loop(
         # Reflection: time-based + needs user interaction or feedback
         reflection_interval = _effective_interval("reflection", settings.reflection_interval)
         if now_mono - last_reflection >= reflection_interval:
-            has_feedback = db.count_unconsumed_events(
-                "feedback_negative", "user_message"
-            ) >= 5
+            has_feedback = db.count_unconsumed_events("feedback_negative", "user_message") >= 5
             if has_feedback or now_mono - last_reflection >= reflection_interval * 6:
                 last_reflection = now_mono
                 maintenance_coros.append(("reflection", run_reflection(bot, sem)))
@@ -296,9 +296,25 @@ async def start_scheduler_loop(
         # Lifecycle review: time-based + needs accumulated memory activity
         if now_mono - last_lifecycle_review >= settings.lifecycle_review_interval:
             has_activity = db.count_unconsumed_events("new_episode", "new_insight") >= 5
-            if has_activity or now_mono - last_lifecycle_review >= settings.lifecycle_review_interval * 6:
+            if (
+                has_activity
+                or now_mono - last_lifecycle_review >= settings.lifecycle_review_interval * 6
+            ):
                 last_lifecycle_review = now_mono
                 maintenance_coros.append(("lifecycle_review", run_lifecycle_review(bot, sem)))
+
+        # Skill extraction: time-based + needs multiple new episodes to infer a reusable pattern.
+        skill_extraction_interval = _effective_interval(
+            "skill_extraction", settings.skill_extraction_interval
+        )
+        if now_mono - last_skill_extraction >= skill_extraction_interval:
+            has_recent_episodes = db.count_unconsumed_events("new_episode") >= 2
+            if (
+                has_recent_episodes
+                or now_mono - last_skill_extraction >= skill_extraction_interval * 6
+            ):
+                last_skill_extraction = now_mono
+                maintenance_coros.append(("skill_extraction", run_skill_extraction(bot, sem)))
 
         # Dream: autonomous thinking periods (quiet-gated internally + needs mental material)
         if now_mono - last_dream >= settings.dream_interval:
@@ -326,6 +342,9 @@ async def start_scheduler_loop(
                 "insight_consolidation": ("new_insight",),
                 "feedback_consolidation": ("feedback_negative",),
                 "lifecycle_review": (),
+                # Shares new_episode as an input signal with consolidation, so it
+                # must not consume those events and starve the other behavior.
+                "skill_extraction": (),
                 "dream": (),
             }
             with db.batch():

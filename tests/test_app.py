@@ -69,6 +69,36 @@ class TestFormatMemoryContext:
         assert "<memories>" in result
 
 
+class TestAutoRecall:
+    async def test_trigger_skill_displaces_lowest_non_skill(self, tmp_settings: Any) -> None:
+        from luke.app import _auto_recall
+
+        tmp_settings.auto_recall_limit = 2
+        existing = [
+            {"id": "old-skill", "type": "procedure", "title": "Old Skill", "score": 0.1},
+            {"id": "entity-1", "type": "entity", "title": "Entity", "score": 0.2},
+        ]
+        trigger = [{"id": "new-skill", "type": "procedure", "title": "New Skill", "score": 0.9}]
+
+        def fake_frontmatter(path: Path) -> dict[str, Any]:
+            if path.name == "old-skill.md":
+                return {"tags": ["skill"]}
+            return {"tags": []}
+
+        with (
+            patch("luke.app.settings", tmp_settings),
+            patch("luke.app.recall", return_value=existing),
+            patch("luke.app.get_trigger_matched_skills", return_value=trigger),
+            patch("luke.app.get_graph_neighbors", return_value=[]),
+            patch("luke.app.touch_memories"),
+            patch("luke.app.read_frontmatter", side_effect=fake_frontmatter),
+            patch("luke.app._format_memory_context", return_value="<context></context>"),
+        ):
+            _memory_context, memories = await _auto_recall("deploy this release", "12345")
+
+        assert [m["id"] for m in memories] == ["old-skill", "new-skill"]
+
+
 # ---------------------------------------------------------------------------
 # _reply_to
 # ---------------------------------------------------------------------------
@@ -692,9 +722,7 @@ class TestClassifyEffort:
     def test_medium_normal_question(self) -> None:
         from luke.app import _classify_effort
 
-        effort, thinking, model = _classify_effort(
-            "What time is the meeting tomorrow?"
-        )
+        effort, thinking, model = _classify_effort("What time is the meeting tomorrow?")
         assert effort == "medium"
         assert thinking["type"] == "disabled"
         assert model == settings.model_medium
@@ -779,7 +807,9 @@ class TestClassifyEffort:
     def test_complex_keyword_implement(self) -> None:
         from luke.app import _classify_effort
 
-        msg = "We need to implement the new feature for the dashboard before next week, can you help?"
+        msg = (
+            "We need to implement the new feature for the dashboard before next week, can you help?"
+        )
         effort, _, model = _classify_effort(msg)
         assert effort == "high"
         assert model == settings.model_high
@@ -1017,10 +1047,28 @@ class TestCodeKeywords:
     @pytest.mark.parametrize(
         "keyword",
         [
-            "code", "fix", "bug", "debug", "refactor", "deploy", "test",
-            "script", "function", "class", "error", "exception", "traceback",
-            "commit", "merge", "pr", "pull request", "api", "endpoint",
-            "database", "migration", "schema",
+            "code",
+            "fix",
+            "bug",
+            "debug",
+            "refactor",
+            "deploy",
+            "test",
+            "script",
+            "function",
+            "class",
+            "error",
+            "exception",
+            "traceback",
+            "commit",
+            "merge",
+            "pr",
+            "pull request",
+            "api",
+            "endpoint",
+            "database",
+            "migration",
+            "schema",
         ],
     )
     def test_each_code_keyword_routes_high(self, keyword: str) -> None:
@@ -1036,12 +1084,30 @@ class TestCodeKeywords:
         from luke.app import _CODE_KEYWORDS
 
         expected = {
-            "code", "fix", "bug", "debug", "refactor", "deploy", "test",
-            "script", "function", "class", "error", "exception", "traceback",
-            "commit", "merge", "pr", "pull request", "api", "endpoint",
-            "database", "migration", "schema",
+            "code",
+            "fix",
+            "bug",
+            "debug",
+            "refactor",
+            "deploy",
+            "test",
+            "script",
+            "function",
+            "class",
+            "error",
+            "exception",
+            "traceback",
+            "commit",
+            "merge",
+            "pr",
+            "pull request",
+            "api",
+            "endpoint",
+            "database",
+            "migration",
+            "schema",
         }
-        assert _CODE_KEYWORDS == expected
+        assert expected == _CODE_KEYWORDS
 
 
 # ---------------------------------------------------------------------------
@@ -1104,7 +1170,17 @@ class TestExtractTopics:
         from luke.app import _extract_topics
 
         # 8 distinct words each appearing 3 times
-        text = " ".join(w * 3 for w in ["alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta"])
+        words = [
+            "alpha",
+            "beta",
+            "gamma",
+            "delta",
+            "epsilon",
+            "zeta",
+            "eta",
+            "theta",
+        ]
+        text = " ".join(w * 3 for w in words)
         msgs = [_make_msg(text)]
         topics = _extract_topics(msgs, [])
         assert len(topics) <= 5
@@ -1150,10 +1226,12 @@ class TestExtractPendingActions:
     def test_deduplicates_actions(self) -> None:
         from luke.app import _extract_pending_actions
 
-        actions = _extract_pending_actions([
-            "I'll review the code",
-            "I'll review the code",
-        ])
+        actions = _extract_pending_actions(
+            [
+                "I'll review the code",
+                "I'll review the code",
+            ]
+        )
         assert actions.count(actions[0]) == 1 if actions else True
 
     def test_caps_at_5_actions(self) -> None:

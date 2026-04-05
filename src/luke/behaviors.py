@@ -72,7 +72,10 @@ async def _run_behavior(
         )
         effective_model = model or settings.agent_model
         db.log_cost(
-            chat_id, result.cost_usd, result.num_turns, result.duration_api_ms,
+            chat_id,
+            result.cost_usd,
+            result.num_turns,
+            result.duration_api_ms,
             f"behavior:{name}:{effective_model}",
         )
         return result
@@ -87,9 +90,17 @@ async def run_consolidation(bot: Bot, sem: asyncio.Semaphore) -> None:
     - experiential: cluster related episodes into synthesized insights (default behavior)
     - factual: merge semantically duplicate factual memories into authoritative versions
     - working: auto-expired by hourly maintenance (no consolidation needed)
+    - semantic: offline HDBSCAN re-clustering + cluster summary generation
     """
     if not settings.chat_id:
         return
+
+    # --- Semantic clustering: offline HDBSCAN re-clustering ---
+    report = memory.recluster_offline()
+    if report.get("n_clusters", 0) > 0:
+        log.info("consolidation_clustering", report=report)
+        # Generate summaries for new clusters
+        memory.generate_all_cluster_summaries()
 
     # --- Experiential consolidation: cluster episodes into insights ---
     clusters = memory.get_consolidation_candidates(settings.consolidation_min_cluster)
@@ -131,9 +142,7 @@ async def run_consolidation(bot: Bot, sem: asyncio.Semaphore) -> None:
             continue
         prompt = (
             "Memory consolidation task (factual). These factual memories overlap "
-            "significantly and should be merged:\n\n"
-            + "\n---\n".join(contents)
-            + "\n\nSteps:\n"
+            "significantly and should be merged:\n\n" + "\n---\n".join(contents) + "\n\nSteps:\n"
             "1. Create ONE authoritative memory that combines all information\n"
             "2. Preserve the most specific/accurate details from each source\n"
             "3. Use 'connect' to link the new memory to relevant entities\n"
@@ -148,6 +157,64 @@ async def run_consolidation(bot: Bot, sem: asyncio.Semaphore) -> None:
             max_sends=0,
             factual_memories=mem_ids,
         )
+
+    # --- Contradiction scan: detect and resolve conflicting memories ---
+    contradiction_candidates = memory.get_factual_duplicate_candidates(similarity_threshold=0.65)
+    contradictions_found = 0
+    for cluster in (contradiction_candidates or [])[: settings.max_consolidation_clusters]:
+        for i, m in enumerate(cluster):
+            for other in cluster[i + 1 :]:
+                body_a = read_memory_body(m["type"], m["id"], 500)
+                body_b = read_memory_body(other["type"], other["id"], 500)
+                if body_a and body_b:
+                    relationship = memory.classify_relationship(body_a, body_b)
+                    if relationship == "contradictory":
+                        contradictions_found += 1
+                        log.info(
+                            "contradiction_detected",
+                            mem_a=m["id"],
+                            mem_b=other["id"],
+                            similarity=m.get("similarity", other.get("similarity", 0)),
+                        )
+                        pending = memory.flag_for_review(
+                            m["id"],
+                            f"Potential contradiction with {other['id']}: {body_b[:200]}",
+                            confidence=0.55,
+                            source="consolidation_scan",
+                        )
+                        log.info("contradiction_flagged", result=pending)
+
+    if contradictions_found > 0:
+        log.info("consolidation_contradiction_scan", found=contradictions_found)
+
+    # --- Contradiction scan: detect and resolve conflicting memories ---
+    contradiction_candidates = memory.get_factual_duplicate_candidates(similarity_threshold=0.65)
+    contradictions_found = 0
+    for cluster in (contradiction_candidates or [])[: settings.max_consolidation_clusters]:
+        for i, m in enumerate(cluster):
+            for other in cluster[i + 1 :]:
+                body_a = read_memory_body(m["type"], m["id"], 500)
+                body_b = read_memory_body(other["type"], other["id"], 500)
+                if body_a and body_b:
+                    relationship = memory.classify_relationship(body_a, body_b)
+                    if relationship == "contradictory":
+                        contradictions_found += 1
+                        log.info(
+                            "contradiction_detected",
+                            mem_a=m["id"],
+                            mem_b=other["id"],
+                            similarity=m.get("similarity", other.get("similarity", 0)),
+                        )
+                        pending = memory.flag_for_review(
+                            m["id"],
+                            f"Potential contradiction with {other['id']}: {body_b[:200]}",
+                            confidence=0.55,
+                            source="consolidation_scan",
+                        )
+                        log.info("contradiction_flagged", result=pending)
+
+    if contradictions_found > 0:
+        log.info("consolidation_contradiction_scan", found=contradictions_found)
 
 
 async def run_reflection(bot: Bot, sem: asyncio.Semaphore) -> None:
@@ -179,10 +246,11 @@ async def run_reflection(bot: Bot, sem: asyncio.Semaphore) -> None:
 
     # Include actual reaction data from the database
     reaction_lines: list[str] = []
-    for r in db.get_reactions(chat_id, limit=50):
+    for rx in db.get_reactions(chat_id, limit=50):
+        rd: dict[str, Any] = dict(rx)
         reaction_lines.append(
-            f"  msg:{r['msg_id']} {r['emoji']} ({r['sentiment']}) "
-            f"from {r['sender_id']} at {r['timestamp']}"
+            f"  msg:{rd['msg_id']} {rd['emoji']} ({rd['sentiment']}) "
+            f"from {rd['sender_id']} at {rd['timestamp']}"
         )
 
     # Pre-analyzed reaction summary for pattern detection
@@ -408,7 +476,9 @@ async def run_deep_work(bot: Bot, sem: asyncio.Semaphore) -> None:
         scores = db.get_recent_quality_scores(g["id"], 5)
         if scores:
             avg = sum(scores) / len(scores)
-            quality_context.append(f"[{g['id']}]: last {len(scores)} ratings: {scores} (avg: {avg:.1f})")
+            quality_context.append(
+                f"[{g['id']}]: last {len(scores)} ratings: {scores} (avg: {avg:.1f})"
+            )
 
     remaining = settings.daily_deep_work_budget_usd - daily_cost
     now_str = datetime.now(UTC).isoformat(timespec="minutes")
@@ -419,11 +489,7 @@ async def run_deep_work(bot: Bot, sem: asyncio.Semaphore) -> None:
         "Active goals (priority order):\n"
         + "\n\n".join(goal_sections)
         + ("\n\nExisting work plans:\n" + "\n".join(plan_status) if plan_status else "")
-        + (
-            "\n\nQuality history:\n" + "\n".join(quality_context)
-            if quality_context
-            else ""
-        )
+        + ("\n\nQuality history:\n" + "\n".join(quality_context) if quality_context else "")
         + "\n\n"
         "Phase 1 — PLAN (do this first):\n"
         "1. Pick the highest-priority goal\n"
@@ -605,6 +671,94 @@ async def run_lifecycle_review(bot: Bot, sem: asyncio.Semaphore) -> None:
     )
 
 
+async def run_skill_extraction(bot: Bot, sem: asyncio.Semaphore) -> None:
+    """Post-task skill extraction: extract reusable procedures from completed work.
+
+    Triggered by task_completed events. Gathers recent episode memories from
+    the completed work and asks Sonnet to extract a reusable procedure.
+    The result passes through the quality gate before being stored.
+    """
+    if not settings.chat_id:
+        return
+
+    now = datetime.now(UTC)
+    day_ago = (now - timedelta(days=1)).isoformat()
+
+    # Get recent episodes that represent completed work
+    recent_episodes = memory.recall(
+        mem_type="episode",
+        after=day_ago,
+        before=now.isoformat(),
+        limit=15,
+    )
+    if not recent_episodes:
+        return
+
+    contents: list[str] = []
+    for ep in recent_episodes:
+        body = read_memory_body(ep["type"], ep["id"], 500)
+        if body:
+            contents.append(f"[{ep['id']}]: {body}")
+
+    if len(contents) < 2:
+        return  # need at least 2 episodes to form a pattern
+
+    # Get existing procedures to avoid duplicates
+    existing_procedures = memory.recall(mem_type="procedure", limit=20)
+    existing_lines: list[str] = []
+    for p in existing_procedures:
+        body = read_memory_body(p["type"], p["id"], 200)
+        if body:
+            existing_lines.append(f"[{p['id']}]: {body}")
+
+    prompt = (
+        "Skill extraction task. Review these recent work episodes and extract "
+        "reusable procedures that would help handle similar tasks faster next time.\n\n"
+        "=== Recent Work Episodes ===\n"
+        + "\n---\n".join(contents)
+        + (
+            "\n\n=== Existing Procedures (avoid duplicates) ===\n" + "\n---\n".join(existing_lines)
+            if existing_lines
+            else ""
+        )
+        + "\n\nFor each procedure worth extracting:\n"
+        "1. It must have >= 3 concrete steps (not trivial)\n"
+        "2. It must NOT duplicate an existing procedure\n"
+        "3. It must be generalizable (not specific to one instance)\n\n"
+        "For each procedure, call 'remember' with:\n"
+        "- type: procedure\n"
+        "- id: a descriptive kebab-case ID (e.g., 'proc-deploy-luke-production')\n"
+        "- tags: ['skill', 'auto-extracted'] + relevant domain tags\n"
+        "- importance: 2.0 (procedures are high-value)\n"
+        "- Content must follow this format:\n"
+        "  ## When to Use\n"
+        "  [trigger conditions]\n\n"
+        "  ## Prerequisites\n"
+        "  [what must be true before starting]\n\n"
+        "  ## Steps\n"
+        "  1. [step]\n"
+        "  2. [step]\n"
+        "  ...\n\n"
+        "  ## Common Pitfalls\n"
+        "  [things that can go wrong]\n\n"
+        "  ## Success Criteria\n"
+        "  [how to verify it worked]\n\n"
+        "If no procedures are worth extracting from these episodes, do nothing.\n"
+        "Quality over quantity — only extract genuinely reusable patterns.\n"
+        "Do NOT message the user. This is internal skill extraction.\n"
+    )
+
+    await _run_behavior(
+        "skill_extraction",
+        prompt,
+        bot,
+        sem,
+        model=settings.consolidation_model,  # sonnet for cost-effectiveness
+        max_sends=0,
+        episodes_reviewed=len(recent_episodes),
+    )
+
+
 async def run_dream(bot: Bot, sem: asyncio.Semaphore) -> None:
     """Autonomous thinking period: make connections, notice patterns, generate ideas.
 
@@ -693,9 +847,7 @@ async def run_dream(bot: Bot, sem: asyncio.Semaphore) -> None:
         "This is a free-form thinking period. You're not executing tasks or "
         "analyzing performance — you're thinking deeply, making connections, "
         "and generating ideas.\n\n"
-        "Here's a cross-section of your memory:\n\n"
-        + "\n\n".join(sections)
-        + "\n\n"
+        "Here's a cross-section of your memory:\n\n" + "\n\n".join(sections) + "\n\n"
         "Think about:\n"
         "1. What unexpected connections exist between these memories? "
         "What patterns span across different domains?\n"

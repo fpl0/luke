@@ -256,7 +256,7 @@ class TestEffectiveInterval:
             mock_db.get_behavior_no_ops.return_value = None
             try:
                 no_ops = int(mock_db.get_behavior_no_ops("consolidation"))
-            except (TypeError, ValueError):
+            except TypeError, ValueError:
                 no_ops = 0
             result = 300.0 * (2 ** min(no_ops, 4))
             assert result == 300.0  # base interval, no backoff
@@ -383,6 +383,7 @@ class TestSchedulerLoop:
             mock_settings.insight_consolidation_interval = 999999
             mock_settings.feedback_consolidation_interval = 999999
             mock_settings.lifecycle_review_interval = 999999
+            mock_settings.skill_extraction_interval = 999999
             mock_settings.dream_interval = 999999
             mock_db.get_due_tasks.return_value = []
             mock_db.get_behavior_last_run.return_value = None
@@ -417,6 +418,7 @@ class TestBehaviorEventMapping:
             "insight_consolidation": ("new_insight",),
             "feedback_consolidation": ("feedback_negative",),
             "lifecycle_review": (),
+            "skill_extraction": (),
             "dream": (),
         }
         assert "goal_updated" in _BEHAVIOR_EVENTS["proactive_scan"]
@@ -430,9 +432,16 @@ class TestBehaviorEventMapping:
             "insight_consolidation": ("new_insight",),
             "feedback_consolidation": ("feedback_negative",),
             "lifecycle_review": (),
+            "skill_extraction": (),
             "dream": (),
         }
-        emitted_types = {"new_episode", "new_insight", "goal_updated", "feedback_negative", "user_message"}
+        emitted_types = {
+            "new_episode",
+            "new_insight",
+            "goal_updated",
+            "feedback_negative",
+            "user_message",
+        }
         consumed_types: set[str] = set()
         for events in _BEHAVIOR_EVENTS.values():
             consumed_types.update(events)
@@ -451,35 +460,51 @@ class TestBehaviorEventMapping:
         for node in ast.walk(tree):
             if isinstance(node, ast.Compare):
                 for comparator in node.comparators:
-                    if isinstance(comparator, ast.BinOp) and isinstance(comparator.op, ast.Mult):
-                        if isinstance(comparator.right, ast.Constant):
-                            fallback_multipliers.append(comparator.right.value)
+                    if (
+                        isinstance(comparator, ast.BinOp)
+                        and isinstance(comparator.op, ast.Mult)
+                        and isinstance(comparator.right, ast.Constant)
+                    ):
+                        fallback_multipliers.append(comparator.right.value)
         # All fallback multipliers should be 6
         assert all(m == 6 for m in fallback_multipliers), (
             f"Expected all fallback multipliers to be 6, got {fallback_multipliers}"
         )
 
     def test_all_newly_gated_behaviors_have_fallback_multiplier(self) -> None:
-        """proactive_scan, lifecycle_review, dream, and deep_work must all have a 6x fallback."""
+        """Event-gated behaviors must all have a 6x fallback."""
         import ast
         import inspect
 
         source = inspect.getsource(start_scheduler_loop)
-        # Verify each newly-gated behavior has a 6x pattern in source
-        for behavior in ("proactive_scan", "lifecycle_review", "dream", "deep_work"):
-            assert f"{behavior}_interval * 6" in source or f"{behavior[:-1]}_interval * 6" in source or "* 6" in source, (
-                f"{behavior} missing 6x fallback"
-            )
-        # Count 6x patterns — should have at least 8 (4 original + 4 new)
+        behaviors = (
+            "proactive_scan",
+            "lifecycle_review",
+            "skill_extraction",
+            "dream",
+            "deep_work",
+        )
+        for behavior in behaviors:
+            assert (
+                f"{behavior}_interval * 6" in source
+                or f"{behavior[:-1]}_interval * 6" in source
+                or "* 6" in source
+            ), f"{behavior} missing 6x fallback"
         tree = ast.parse(source)
         fallback_count = 0
         for node in ast.walk(tree):
             if isinstance(node, ast.Compare):
                 for comparator in node.comparators:
-                    if isinstance(comparator, ast.BinOp) and isinstance(comparator.op, ast.Mult):
-                        if isinstance(comparator.right, ast.Constant) and comparator.right.value == 6:
-                            fallback_count += 1
-        assert fallback_count >= 8, f"Expected at least 8 behaviors with 6x fallback, found {fallback_count}"
+                    if (
+                        isinstance(comparator, ast.BinOp)
+                        and isinstance(comparator.op, ast.Mult)
+                        and isinstance(comparator.right, ast.Constant)
+                        and comparator.right.value == 6
+                    ):
+                        fallback_count += 1
+        assert fallback_count >= 9, (
+            f"Expected at least 9 behaviors with 6x fallback, found {fallback_count}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -520,11 +545,18 @@ class TestBehaviorEventGating:
         mock_settings.cleanup_interval = 999999
         mock_settings.episode_consolidation_interval = 999999
         mock_settings.reflection_interval = 999999
-        mock_settings.proactive_scan_interval = interval if due_behavior == "proactive_scan" else 999999
+        mock_settings.proactive_scan_interval = (
+            interval if due_behavior == "proactive_scan" else 999999
+        )
         mock_settings.deep_work_interval = interval if due_behavior == "deep_work" else 999999
         mock_settings.insight_consolidation_interval = 999999
         mock_settings.feedback_consolidation_interval = 999999
-        mock_settings.lifecycle_review_interval = interval if due_behavior == "lifecycle_review" else 999999
+        mock_settings.lifecycle_review_interval = (
+            interval if due_behavior == "lifecycle_review" else 999999
+        )
+        mock_settings.skill_extraction_interval = (
+            interval if due_behavior == "skill_extraction" else 999999
+        )
         mock_settings.dream_interval = interval if due_behavior == "dream" else 999999
         mock_settings.consolidation_min_cluster = 3
         return mock_settings
@@ -555,7 +587,11 @@ class TestBehaviorEventGating:
         """proactive_scan does not fire when no events exist and timer < 6x interval."""
         mock_settings = self._make_mock_settings(due_behavior="proactive_scan", interval=1.0)
         # elapsed=2s < 6s (6x interval), no events
-        mock_db = self._make_mock_db(due_behavior="proactive_scan", elapsed_seconds=2.0, unconsumed_count=0)
+        mock_db = self._make_mock_db(
+            due_behavior="proactive_scan",
+            elapsed_seconds=2.0,
+            unconsumed_count=0,
+        )
 
         with (
             patch("luke.scheduler.settings", new=mock_settings),
@@ -579,7 +615,11 @@ class TestBehaviorEventGating:
     async def test_proactive_scan_fires_with_goal_event(self) -> None:
         """proactive_scan fires when goal_updated/user_message events exist."""
         mock_settings = self._make_mock_settings(due_behavior="proactive_scan", interval=1.0)
-        mock_db = self._make_mock_db(due_behavior="proactive_scan", elapsed_seconds=2.0, unconsumed_count=1)
+        mock_db = self._make_mock_db(
+            due_behavior="proactive_scan",
+            elapsed_seconds=2.0,
+            unconsumed_count=1,
+        )
 
         with (
             patch("luke.scheduler.settings", new=mock_settings),
@@ -604,7 +644,11 @@ class TestBehaviorEventGating:
         """proactive_scan fires at 6x interval even with no events."""
         mock_settings = self._make_mock_settings(due_behavior="proactive_scan", interval=1.0)
         # elapsed=10s > 6s (6x interval), no events
-        mock_db = self._make_mock_db(due_behavior="proactive_scan", elapsed_seconds=10.0, unconsumed_count=0)
+        mock_db = self._make_mock_db(
+            due_behavior="proactive_scan",
+            elapsed_seconds=10.0,
+            unconsumed_count=0,
+        )
 
         with (
             patch("luke.scheduler.settings", new=mock_settings),
@@ -628,7 +672,11 @@ class TestBehaviorEventGating:
     async def test_lifecycle_review_skipped_without_events(self) -> None:
         """lifecycle_review does not fire without enough memory activity (< 5 events)."""
         mock_settings = self._make_mock_settings(due_behavior="lifecycle_review", interval=1.0)
-        mock_db = self._make_mock_db(due_behavior="lifecycle_review", elapsed_seconds=2.0, unconsumed_count=4)
+        mock_db = self._make_mock_db(
+            due_behavior="lifecycle_review",
+            elapsed_seconds=2.0,
+            unconsumed_count=4,
+        )
 
         with (
             patch("luke.scheduler.settings", new=mock_settings),
@@ -652,7 +700,11 @@ class TestBehaviorEventGating:
     async def test_lifecycle_review_fires_with_enough_events(self) -> None:
         """lifecycle_review fires when >= 5 episode/insight events exist."""
         mock_settings = self._make_mock_settings(due_behavior="lifecycle_review", interval=1.0)
-        mock_db = self._make_mock_db(due_behavior="lifecycle_review", elapsed_seconds=2.0, unconsumed_count=5)
+        mock_db = self._make_mock_db(
+            due_behavior="lifecycle_review",
+            elapsed_seconds=2.0,
+            unconsumed_count=5,
+        )
 
         with (
             patch("luke.scheduler.settings", new=mock_settings),
@@ -721,10 +773,66 @@ class TestBehaviorEventGating:
 
         mock_fn.assert_called_once()
 
+    async def test_skill_extraction_skipped_without_enough_episodes(self) -> None:
+        """skill_extraction does not fire without enough new episodes and timer < 6x."""
+        mock_settings = self._make_mock_settings(due_behavior="skill_extraction", interval=1.0)
+        mock_db = self._make_mock_db(
+            due_behavior="skill_extraction", elapsed_seconds=2.0, unconsumed_count=1
+        )
+
+        with (
+            patch("luke.scheduler.settings", new=mock_settings),
+            patch("luke.scheduler.db", new=mock_db),
+            patch("luke.scheduler.memory"),
+            patch("luke.scheduler.run_skill_extraction", new_callable=AsyncMock) as mock_fn,
+        ):
+            bot = AsyncMock()
+            shutdown = asyncio.Event()
+
+            async def set_shutdown() -> None:
+                await asyncio.sleep(0.05)
+                shutdown.set()
+
+            async with asyncio.TaskGroup() as tg:
+                tg.create_task(start_scheduler_loop(bot, _SEM, shutdown=shutdown))
+                tg.create_task(set_shutdown())
+
+        mock_fn.assert_not_called()
+
+    async def test_skill_extraction_fires_with_enough_episodes(self) -> None:
+        """skill_extraction fires when at least two new episodes exist."""
+        mock_settings = self._make_mock_settings(due_behavior="skill_extraction", interval=1.0)
+        mock_db = self._make_mock_db(
+            due_behavior="skill_extraction", elapsed_seconds=2.0, unconsumed_count=2
+        )
+
+        with (
+            patch("luke.scheduler.settings", new=mock_settings),
+            patch("luke.scheduler.db", new=mock_db),
+            patch("luke.scheduler.memory"),
+            patch("luke.scheduler.run_skill_extraction", new_callable=AsyncMock) as mock_fn,
+        ):
+            bot = AsyncMock()
+            shutdown = asyncio.Event()
+
+            async def set_shutdown() -> None:
+                await asyncio.sleep(0.05)
+                shutdown.set()
+
+            async with asyncio.TaskGroup() as tg:
+                tg.create_task(start_scheduler_loop(bot, _SEM, shutdown=shutdown))
+                tg.create_task(set_shutdown())
+
+        mock_fn.assert_called_once()
+
     async def test_deep_work_skipped_without_goal_events(self) -> None:
         """deep_work does not launch when no goal_updated events exist (and timer < 6x)."""
         mock_settings = self._make_mock_settings(due_behavior="deep_work", interval=1.0)
-        mock_db = self._make_mock_db(due_behavior="deep_work", elapsed_seconds=2.0, unconsumed_count=0)
+        mock_db = self._make_mock_db(
+            due_behavior="deep_work",
+            elapsed_seconds=2.0,
+            unconsumed_count=0,
+        )
 
         with (
             patch("luke.scheduler.settings", new=mock_settings),
@@ -748,7 +856,11 @@ class TestBehaviorEventGating:
     async def test_deep_work_fires_with_goal_event(self) -> None:
         """deep_work launches when goal_updated events exist."""
         mock_settings = self._make_mock_settings(due_behavior="deep_work", interval=1.0)
-        mock_db = self._make_mock_db(due_behavior="deep_work", elapsed_seconds=2.0, unconsumed_count=1)
+        mock_db = self._make_mock_db(
+            due_behavior="deep_work",
+            elapsed_seconds=2.0,
+            unconsumed_count=1,
+        )
 
         with (
             patch("luke.scheduler.settings", new=mock_settings),
