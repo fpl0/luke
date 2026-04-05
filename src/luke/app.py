@@ -1273,6 +1273,7 @@ async def main() -> None:
 
     await _notify_main("Back online.")
     _guardian_mark_healthy()
+    await _send_crash_notifications()
     write_heartbeat("online")
     _mark("online")
 
@@ -1359,6 +1360,58 @@ def _configure_logging() -> None:
         logger_factory=_structlog.PrintLoggerFactory(),
         cache_logger_on_first_use=True,
     )
+
+
+async def _send_crash_notifications() -> None:
+    """Check for crash/recovery notifications from guardian or watchdog.
+
+    The guardian.sh and watchdog.sh scripts write to a notification file when
+    they intervene (rollback, restart, etc). We read and send those on startup
+    so Filipe knows what happened while he wasn't looking.
+    """
+    notify_file = settings.store_dir / "crash_notifications"
+    if not notify_file.exists():
+        return
+
+    try:
+        lines = notify_file.read_text().strip().splitlines()
+    except Exception:
+        return
+
+    if not lines:
+        notify_file.unlink(missing_ok=True)
+        return
+
+    parts: list[str] = []
+    for line in lines:
+        fields = line.split("|", 3)
+        if len(fields) < 4:
+            continue
+        event_type, old_sha, new_sha, detail = fields
+        if event_type == "rollback":
+            parts.append(
+                f"Crash loop detected on <code>{old_sha}</code>. "
+                f"Auto-rolled back to <code>{new_sha}</code> ({detail})."
+            )
+        elif event_type == "revert_failed":
+            parts.append(
+                f"Crash loop on <code>{old_sha}</code> — revert failed. "
+                "Manual fix needed."
+            )
+        elif event_type == "rollback_limit":
+            parts.append(f"Too many rollbacks on <code>{old_sha}</code>. {detail}")
+        elif event_type == "watchdog_restart":
+            parts.append(f"Watchdog restart: {detail}")
+        else:
+            parts.append(detail or f"Unknown recovery event: {event_type}")
+
+    if parts:
+        msg = "\n".join(parts)
+        await _notify_main(f"Recovery report:\n{msg}")
+        log.warning("crash_notifications_sent", count=len(parts))
+
+    # Clear the file after sending
+    notify_file.unlink(missing_ok=True)
 
 
 def _guardian_mark_healthy() -> None:
