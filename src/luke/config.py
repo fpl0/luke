@@ -104,6 +104,11 @@ class Settings(BaseSettings):
     reflection_model: str = "sonnet"
     proactive_scan_model: str = "sonnet"
 
+    # Streaming
+    streaming_enabled: bool = True  # progressive message delivery to Telegram
+    streaming_edit_interval: float = 1.5  # min seconds between Telegram edits
+    streaming_min_chars: int = 80  # min accumulated chars before first edit
+
     # Telegram retry
     telegram_send_retries: int = 3
     telegram_retry_base_delay: float = 1.0  # seconds, exponential backoff

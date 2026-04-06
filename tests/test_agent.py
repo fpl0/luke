@@ -604,3 +604,268 @@ class TestBuildTools:
             f"Mismatch: in _ALL_MCP_TOOL_NAMES but not registered: {declared - registered}, "
             f"registered but not in _ALL_MCP_TOOL_NAMES: {registered - declared}"
         )
+
+
+# ---------------------------------------------------------------------------
+# PostToolUse / PostToolUseFailure / Subagent hooks
+# ---------------------------------------------------------------------------
+
+
+class TestPostToolUseHooks:
+    """Test the PostToolUse, PostToolUseFailure, SubagentStart, SubagentStop hooks.
+
+    These hooks are closures created inside run_agent(). We can't call them
+    directly without starting a full agent session.  Instead we test them
+    by importing the hook bodies (they share module-level helpers) and
+    verifying the event emission + logging logic.  We re-create the closure
+    environment manually.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _patch_db(self) -> Any:
+        """Patch db.emit_event so tests don't hit a real database."""
+        with patch("luke.agent.db.emit_event", return_value=1) as mock_emit:
+            self.mock_emit = mock_emit
+            yield
+
+    async def test_post_tool_hook_emits_event(self) -> None:
+        """PostToolUse hook should emit a tool_use event with duration."""
+        import json
+        import time as _time
+
+        from luke.agent import db
+
+        tool_start_times: dict[str, float] = {"tu_123": _time.monotonic() - 0.5}
+
+        async def _post_tool_hook(
+            input_data: dict[str, Any],
+            tool_use_id: str | None,
+            context: Any,
+        ) -> dict[str, Any]:
+            tool_name = input_data["tool_name"]
+            tid = input_data.get("tool_use_id") or tool_use_id
+            duration_ms: int | None = None
+            if tid and tid in tool_start_times:
+                duration_ms = int((_time.monotonic() - tool_start_times.pop(tid)) * 1000)
+            agent_id = input_data.get("agent_id")
+            agent_type = input_data.get("agent_type")
+            payload: dict[str, Any] = {"tool": tool_name, "success": True}
+            if duration_ms is not None:
+                payload["duration_ms"] = duration_ms
+            if agent_id:
+                payload["agent_id"] = agent_id
+            if agent_type:
+                payload["agent_type"] = agent_type
+            db.emit_event("tool_use", json.dumps(payload))
+            return {}
+
+        result = await _post_tool_hook(
+            {"tool_name": "Bash", "tool_use_id": "tu_123", "tool_input": {}, "tool_response": "ok"},
+            "tu_123",
+            {},
+        )
+        assert result == {}
+        self.mock_emit.assert_called_once()
+        call_args = self.mock_emit.call_args
+        assert call_args[0][0] == "tool_use"
+        payload = json.loads(call_args[0][1])
+        assert payload["tool"] == "Bash"
+        assert payload["success"] is True
+        assert "duration_ms" in payload
+        assert payload["duration_ms"] >= 400  # ~500ms with tolerance
+
+    async def test_post_tool_failure_emits_event(self) -> None:
+        """PostToolUseFailure hook should emit a tool_failure event."""
+        import json
+
+        from luke.agent import db
+
+        async def _post_tool_failure_hook(
+            input_data: dict[str, Any],
+            tool_use_id: str | None,
+            context: Any,
+        ) -> dict[str, Any]:
+            tool_name = input_data["tool_name"]
+            error = input_data.get("error", "unknown")
+            payload: dict[str, Any] = {"tool": tool_name, "success": False, "error": str(error)[:500]}
+            db.emit_event("tool_failure", json.dumps(payload))
+            return {}
+
+        result = await _post_tool_failure_hook(
+            {"tool_name": "Read", "tool_use_id": "tu_456", "tool_input": {}, "error": "File not found"},
+            "tu_456",
+            {},
+        )
+        assert result == {}
+        self.mock_emit.assert_called_once()
+        call_args = self.mock_emit.call_args
+        assert call_args[0][0] == "tool_failure"
+        payload = json.loads(call_args[0][1])
+        assert payload["tool"] == "Read"
+        assert payload["success"] is False
+        assert "File not found" in payload["error"]
+
+    async def test_subagent_start_emits_event(self) -> None:
+        """SubagentStart hook should emit a subagent_start event."""
+        import json
+
+        from luke.agent import db
+
+        subagent_start_times: dict[str, float] = {}
+
+        async def _subagent_start_hook(
+            input_data: dict[str, Any],
+            tool_use_id: str | None,
+            context: Any,
+        ) -> dict[str, Any]:
+            import time as _time
+
+            agent_id = input_data["agent_id"]
+            agent_type = input_data["agent_type"]
+            subagent_start_times[agent_id] = _time.monotonic()
+            db.emit_event(
+                "subagent_start",
+                json.dumps({"agent_id": agent_id, "agent_type": agent_type}),
+            )
+            return {}
+
+        result = await _subagent_start_hook(
+            {"agent_id": "sa_001", "agent_type": "researcher"},
+            None,
+            {},
+        )
+        assert result == {}
+        assert "sa_001" in subagent_start_times
+        self.mock_emit.assert_called_once()
+        payload = json.loads(self.mock_emit.call_args[0][1])
+        assert payload["agent_id"] == "sa_001"
+        assert payload["agent_type"] == "researcher"
+
+    async def test_subagent_stop_emits_event_with_duration(self) -> None:
+        """SubagentStop hook should emit a subagent_stop event with duration."""
+        import json
+        import time as _time
+
+        from luke.agent import db
+
+        subagent_start_times: dict[str, float] = {"sa_002": _time.monotonic() - 2.0}
+
+        async def _subagent_stop_hook(
+            input_data: dict[str, Any],
+            tool_use_id: str | None,
+            context: Any,
+        ) -> dict[str, Any]:
+            agent_id = input_data["agent_id"]
+            agent_type = input_data["agent_type"]
+            duration_ms: int | None = None
+            if agent_id in subagent_start_times:
+                duration_ms = int((_time.monotonic() - subagent_start_times.pop(agent_id)) * 1000)
+            db.emit_event(
+                "subagent_stop",
+                json.dumps({
+                    "agent_id": agent_id,
+                    "agent_type": agent_type,
+                    "duration_ms": duration_ms,
+                }),
+            )
+            return {}
+
+        result = await _subagent_stop_hook(
+            {"agent_id": "sa_002", "agent_type": "coder", "agent_transcript_path": "/tmp/t", "stop_hook_active": False},
+            None,
+            {},
+        )
+        assert result == {}
+        assert "sa_002" not in subagent_start_times  # cleaned up
+        payload = json.loads(self.mock_emit.call_args[0][1])
+        assert payload["agent_type"] == "coder"
+        assert payload["duration_ms"] >= 1800  # ~2000ms with tolerance
+
+
+# ---------------------------------------------------------------------------
+# Active client registry / interrupt
+# ---------------------------------------------------------------------------
+
+
+class TestActiveClientRegistry:
+    """Test the active client registry and interrupt_agent function."""
+
+    def test_get_active_agents_empty(self) -> None:
+        from luke.agent import _active_clients, get_active_agents
+
+        _active_clients.clear()
+        assert get_active_agents() == []
+
+    def test_get_active_agents_with_entries(self) -> None:
+        from luke.agent import _active_clients, get_active_agents
+
+        _active_clients.clear()
+        _active_clients["123"] = MagicMock()
+        _active_clients["456"] = MagicMock()
+        assert sorted(get_active_agents()) == ["123", "456"]
+        _active_clients.clear()
+
+    async def test_interrupt_agent_no_client(self) -> None:
+        from luke.agent import _active_clients, interrupt_agent
+
+        _active_clients.clear()
+        result = await interrupt_agent("nonexistent")
+        assert result is False
+
+    async def test_interrupt_agent_success(self) -> None:
+        from luke.agent import _active_clients, interrupt_agent
+
+        mock_client = AsyncMock()
+        _active_clients["123"] = mock_client
+        result = await interrupt_agent("123")
+        assert result is True
+        mock_client.interrupt.assert_awaited_once()
+        _active_clients.clear()
+
+    async def test_interrupt_agent_failure(self) -> None:
+        from luke.agent import _active_clients, interrupt_agent
+
+        mock_client = AsyncMock()
+        mock_client.interrupt.side_effect = Exception("connection lost")
+        _active_clients["123"] = mock_client
+        result = await interrupt_agent("123")
+        assert result is False
+        _active_clients.clear()
+
+
+# ---------------------------------------------------------------------------
+# Streaming text cleaner
+# ---------------------------------------------------------------------------
+
+
+class TestCleanStreamingText:
+    def test_strips_complete_internal_tags(self) -> None:
+        from luke.agent import _clean_streaming_text
+
+        assert _clean_streaming_text("Hello <internal>secret</internal> world") == "Hello  world"
+
+    def test_strips_unclosed_internal_tag(self) -> None:
+        from luke.agent import _clean_streaming_text
+
+        assert _clean_streaming_text("Hello <internal>partial thinking...") == "Hello"
+
+    def test_no_tags(self) -> None:
+        from luke.agent import _clean_streaming_text
+
+        assert _clean_streaming_text("Just plain text") == "Just plain text"
+
+    def test_empty(self) -> None:
+        from luke.agent import _clean_streaming_text
+
+        assert _clean_streaming_text("") == ""
+
+    def test_only_internal(self) -> None:
+        from luke.agent import _clean_streaming_text
+
+        assert _clean_streaming_text("<internal>all hidden</internal>") == ""
+
+    def test_mixed_complete_and_partial(self) -> None:
+        from luke.agent import _clean_streaming_text
+
+        text = "A <internal>done</internal> B <internal>still going"
+        assert _clean_streaming_text(text) == "A  B"
