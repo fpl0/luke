@@ -44,6 +44,74 @@ class TestShouldSendError:
 
 
 # ---------------------------------------------------------------------------
+# Safe handler decorator
+# ---------------------------------------------------------------------------
+
+
+class TestSafeHandler:
+    @pytest.mark.asyncio
+    async def test_normal_execution(self) -> None:
+        """Wrapped handler should execute normally when no exception."""
+        from luke.app import _safe_handler
+
+        called = False
+
+        @_safe_handler
+        async def handler(msg: Any) -> None:
+            nonlocal called
+            called = True
+
+        await handler(MagicMock())
+        assert called
+
+    @pytest.mark.asyncio
+    async def test_exception_caught(self) -> None:
+        """Wrapped handler should catch and log exceptions without re-raising."""
+        from luke.app import _safe_handler
+
+        @_safe_handler
+        async def handler(msg: Any) -> None:
+            raise ValueError("bad message data")
+
+        # Should NOT raise
+        msg = MagicMock(spec=[])
+        await handler(msg)
+
+    @pytest.mark.asyncio
+    async def test_crash_context_set_on_error(self) -> None:
+        """Crash context should record last handler error on failure."""
+        from luke.app import _crash_context, _safe_handler
+
+        @_safe_handler
+        async def failing_handler(msg: Any) -> None:
+            raise RuntimeError("db locked")
+
+        msg = MagicMock(spec=[])
+        await failing_handler(msg)
+        assert _crash_context.get("last_handler_error") == "failing_handler"
+        assert "last_handler_error_time" in _crash_context
+
+    @pytest.mark.asyncio
+    async def test_message_context_logged(self) -> None:
+        """Handler error log should include message context when available."""
+        from luke.app import _safe_handler
+
+        @_safe_handler
+        async def on_text(msg: Any) -> None:
+            raise TypeError("unexpected None")
+
+        msg = MagicMock(spec=["chat", "message_id", "from_user", "content_type"])
+        msg.chat.id = 12345
+        msg.message_id = 99
+        msg.from_user.full_name = "Test User"
+        msg.content_type = "text"
+
+        # Make msg pass isinstance check for types.Message
+        with patch("luke.app.types.Message", type(msg)):
+            await on_text(msg)
+
+
+# ---------------------------------------------------------------------------
 # Format memory context
 # ---------------------------------------------------------------------------
 
