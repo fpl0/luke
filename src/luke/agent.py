@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, cast
+from zoneinfo import ZoneInfo
 
 import structlog
 import yaml
@@ -40,6 +41,7 @@ from claude_agent_sdk import (
     SubagentStartHookInput,
     SubagentStopHookInput,
     ToolAnnotations,
+    UserPromptSubmitHookInput,
     create_sdk_mcp_server,
     tool,
 )
@@ -1112,6 +1114,25 @@ async def _notification_hook(
     return {}
 
 
+_DUBLIN_TZ = ZoneInfo("Europe/Dublin")
+
+
+async def _user_prompt_submit_hook(
+    input_data: UserPromptSubmitHookInput,
+    tool_use_id: str | None,
+    context: HookContext,
+) -> SyncHookJSONOutput:
+    """Inject current Dublin local time so day-of-week and schedule reasoning is always accurate."""
+    now = datetime.now(_DUBLIN_TZ)
+    time_str = now.strftime("%Y-%m-%dT%H:%M:%S%z")
+    day_name = now.strftime("%A")
+    log.debug("user_prompt_submit", local_time=time_str, day=day_name)
+    return {
+        "hookEventName": "UserPromptSubmit",
+        "additionalContext": f"Current local time (Dublin): {time_str}. Day of week: {day_name}.",
+    }
+
+
 # ---------------------------------------------------------------------------
 # Tool scoping per model tier
 # ---------------------------------------------------------------------------
@@ -1369,6 +1390,7 @@ async def run_agent(
         "Notification": [HookMatcher(hooks=[cast(HookCallback, _notification_hook)])],
         "SubagentStart": [HookMatcher(hooks=[cast(HookCallback, _subagent_start_hook)])],
         "SubagentStop": [HookMatcher(hooks=[cast(HookCallback, _subagent_stop_hook)])],
+        "UserPromptSubmit": [HookMatcher(hooks=[cast(HookCallback, _user_prompt_submit_hook)])],
     }
 
     allowed = _allowed_tools_for_model(effective_model)
