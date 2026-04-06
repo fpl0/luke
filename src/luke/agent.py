@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import re
+import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -30,10 +31,14 @@ from claude_agent_sdk import (
     HookContext,
     HookMatcher,
     NotificationHookInput,
+    PostToolUseFailureHookInput,
+    PostToolUseHookInput,
     PreCompactHookInput,
     PreToolUseHookInput,
     ResultMessage,
     StopHookInput,
+    SubagentStartHookInput,
+    SubagentStopHookInput,
     ToolAnnotations,
     create_sdk_mcp_server,
     tool,
@@ -1195,9 +1200,11 @@ async def run_agent(
             "\n\n<constitutional>\n" + constitutional_path.read_text() + "\n</constitutional>"
         )
 
-    # Per-run counters (closed over by PreToolUse hook)
+    # Per-run counters and timing state (closed over by hooks)
     send_count = {"n": 0}
     tool_count: dict[str, int] = {"n": 0}
+    tool_start_times: dict[str, float] = {}  # tool_use_id -> monotonic start
+    subagent_start_times: dict[str, float] = {}  # agent_id -> monotonic start
     effective_max_sends = max_sends if max_sends is not None else settings.max_sends_per_run
 
     async def _pre_tool_hook(
@@ -1208,6 +1215,10 @@ async def run_agent(
         tool_name = input_data["tool_name"]
         log.info("tool_use", tool=tool_name, input=_trunc(str(input_data["tool_input"])))
         tool_count["n"] += 1
+        # Record start time for latency tracking in PostToolUse
+        tid = input_data.get("tool_use_id") or tool_use_id
+        if tid:
+            tool_start_times[tid] = time.monotonic()
         if tool_name in _SEND_TOOLS:
             send_count["n"] += 1
             if send_count["n"] > effective_max_sends:
@@ -1232,11 +1243,98 @@ async def run_agent(
                     return {"decision": "block", "reason": "Hourly message budget exceeded"}
         return {}
 
+    async def _post_tool_hook(
+        input_data: PostToolUseHookInput,
+        tool_use_id: str | None,
+        context: HookContext,
+    ) -> SyncHookJSONOutput:
+        tool_name = input_data["tool_name"]
+        tid = input_data.get("tool_use_id") or tool_use_id
+        duration_ms: int | None = None
+        if tid and tid in tool_start_times:
+            duration_ms = int((time.monotonic() - tool_start_times.pop(tid)) * 1000)
+        agent_id = input_data.get("agent_id")
+        agent_type = input_data.get("agent_type")
+        payload = {"tool": tool_name, "success": True}
+        if duration_ms is not None:
+            payload["duration_ms"] = duration_ms
+        if agent_id:
+            payload["agent_id"] = agent_id
+        if agent_type:
+            payload["agent_type"] = agent_type
+        log.info("tool_complete", tool=tool_name, duration_ms=duration_ms, agent_id=agent_id)
+        db.emit_event("tool_use", json.dumps(payload))
+        return {}
+
+    async def _post_tool_failure_hook(
+        input_data: PostToolUseFailureHookInput,
+        tool_use_id: str | None,
+        context: HookContext,
+    ) -> SyncHookJSONOutput:
+        tool_name = input_data["tool_name"]
+        error = input_data.get("error", "unknown")
+        tid = input_data.get("tool_use_id") or tool_use_id
+        # Clean up start time if present
+        if tid:
+            tool_start_times.pop(tid, None)
+        agent_id = input_data.get("agent_id")
+        agent_type = input_data.get("agent_type")
+        payload = {"tool": tool_name, "success": False, "error": str(error)[:500]}
+        if agent_id:
+            payload["agent_id"] = agent_id
+        if agent_type:
+            payload["agent_type"] = agent_type
+        log.warning("tool_failure", tool=tool_name, error=_trunc(str(error)), agent_id=agent_id)
+        db.emit_event("tool_failure", json.dumps(payload))
+        return {}
+
+    async def _subagent_start_hook(
+        input_data: SubagentStartHookInput,
+        tool_use_id: str | None,
+        context: HookContext,
+    ) -> SyncHookJSONOutput:
+        agent_id = input_data["agent_id"]
+        agent_type = input_data["agent_type"]
+        subagent_start_times[agent_id] = time.monotonic()
+        log.info("subagent_start", agent_id=agent_id, agent_type=agent_type)
+        db.emit_event(
+            "subagent_start",
+            json.dumps({"agent_id": agent_id, "agent_type": agent_type}),
+        )
+        return {}
+
+    async def _subagent_stop_hook(
+        input_data: SubagentStopHookInput,
+        tool_use_id: str | None,
+        context: HookContext,
+    ) -> SyncHookJSONOutput:
+        agent_id = input_data["agent_id"]
+        agent_type = input_data["agent_type"]
+        duration_ms: int | None = None
+        if agent_id in subagent_start_times:
+            duration_ms = int((time.monotonic() - subagent_start_times.pop(agent_id)) * 1000)
+        log.info("subagent_stop", agent_id=agent_id, agent_type=agent_type, duration_ms=duration_ms)
+        db.emit_event(
+            "subagent_stop",
+            json.dumps(
+                {
+                    "agent_id": agent_id,
+                    "agent_type": agent_type,
+                    "duration_ms": duration_ms,
+                }
+            ),
+        )
+        return {}
+
     hooks: dict[HookEvent, list[HookMatcher]] = {
         "Stop": [HookMatcher(hooks=[_build_stop_hook(tool_count, autonomous)])],
         "PreToolUse": [HookMatcher(hooks=[cast(HookCallback, _pre_tool_hook)])],
+        "PostToolUse": [HookMatcher(hooks=[cast(HookCallback, _post_tool_hook)])],
+        "PostToolUseFailure": [HookMatcher(hooks=[cast(HookCallback, _post_tool_failure_hook)])],
         "PreCompact": [HookMatcher(hooks=[cast(HookCallback, _pre_compact_hook)])],
         "Notification": [HookMatcher(hooks=[cast(HookCallback, _notification_hook)])],
+        "SubagentStart": [HookMatcher(hooks=[cast(HookCallback, _subagent_start_hook)])],
+        "SubagentStop": [HookMatcher(hooks=[cast(HookCallback, _subagent_stop_hook)])],
     }
 
     allowed = _allowed_tools_for_model(effective_model)
