@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import fcntl
+import functools
 import json
 import os
 import re
@@ -83,6 +84,51 @@ def _clear_crash_context(*keys: str) -> None:
     """Remove keys from crash context when an operation completes."""
     for k in keys:
         _crash_context.pop(k, None)
+
+
+# ---------------------------------------------------------------------------
+# Per-handler error recovery — defense-in-depth for message processing
+# ---------------------------------------------------------------------------
+
+_F = Any  # type alias for handler function signatures
+
+
+def _safe_handler(func: _F) -> _F:
+    """Wrap a Telegram handler with per-handler error recovery.
+
+    Catches exceptions before they reach the global ``@dp.errors()`` handler,
+    providing richer context about which message caused the failure and writing
+    crash breadcrumbs.  The message is silently dropped rather than crashing
+    the polling loop — the global error handler still acts as a backstop.
+    """
+
+    @functools.wraps(func)
+    async def wrapper(*args: Any, **kwargs: Any) -> None:
+        try:
+            await func(*args, **kwargs)
+        except Exception:
+            event = args[0] if args else None
+            ctx: dict[str, Any] = {"handler": func.__name__}
+            if isinstance(event, types.Message):
+                ctx["chat_id"] = event.chat.id
+                ctx["message_id"] = event.message_id
+                ctx["sender"] = event.from_user.full_name if event.from_user else "unknown"
+                ctx["content_type"] = event.content_type
+            elif isinstance(event, types.MessageReactionUpdated):
+                ctx["chat_id"] = event.chat.id
+                ctx["message_id"] = event.message_id
+                ctx["sender"] = event.user.full_name if event.user else "unknown"
+            elif isinstance(event, types.CallbackQuery):
+                ctx["callback_data"] = event.data
+                if event.message and isinstance(event.message, types.Message):
+                    ctx["chat_id"] = event.message.chat.id
+            log.exception("handler_error_recovered", **ctx)
+            _set_crash_context(
+                last_handler_error=func.__name__,
+                last_handler_error_time=datetime.now(UTC).isoformat(timespec="seconds"),
+            )
+
+    return wrapper
 
 
 _TRIVIAL_WORDS = frozenset(
@@ -1018,6 +1064,7 @@ def _format_memory_context(memories: list[MemoryResult]) -> str:
 
 
 @dp.message(F.text.startswith("/restart"))
+@_safe_handler
 async def on_restart(msg: types.Message) -> None:
     if not msg.from_user:
         return
@@ -1037,6 +1084,7 @@ async def on_restart(msg: types.Message) -> None:
 
 
 @dp.message(F.text.startswith("/start"))
+@_safe_handler
 async def on_start(msg: types.Message) -> None:
     if not msg.from_user:
         return
@@ -1057,6 +1105,7 @@ async def on_start(msg: types.Message) -> None:
 
 
 @dp.message(F.text)
+@_safe_handler
 async def on_text(msg: types.Message) -> None:
     if not msg.from_user:
         return
@@ -1065,6 +1114,7 @@ async def on_text(msg: types.Message) -> None:
 
 
 @dp.message(F.photo)
+@_safe_handler
 async def on_photo(msg: types.Message) -> None:
     if not msg.from_user or not msg.photo:
         return
@@ -1078,6 +1128,7 @@ async def on_photo(msg: types.Message) -> None:
 
 
 @dp.message(F.voice)
+@_safe_handler
 async def on_voice(msg: types.Message) -> None:
     if not msg.from_user or not msg.voice:
         return
@@ -1094,6 +1145,7 @@ async def on_voice(msg: types.Message) -> None:
 
 
 @dp.message(F.document)
+@_safe_handler
 async def on_document(msg: types.Message) -> None:
     if not msg.from_user or not msg.document:
         return
@@ -1108,6 +1160,7 @@ async def on_document(msg: types.Message) -> None:
 
 
 @dp.message(F.video)
+@_safe_handler
 async def on_video(msg: types.Message) -> None:
     if not msg.from_user or not msg.video:
         return
@@ -1123,6 +1176,7 @@ async def on_video(msg: types.Message) -> None:
 
 
 @dp.message(F.video_note)
+@_safe_handler
 async def on_video_note(msg: types.Message) -> None:
     if not msg.from_user or not msg.video_note:
         return
@@ -1138,6 +1192,7 @@ async def on_video_note(msg: types.Message) -> None:
 
 
 @dp.message(F.sticker)
+@_safe_handler
 async def on_sticker(msg: types.Message) -> None:
     if not msg.from_user or not msg.sticker:
         return
@@ -1156,6 +1211,7 @@ async def on_sticker(msg: types.Message) -> None:
 
 
 @dp.message(F.animation)
+@_safe_handler
 async def on_animation(msg: types.Message) -> None:
     if not msg.from_user or not msg.animation:
         return
@@ -1170,6 +1226,7 @@ async def on_animation(msg: types.Message) -> None:
 
 
 @dp.message(F.audio)
+@_safe_handler
 async def on_audio(msg: types.Message) -> None:
     if not msg.from_user or not msg.audio:
         return
@@ -1185,6 +1242,7 @@ async def on_audio(msg: types.Message) -> None:
 
 
 @dp.message(F.location)
+@_safe_handler
 async def on_location(msg: types.Message) -> None:
     if not msg.from_user or not msg.location:
         return
@@ -1193,6 +1251,7 @@ async def on_location(msg: types.Message) -> None:
 
 
 @dp.message(F.contact)
+@_safe_handler
 async def on_contact(msg: types.Message) -> None:
     if not msg.from_user or not msg.contact:
         return
@@ -1202,6 +1261,7 @@ async def on_contact(msg: types.Message) -> None:
 
 
 @dp.message(F.poll)
+@_safe_handler
 async def on_poll(msg: types.Message) -> None:
     if not msg.from_user or not msg.poll:
         return
@@ -1211,6 +1271,7 @@ async def on_poll(msg: types.Message) -> None:
 
 
 @dp.message_reaction()
+@_safe_handler
 async def on_reaction(event: types.MessageReactionUpdated) -> None:
     if not event.user or not event.new_reaction:
         return
@@ -1235,6 +1296,7 @@ async def on_reaction(event: types.MessageReactionUpdated) -> None:
 
 
 @dp.edited_message()
+@_safe_handler
 async def on_edit(msg: types.Message) -> None:
     if not msg.from_user:
         return
@@ -1248,6 +1310,7 @@ async def on_edit(msg: types.Message) -> None:
 
 
 @dp.callback_query()
+@_safe_handler
 async def on_callback(cb: types.CallbackQuery) -> None:
     with contextlib.suppress(Exception):
         await cb.answer()
