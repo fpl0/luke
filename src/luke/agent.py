@@ -45,7 +45,9 @@ from claude_agent_sdk import (
 )
 from claude_agent_sdk.types import (
     HookEvent,
+    StreamEvent,
     SyncHookJSONOutput,
+    TextBlock,
     ThinkingConfig,
     ThinkingConfigAdaptive,
 )
@@ -58,13 +60,22 @@ from .memory import MEMORY_DIRS, read_frontmatter, read_memory_body, sanitize_me
 log: BoundLogger = structlog.get_logger()
 
 _INTERNAL_RE = re.compile(r"<internal>[\s\S]*?</internal>")
+_INTERNAL_OPEN_RE = re.compile(r"<internal>[\s\S]*$")  # unclosed tag at end
 _LOG_TRUNCATION = 100  # chars for log message truncation
 _TG_MAX_MSG_LEN = 4096  # Telegram API hard limit
+_STREAMING_CURSOR = " ▍"  # visual typing indicator
 
 
 def _trunc(text: str) -> str:
     """Truncate text for logging."""
     return text[:_LOG_TRUNCATION] + "…" if len(text) > _LOG_TRUNCATION else text
+
+
+def _clean_streaming_text(raw: str) -> str:
+    """Strip complete and partial <internal> tags for streaming display."""
+    text = _INTERNAL_RE.sub("", raw)  # strip closed tags
+    text = _INTERNAL_OPEN_RE.sub("", text)  # strip unclosed trailing tag
+    return text.strip()
 
 
 def _ok(text: str) -> dict[str, Any]:
@@ -171,6 +182,28 @@ _SEND_TOOLS: frozenset[str] = frozenset(
 
 _AUTO_SKILL_THRESHOLD: int = 5  # tool calls to trigger procedure extraction in stop hook
 
+# Active client registry — enables external interruption of running agents
+_active_clients: dict[str, ClaudeSDKClient] = {}
+
+
+async def interrupt_agent(chat_id: str) -> bool:
+    """Interrupt a running agent for the given chat. Returns True if interrupted."""
+    client = _active_clients.get(chat_id)
+    if client is None:
+        return False
+    try:
+        await client.interrupt()
+        log.info("agent_interrupted", chat_id=chat_id)
+        return True
+    except Exception:
+        log.exception("interrupt_failed", chat_id=chat_id)
+        return False
+
+
+def get_active_agents() -> list[str]:
+    """Return chat IDs with currently running agents."""
+    return list(_active_clients.keys())
+
 
 @dataclass(slots=True)
 class AgentResult:
@@ -181,6 +214,7 @@ class AgentResult:
     duration_api_ms: int = 0
     sent_messages: int = 0  # messages sent via MCP tools during this run
     tool_uses: int = 0  # total tool calls made during this run
+    streaming_msg_id: int | None = None  # Telegram msg ID if streaming preview was sent
 
 
 # ---------------------------------------------------------------------------
@@ -1362,6 +1396,7 @@ async def run_agent(
         max_budget_usd=(
             max_budget_usd if max_budget_usd is not None else settings.agent_max_budget_usd
         ),
+        include_partial_messages=settings.streaming_enabled,
         enable_file_checkpointing=True,
         sandbox={"enabled": True, "autoAllowBashIfSandboxed": True},
         hooks=hooks,
@@ -1426,37 +1461,85 @@ async def run_agent(
 
     result = AgentResult()
     async with ClaudeSDKClient(options=options) as client:
-        if isinstance(prompt, list):
+        _active_clients[chat_id] = client
+        try:
+            if isinstance(prompt, list):
 
-            async def _multimodal() -> AsyncIterator[dict[str, Any]]:
-                yield {
-                    "type": "user",
-                    "message": {"role": "user", "content": prompt},
-                    "session_id": session_id or "default",
-                }
+                async def _multimodal() -> AsyncIterator[dict[str, Any]]:
+                    yield {
+                        "type": "user",
+                        "message": {"role": "user", "content": prompt},
+                        "session_id": session_id or "default",
+                    }
 
-            await client.query(_multimodal())
-        else:
-            await client.query(prompt)
-        async for msg in client.receive_response():
-            if isinstance(msg, ResultMessage):
-                result.session_id = result.session_id or msg.session_id
-                if msg.total_cost_usd is not None:
-                    result.cost_usd = msg.total_cost_usd
-                result.num_turns = msg.num_turns
-                result.duration_api_ms = msg.duration_api_ms
-                if msg.usage:
-                    log.info(
-                        "agent_usage",
-                        input=msg.usage.get("input_tokens", 0),
-                        output=msg.usage.get("output_tokens", 0),
-                        cache_create=msg.usage.get("cache_creation_input_tokens", 0),
-                        cache_read=msg.usage.get("cache_read_input_tokens", 0),
-                    )
-                if msg.result:
-                    text = _INTERNAL_RE.sub("", msg.result).strip()
-                    if text:
-                        result.texts.append(text)
+                await client.query(_multimodal())
+            else:
+                await client.query(prompt)
+            # Streaming state — progressive delivery to Telegram
+            _stream_buf = ""  # accumulated raw text from stream events
+            _stream_msg_id: int | None = None  # Telegram message ID for edits
+            _stream_last_edit = 0.0  # monotonic time of last edit
+            _stream_enabled = settings.streaming_enabled and not autonomous
+
+            async for msg in client.receive_response():
+                if _stream_enabled and isinstance(msg, StreamEvent):
+                    event = msg.event
+                    if event.get("type") == "content_block_delta":
+                        delta = event.get("delta", {})
+                        if delta.get("type") == "text_delta":
+                            _stream_buf += delta.get("text", "")
+                            clean = _clean_streaming_text(_stream_buf)
+                            now = time.monotonic()
+                            if (
+                                clean
+                                and len(clean) >= settings.streaming_min_chars
+                                and now - _stream_last_edit >= settings.streaming_edit_interval
+                            ):
+                                # Truncate for Telegram limit, add cursor
+                                display = clean[: _TG_MAX_MSG_LEN - 10]
+                                if len(clean) > _TG_MAX_MSG_LEN - 10:
+                                    display += "…"
+                                else:
+                                    display += _STREAMING_CURSOR
+                                try:
+                                    if _stream_msg_id:
+                                        await bot.edit_message_text(
+                                            text=display,
+                                            chat_id=int(chat_id),
+                                            message_id=_stream_msg_id,
+                                            parse_mode=None,
+                                        )
+                                    else:
+                                        sent = await bot.send_message(
+                                            int(chat_id), display, parse_mode=None
+                                        )
+                                        _stream_msg_id = sent.message_id
+                                    _stream_last_edit = now
+                                except Exception:
+                                    pass  # best-effort — don't break agent run
+
+                elif isinstance(msg, ResultMessage):
+                    result.session_id = result.session_id or msg.session_id
+                    if msg.total_cost_usd is not None:
+                        result.cost_usd = msg.total_cost_usd
+                    result.num_turns = msg.num_turns
+                    result.duration_api_ms = msg.duration_api_ms
+                    if msg.usage:
+                        log.info(
+                            "agent_usage",
+                            input=msg.usage.get("input_tokens", 0),
+                            output=msg.usage.get("output_tokens", 0),
+                            cache_create=msg.usage.get("cache_creation_input_tokens", 0),
+                            cache_read=msg.usage.get("cache_read_input_tokens", 0),
+                        )
+                    if msg.result:
+                        text = _INTERNAL_RE.sub("", msg.result).strip()
+                        if text:
+                            result.texts.append(text)
+
+            result.streaming_msg_id = _stream_msg_id
+        finally:
+            _active_clients.pop(chat_id, None)
 
     result.sent_messages = send_count["n"]
     result.tool_uses = tool_count["n"]

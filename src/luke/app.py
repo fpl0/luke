@@ -31,7 +31,14 @@ from claude_agent_sdk.types import (
 from structlog.stdlib import BoundLogger
 
 from . import db, memory
-from .agent import _trunc, run_agent, send_long_message
+from .agent import (
+    _TG_MAX_MSG_LEN,
+    _trunc,
+    get_active_agents,
+    interrupt_agent,
+    run_agent,
+    send_long_message,
+)
 from .config import settings
 from .db import ensure_utc
 from .media import build_prompt, extract_frame, transcribe
@@ -562,8 +569,35 @@ async def process(chat_id: str) -> None:
         # Send result text first — this is the user-facing response and must
         # not be blocked by non-critical post-processing failures.
         if result.sent_messages == 0:
-            for text in result.texts:
-                await send_long_message(bot, chat_id=int(chat_id), text=text)
+            if result.streaming_msg_id and len(result.texts) == 1:
+                # Edit the streaming preview with the final text
+                final = result.texts[0]
+                if len(final) <= _TG_MAX_MSG_LEN:
+                    try:
+                        await bot.edit_message_text(
+                            text=final,
+                            chat_id=int(chat_id),
+                            message_id=result.streaming_msg_id,
+                        )
+                    except Exception:
+                        # Fallback: send as new message if edit fails
+                        await send_long_message(bot, chat_id=int(chat_id), text=final)
+                else:
+                    # Multi-chunk: delete preview, send full
+                    with contextlib.suppress(Exception):
+                        await bot.delete_message(int(chat_id), result.streaming_msg_id)
+                    await send_long_message(bot, chat_id=int(chat_id), text=final)
+            else:
+                # No streaming preview, or multiple text blocks — send normally
+                if result.streaming_msg_id:
+                    with contextlib.suppress(Exception):
+                        await bot.delete_message(int(chat_id), result.streaming_msg_id)
+                for text in result.texts:
+                    await send_long_message(bot, chat_id=int(chat_id), text=text)
+        elif result.streaming_msg_id:
+            # Agent sent messages via tools — clean up streaming preview
+            with contextlib.suppress(Exception):
+                await bot.delete_message(int(chat_id), result.streaming_msg_id)
 
         # --- Post-agent bookkeeping (non-critical) ---
         # Failures here are logged but must never prevent the response above.
@@ -1081,6 +1115,26 @@ async def on_restart(msg: types.Message) -> None:
         "-k",
         f"gui/{uid}/com.luke",
     )
+
+
+@dp.message(F.text.startswith("/stop"))
+@_safe_handler
+async def on_stop(msg: types.Message) -> None:
+    """Interrupt any running agent for this chat."""
+    if not msg.from_user:
+        return
+    chat_id = str(msg.chat.id)
+    if settings.chat_id and chat_id != settings.chat_id:
+        return
+    active = get_active_agents()
+    if chat_id not in active:
+        await bot.send_message(int(chat_id), "No agent running.")
+        return
+    ok = await interrupt_agent(chat_id)
+    if ok:
+        await bot.send_message(int(chat_id), "Interrupted.")
+    else:
+        await bot.send_message(int(chat_id), "Interrupt failed — agent may have already finished.")
 
 
 @dp.message(F.text.startswith("/start"))
