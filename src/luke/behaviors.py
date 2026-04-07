@@ -77,6 +77,10 @@ async def _run_behavior(
             result.num_turns,
             result.duration_api_ms,
             f"behavior:{name}:{effective_model}",
+            input_tokens=result.input_tokens,
+            output_tokens=result.output_tokens,
+            cache_create_tokens=result.cache_create_tokens,
+            cache_read_tokens=result.cache_read_tokens,
         )
         return result
     except Exception:

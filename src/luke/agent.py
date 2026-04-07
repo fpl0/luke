@@ -55,7 +55,7 @@ from claude_agent_sdk.types import (
 )
 from structlog.stdlib import BoundLogger
 
-from . import db, memory
+from . import context, db, memory
 from .config import settings
 from .memory import MEMORY_DIRS, read_frontmatter, read_memory_body, sanitize_memory_id
 
@@ -66,6 +66,20 @@ _INTERNAL_OPEN_RE = re.compile(r"<internal>[\s\S]*$")  # unclosed tag at end
 _LOG_TRUNCATION = 100  # chars for log message truncation
 _TG_MAX_MSG_LEN = 4096  # Telegram API hard limit
 _STREAMING_CURSOR = " ▍"  # visual typing indicator
+
+
+_LEAKED_INTERNAL_PATTERNS = re.compile(
+    r"^(?:No response (?:requested|needed)|Nothing to (?:say|send|respond)"
+    r"|Silently |I (?:won't|don't need to) (?:send|respond|reply)"
+    r"|No (?:message|reply|output) (?:needed|required|necessary))"
+    r"\.?$",
+    re.IGNORECASE,
+)
+
+
+def _is_leaked_internal(text: str) -> bool:
+    """Detect internal reasoning that leaked without <internal> tags."""
+    return bool(_LEAKED_INTERNAL_PATTERNS.match(text.strip()))
 
 
 def _trunc(text: str) -> str:
@@ -217,6 +231,10 @@ class AgentResult:
     sent_messages: int = 0  # messages sent via MCP tools during this run
     tool_uses: int = 0  # total tool calls made during this run
     streaming_msg_id: int | None = None  # Telegram msg ID if streaming preview was sent
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_create_tokens: int = 0
+    cache_read_tokens: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -1077,28 +1095,11 @@ def _build_stop_hook(tool_count: dict[str, int], autonomous: bool) -> HookCallba
 async def _pre_compact_hook(
     input_data: PreCompactHookInput,
     tool_use_id: str | None,
-    context: HookContext,
+    hook_context: HookContext,
 ) -> SyncHookJSONOutput:
     log.info("session_compact", trigger=input_data["trigger"])
-    return {
-        "systemMessage": (
-            "CRITICAL — preserve in your compaction summary:\n"
-            "1. All memory IDs you've referenced or created (needed for follow-ups)\n"
-            "2. The user's most recent request and any pending actions\n"
-            "3. Active goals and their current status\n"
-            "4. Key facts about the user (preferences, context) from injected memories\n"
-            "5. Any tool results not yet communicated to the user\n"
-            "6. Relationship links between memories you've established\n"
-            "\n"
-            "CONSTITUTIONAL INVARIANTS (never compress away):\n"
-            "- You are Luke. Not an AI, not an assistant. A close friend.\n"
-            "- Voice: warm, unhurried, wry. Never corporate or scripted.\n"
-            "- Always 'you', never 'the user'. HTML only, no markdown.\n"
-            "- Have real opinions. No 'here are the pros and cons' cop-outs.\n"
-            "- Do the work, don't describe it. Don't ask 'would you like me to'.\n"
-            "- One message, not three. Stop when done.\n"
-        )
-    }
+    manifest = context.build_preservation_manifest()
+    return {"systemMessage": manifest}
 
 
 async def _notification_hook(
@@ -1254,6 +1255,12 @@ async def run_agent(
         persona += (
             "\n\n<constitutional>\n" + constitutional_path.read_text() + "\n</constitutional>"
         )
+
+    # Inject working memory — priority memories scored and selected at session start
+    prompt_text_for_context = prompt if isinstance(prompt, str) else str(prompt[0].get("text", ""))
+    working_ctx = context.build_working_context(query=prompt_text_for_context)
+    if working_ctx:
+        persona += "\n\n" + working_ctx
 
     # Per-run counters and timing state (closed over by hooks)
     send_count = {"n": 0}
@@ -1547,16 +1554,21 @@ async def run_agent(
                     result.num_turns = msg.num_turns
                     result.duration_api_ms = msg.duration_api_ms
                     if msg.usage:
+                        result.input_tokens = msg.usage.get("input_tokens", 0)
+                        result.output_tokens = msg.usage.get("output_tokens", 0)
+                        result.cache_create_tokens = msg.usage.get("cache_creation_input_tokens", 0)
+                        result.cache_read_tokens = msg.usage.get("cache_read_input_tokens", 0)
                         log.info(
                             "agent_usage",
-                            input=msg.usage.get("input_tokens", 0),
-                            output=msg.usage.get("output_tokens", 0),
-                            cache_create=msg.usage.get("cache_creation_input_tokens", 0),
-                            cache_read=msg.usage.get("cache_read_input_tokens", 0),
+                            input=result.input_tokens,
+                            output=result.output_tokens,
+                            cache_create=result.cache_create_tokens,
+                            cache_read=result.cache_read_tokens,
                         )
                     if msg.result:
                         text = _INTERNAL_RE.sub("", msg.result).strip()
-                        if text:
+                        text = _INTERNAL_OPEN_RE.sub("", text).strip()
+                        if text and not _is_leaked_internal(text):
                             result.texts.append(text)
 
             result.streaming_msg_id = _stream_msg_id
