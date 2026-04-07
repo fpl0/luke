@@ -1073,13 +1073,10 @@ def _build_stop_hook(tool_count: dict[str, int], autonomous: bool) -> HookCallba
                 "why you chose your solution, what worked or didn't.\n"
                 "4. Did you notice a pattern or preference? Save an insight.\n"
                 "5. Is there anything pending that needs follow-up? Schedule a reminder.\n"
-                "6. Did the user mention wanting to achieve something? Create or update a goal.\n"
-                "7. Save a 'conversation-state-latest' episode: what you discussed, "
-                "user's mood/energy, anything unresolved or promised, what's likely to "
-                "come up next. Keep under 200 words. Overwrite the previous one if it exists."
+                "6. Did the user mention wanting to achieve something? Create or update a goal."
                 + skill_prompt
                 + (
-                    "\n8. Correction check: did any recalled information get corrected "
+                    "\n7. Correction check: did any recalled information get corrected "
                     "during this conversation? If the user corrected a fact you remembered, "
                     "or you realized something you stored was wrong, use the remember tool "
                     "to update the entity with the corrected content. Corrections include: "
