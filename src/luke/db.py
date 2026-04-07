@@ -437,6 +437,16 @@ _MIGRATIONS: list[tuple[int, str, list[str]]] = [
             "ALTER TABLE memory_history ADD COLUMN confidence REAL",
         ],
     ),
+    (
+        11,
+        "add cache token tracking to cost_log for prompt caching analysis",
+        [
+            "ALTER TABLE cost_log ADD COLUMN input_tokens INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE cost_log ADD COLUMN output_tokens INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE cost_log ADD COLUMN cache_create_tokens INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE cost_log ADD COLUMN cache_read_tokens INTEGER NOT NULL DEFAULT 0",
+        ],
+    ),
 ]
 
 
@@ -1092,13 +1102,20 @@ def log_cost(
     num_turns: int,
     duration_api_ms: int,
     source: str = "message",
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    cache_create_tokens: int = 0,
+    cache_read_tokens: int = 0,
 ) -> None:
     """Record cost and usage for an agent run."""
     db = _db()
     db.execute(
-        "INSERT INTO cost_log (chat_id, cost_usd, num_turns, duration_api_ms, source) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (chat_id, cost_usd, num_turns, duration_api_ms, source),
+        "INSERT INTO cost_log "
+        "(chat_id, cost_usd, num_turns, duration_api_ms, source, "
+        " input_tokens, output_tokens, cache_create_tokens, cache_read_tokens) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (chat_id, cost_usd, num_turns, duration_api_ms, source,
+         input_tokens, output_tokens, cache_create_tokens, cache_read_tokens),
     )
     _commit(db)
 
@@ -1118,7 +1135,11 @@ def get_cost_report(period: str = "month") -> str:
         f"SELECT COALESCE(SUM(cost_usd), 0) AS total, "
         f"COUNT(*) AS runs, "
         f"COALESCE(SUM(num_turns), 0) AS turns, "
-        f"COALESCE(AVG(cost_usd), 0) AS avg_cost "
+        f"COALESCE(AVG(cost_usd), 0) AS avg_cost, "
+        f"COALESCE(SUM(input_tokens), 0) AS input_tok, "
+        f"COALESCE(SUM(output_tokens), 0) AS output_tok, "
+        f"COALESCE(SUM(cache_create_tokens), 0) AS cache_create, "
+        f"COALESCE(SUM(cache_read_tokens), 0) AS cache_read "
         f"FROM cost_log WHERE {where}",
     ).fetchone()
     assert row is not None
@@ -1135,6 +1156,17 @@ def get_cost_report(period: str = "month") -> str:
         f"  Turns: {row['turns']}",
         f"  Avg per run: ${row['avg_cost']:.4f}",
     ]
+
+    # Cache efficiency stats (only show if data exists)
+    total_input = row["input_tok"] + row["cache_create"] + row["cache_read"]
+    if total_input > 0:
+        cache_hit_rate = row["cache_read"] / total_input * 100
+        lines.append(f"  Tokens: {total_input:,} input ({row['output_tok']:,} output)")
+        lines.append(
+            f"  Cache: {row['cache_read']:,} read / {row['cache_create']:,} created "
+            f"({cache_hit_rate:.0f}% hit rate)"
+        )
+
     if by_source:
         lines.append("  By source:")
         for s in by_source:

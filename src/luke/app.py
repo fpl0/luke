@@ -561,6 +561,10 @@ async def process(chat_id: str) -> None:
                 result.num_turns,
                 result.duration_api_ms,
                 f"message:{model}",
+                input_tokens=result.input_tokens,
+                output_tokens=result.output_tokens,
+                cache_create_tokens=result.cache_create_tokens,
+                cache_read_tokens=result.cache_read_tokens,
             )
             # Advance cursor only after successful agent run
             db.advance_cursor(chat_id, messages[-1].id)
@@ -1507,6 +1511,7 @@ async def main() -> None:
 
     await bot.set_my_commands(
         [
+            BotCommand(command="stop", description="Interrupt running agent"),
             BotCommand(command="cost", description="Show cost & usage stats"),
             BotCommand(command="tasks", description="List scheduled tasks"),
             BotCommand(command="recall", description="Search memories"),

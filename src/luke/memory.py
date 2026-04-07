@@ -2159,10 +2159,16 @@ def assign_cluster_online(mem_id: str, embedding: list[float] | None) -> int | N
         # Assign the new memory
         normalized_new = _normalize_embeddings([embedding])
         np_new = _embeddings_to_numpy_array(normalized_new)
-        label = int(birch.predict(np_new)[0])
 
-        # Update BIRCH model with new point
-        birch.partial_fit(np_new)
+        # If BIRCH hasn't been fitted yet, partial_fit first to initialize
+        from sklearn.exceptions import NotFittedError  # type: ignore[import-not-found]
+
+        try:
+            label = int(birch.predict(np_new)[0])
+            birch.partial_fit(np_new)
+        except NotFittedError:
+            birch.partial_fit(np_new)
+            label = int(birch.predict(np_new)[0])
 
         # Store cluster assignment
         db.execute(
