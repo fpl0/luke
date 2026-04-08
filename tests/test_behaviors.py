@@ -364,6 +364,7 @@ class TestRunDeepWork:
 
         with (
             patch("luke.behaviors.db") as mock_db,
+            patch("luke.behaviors.bus"),
             patch("luke.behaviors.settings") as mock_settings,
             patch("luke.behaviors.run_agent", new_callable=AsyncMock) as mock_agent,
         ):
@@ -379,6 +380,7 @@ class TestRunDeepWork:
 
         with (
             patch("luke.behaviors.db") as mock_db,
+            patch("luke.behaviors.bus"),
             patch("luke.behaviors.memory") as mock_memory,
             patch("luke.behaviors.settings") as mock_settings,
         ):
@@ -400,6 +402,7 @@ class TestRunDeepWork:
 
         with (
             patch("luke.behaviors.db") as mock_db,
+            patch("luke.behaviors.bus"),
             patch("luke.behaviors.memory") as mock_memory,
             patch("luke.behaviors.run_agent", new_callable=AsyncMock) as mock_agent,
         ):
@@ -423,6 +426,7 @@ class TestRunDeepWork:
 
         with (
             patch("luke.behaviors.db") as mock_db,
+            patch("luke.behaviors.bus"),
             patch("luke.behaviors.memory") as mock_memory,
             patch("luke.behaviors.run_agent", side_effect=RuntimeError("err")),
             patch("luke.behaviors.read_memory_body", return_value="content"),
@@ -448,6 +452,7 @@ class TestRunDeepWork:
 
         with (
             patch("luke.behaviors.db") as mock_db,
+            patch("luke.behaviors.bus"),
             patch("luke.behaviors.memory") as mock_memory,
             patch("luke.behaviors.read_memory_body", return_value=""),
             patch("luke.behaviors.settings") as mock_settings,

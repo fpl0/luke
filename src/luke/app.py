@@ -31,6 +31,7 @@ from claude_agent_sdk.types import (
 from structlog.stdlib import BoundLogger
 
 from . import db, memory
+from .bus import bus
 from .agent import (
     _TG_MAX_MSG_LEN,
     _trunc,
@@ -425,7 +426,7 @@ async def process(chat_id: str) -> None:
 
         # Emit user_message event for event-driven behavior triggers
         word_count = sum(len(m.content.split()) for m in messages)
-        db.emit_event("user_message", f'{{"word_count": {word_count}}}')
+        bus.emit("user_message", {"word_count": word_count})
 
         # --- Enrichment phase (graceful degradation) ---
         # If prompt building or memory recall fails, fall back to raw text
@@ -950,7 +951,7 @@ def _save_conv_state(
         importance=0.3,
     )
     # Emit event so event-driven behaviors notice the new episode
-    db.emit_event("new_episode", f'{{"id": "{_CONV_STATE_ID}"}}')
+    bus.emit("new_episode", {"id": _CONV_STATE_ID})
 
 
 _background_tasks: set[asyncio.Task[None]] = set()

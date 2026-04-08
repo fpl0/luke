@@ -13,6 +13,7 @@ from structlog.stdlib import BoundLogger
 
 from . import db, memory
 from .agent import AgentResult, run_agent
+from .bus import bus
 from .config import settings
 from .memory import read_memory_body, sanitize_memory_id
 
@@ -309,6 +310,96 @@ async def run_reflection(bot: Bot, sem: asyncio.Semaphore) -> None:
     )
 
 
+async def run_reflexion(
+    bot: Bot,
+    sem: asyncio.Semaphore,
+    *,
+    event_kind: str = "",
+    event_payload: dict[str, Any] | None = None,
+) -> None:
+    """Immediate micro-level self-improvement: analyze a specific failure event.
+
+    Unlike reflection (weekly, macro, user-facing feedback patterns), reflexion
+    is triggered by specific failure events and focuses on system-internal
+    root-cause analysis to improve the next attempt.
+    """
+    if not settings.chat_id:
+        return
+
+    payload = event_payload or {}
+    goal_id = payload.get("goal_id", "unknown")
+    reason = payload.get("reason", "")
+
+    # Gather context about the failure
+    context_sections: list[str] = []
+
+    # Include recent quality scores for the goal if available
+    if goal_id != "unknown":
+        scores = db.get_recent_quality_scores(goal_id, 5)
+        if scores:
+            avg = sum(scores) / len(scores)
+            context_sections.append(
+                f"Quality history for [{goal_id}]: last {len(scores)} ratings: "
+                f"{scores} (avg: {avg:.1f})"
+            )
+
+        # Include the goal body for context
+        body = read_memory_body("goal", goal_id, 500)
+        if body:
+            context_sections.append(f"Goal [{goal_id}]:\n{body}")
+
+    # Include the plan status if available
+    if goal_id != "unknown":
+        plan_status = _parse_plan_status(goal_id)
+        if plan_status:
+            context_sections.append(f"Plan status for [{goal_id}]: {plan_status}")
+
+    # Recall previous reflexion insights to avoid repeating the same analysis
+    prev_insights = memory.recall(
+        query=f"reflexion {goal_id}",
+        mem_type="insight",
+        limit=3,
+    )
+    if prev_insights:
+        prev_lines: list[str] = []
+        for ins in prev_insights:
+            body = read_memory_body(ins["type"], ins["id"], 300)
+            if body:
+                prev_lines.append(f"[{ins['id']}]: {body}")
+        if prev_lines:
+            context_sections.append(
+                "Previous reflexion insights (do NOT repeat these):\n"
+                + "\n---\n".join(prev_lines)
+            )
+
+    prompt = (
+        f"Reflexion task. A failure event just occurred.\n\n"
+        f"Event: {event_kind}\n"
+        f"Payload: {payload}\n"
+        + (f"Skip reason: {reason}\n" if reason else "")
+        + ("\n\n".join(context_sections) + "\n\n" if context_sections else "\n")
+        + "Analyze this failure:\n"
+        "1. What just happened? Describe the failure/low-quality event concretely.\n"
+        "2. Root cause -- what assumption was wrong?\n"
+        "3. What should change for the next attempt? Be specific and actionable.\n"
+        "4. Save a reflexion insight with 'remember' (type: insight, tags: ['reflexion', "
+        f"'{goal_id}']). The insight should be concise and actionable.\n\n"
+        "Do NOT message the user. This is internal system analysis only.\n"
+        "Do NOT repeat insights that already exist (see previous reflexion insights above).\n"
+    )
+
+    await _run_behavior(
+        "reflexion",
+        prompt,
+        bot,
+        sem,
+        model=settings.consolidation_model,  # sonnet for cost-effectiveness
+        max_sends=0,
+        event_kind=event_kind,
+        goal_id=goal_id,
+    )
+
+
 async def run_proactive_scan(bot: Bot, sem: asyncio.Semaphore) -> None:
     """Daily proactive scan: check for actionable items and message the user."""
     chat_id = settings.chat_id
@@ -426,19 +517,18 @@ async def run_deep_work(bot: Bot, sem: asyncio.Semaphore) -> None:
     daily_cost = db.get_daily_deep_work_cost()
     if daily_cost >= settings.daily_deep_work_budget_usd:
         log.info("deep_work_budget_exhausted", daily_cost=daily_cost)
-        db.emit_event("deep_work_skipped", '{"reason": "budget_exhausted"}')
+        bus.emit("deep_work_skipped", {"reason": "budget_exhausted"})
         return
 
     goals = memory.recall(mem_type="goal", limit=10)
     if not goals:
-        db.emit_event("deep_work_skipped", '{"reason": "no_goals"}')
+        bus.emit("deep_work_skipped", {"reason": "no_goals"})
         return
 
-    # Quality gate: get goals blocked by low quality scores
-    quality_blocked = set(db.get_quality_blocked_goals())
-
+    # Graduated quality gates: paused / reflexion / normal
     goal_sections: list[str] = []
     skipped_goals: list[str] = []
+    reflexion_goals: list[str] = []  # goals that triggered reflexion before proceeding
     for g in goals:
         gid = g["id"]
 
@@ -448,10 +538,16 @@ async def run_deep_work(bot: Bot, sem: asyncio.Semaphore) -> None:
             skipped_goals.append(f"{gid} (plan {plan_st})")
             continue
 
-        # Skip goals blocked by quality scores
-        if gid in quality_blocked:
-            skipped_goals.append(f"{gid} (quality avg < 2.0 over last 3 sessions)")
+        # Graduated quality gate
+        tier = db.get_goal_quality_tier(gid)
+        if tier == "paused":
+            skipped_goals.append(f"{gid} (quality avg < 1.5 over last 3 sessions — PAUSED)")
+            log.warning("deep_work_goal_paused", goal_id=gid)
             continue
+        if tier == "reflexion":
+            # Emit low_quality_work event to trigger reflexion analysis
+            bus.emit("low_quality_work", {"goal_id": gid})
+            reflexion_goals.append(gid)
 
         body = read_memory_body(g["type"], g["id"], 1000)
         if body:
@@ -461,6 +557,7 @@ async def run_deep_work(bot: Bot, sem: asyncio.Semaphore) -> None:
         log.info("deep_work_goals_skipped", skipped=skipped_goals)
 
     if not goal_sections:
+        bus.emit("deep_work_skipped", {"reason": "all_goals_filtered"})
         return
 
     # Check for existing work plans
@@ -486,6 +583,19 @@ async def run_deep_work(bot: Bot, sem: asyncio.Semaphore) -> None:
                 f"[{g['id']}]: last {len(scores)} ratings: {scores} (avg: {avg:.1f})"
             )
 
+    # Include reflexion insights for goals in the reflexion tier
+    reflexion_context: list[str] = []
+    for gid in reflexion_goals:
+        insights = memory.recall(
+            query=f"reflexion {gid}",
+            mem_type="insight",
+            limit=2,
+        )
+        for ins in insights or []:
+            body = read_memory_body(ins["type"], ins["id"], 300)
+            if body:
+                reflexion_context.append(f"[{ins['id']}] (for {gid}): {body}")
+
     remaining = settings.daily_deep_work_budget_usd - daily_cost
     now_str = datetime.now(UTC).isoformat(timespec="minutes")
 
@@ -496,6 +606,12 @@ async def run_deep_work(bot: Bot, sem: asyncio.Semaphore) -> None:
         + "\n\n".join(goal_sections)
         + ("\n\nExisting work plans:\n" + "\n".join(plan_status) if plan_status else "")
         + ("\n\nQuality history:\n" + "\n".join(quality_context) if quality_context else "")
+        + (
+            "\n\nREFLEXION WARNINGS (recent quality is low — apply these insights):\n"
+            + "\n---\n".join(reflexion_context)
+            if reflexion_context
+            else ""
+        )
         + "\n\n"
         "Phase 1 — PLAN (do this first):\n"
         "1. Pick the highest-priority goal\n"
@@ -530,7 +646,7 @@ async def run_deep_work(bot: Bot, sem: asyncio.Semaphore) -> None:
     )
 
     # Track that orient phase completed (all gates passed, goals reviewed)
-    db.emit_event("deep_work_oriented", f'{{"goals_reviewed": {len(goals)}}}')
+    bus.emit("deep_work_oriented", {"goals_reviewed": len(goals)})
 
     await _run_behavior(
         "deep_work",
