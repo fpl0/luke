@@ -265,7 +265,7 @@ async def start_scheduler_loop(
             has_episodes = (
                 db.count_unconsumed_events("new_episode") >= settings.consolidation_min_cluster
             )
-            if has_episodes or now_mono - last_consolidation >= consol_interval * 6:
+            if has_episodes or now_mono - last_consolidation >= consol_interval * 3:
                 last_consolidation = now_mono
                 maintenance_coros.append(("consolidation", run_consolidation(bot, sem)))
 
@@ -273,7 +273,7 @@ async def start_scheduler_loop(
         proactive_interval = _effective_interval("proactive_scan", settings.proactive_scan_interval)
         if now_mono - last_proactive >= proactive_interval:
             has_activity = db.count_unconsumed_events("goal_updated", "user_message") >= 1
-            if has_activity or now_mono - last_proactive >= proactive_interval * 6:
+            if has_activity or now_mono - last_proactive >= proactive_interval * 3:
                 last_proactive = now_mono
                 maintenance_coros.append(("proactive_scan", run_proactive_scan(bot, sem)))
 
@@ -390,7 +390,7 @@ async def start_scheduler_loop(
         deep_work_running = _deep_work_task is not None and not _deep_work_task.done()
         if not deep_work_running and now_mono - last_deep_work >= settings.deep_work_interval:
             has_goal_activity = db.count_unconsumed_events("goal_updated") >= 1
-            if has_goal_activity or now_mono - last_deep_work >= settings.deep_work_interval * 6:
+            if has_goal_activity or now_mono - last_deep_work >= settings.deep_work_interval * 3:
                 # Track continuation: deep work launching after maintenance ran
                 if maintenance_coros:
                     db.emit_event("post_trigger_continuation", '{}')

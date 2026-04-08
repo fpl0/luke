@@ -50,7 +50,7 @@ class Settings(BaseSettings):
     decay_rate_goal: float = 0.9997
 
     # Consolidation
-    episode_consolidation_interval: float = 43200.0  # twice daily (seconds)
+    episode_consolidation_interval: float = 21600.0  # every 6h (seconds)
     consolidation_min_cluster: int = 2
 
     # Insight consolidation
@@ -65,7 +65,7 @@ class Settings(BaseSettings):
 
     # Reflection + proactive scan + goal execution
     reflection_interval: float = 604800.0  # weekly (seconds)
-    proactive_scan_interval: float = 21600.0  # every 6 hours (seconds)
+    proactive_scan_interval: float = 10800.0  # every 3h (seconds)
     # Dream (autonomous thinking periods)
     dream_interval: float = 21600.0  # 6h between sessions
     dream_max_budget_usd: float = 2.0  # per-session cap
@@ -75,7 +75,7 @@ class Settings(BaseSettings):
     skill_extraction_interval: float = 21600.0  # 6h between extraction runs
 
     # Autonomous goal loop (replaces goal_execution)
-    deep_work_interval: float = 14400.0  # 4h between sessions
+    deep_work_interval: float = 7200.0  # 2h between sessions
     deep_work_max_turns: int = 500
     deep_work_max_budget_usd: float = 10.0  # per-session cap
     daily_deep_work_budget_usd: float = 120.0  # daily autonomous spend cap
