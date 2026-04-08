@@ -448,8 +448,8 @@ class TestBehaviorEventMapping:
         uncovered = emitted_types - consumed_types
         assert not uncovered, f"Event types emitted but never consumed: {uncovered}"
 
-    def test_fallback_multiplier_is_6(self) -> None:
-        """Time-based fallback should be 6x the effective interval, not 2x."""
+    def test_fallback_multiplier_range(self) -> None:
+        """Time-based fallback should be 3x-6x the effective interval."""
         import ast
         import inspect
 
@@ -466,30 +466,17 @@ class TestBehaviorEventMapping:
                         and isinstance(comparator.right, ast.Constant)
                     ):
                         fallback_multipliers.append(comparator.right.value)
-        # All fallback multipliers should be 6
-        assert all(m == 6 for m in fallback_multipliers), (
-            f"Expected all fallback multipliers to be 6, got {fallback_multipliers}"
+        # Scorecard-tracked behaviors use 3x, others use 6x
+        assert all(m in (3, 6) for m in fallback_multipliers), (
+            f"Expected fallback multipliers to be 3 or 6, got {fallback_multipliers}"
         )
 
     def test_all_newly_gated_behaviors_have_fallback_multiplier(self) -> None:
-        """Event-gated behaviors must all have a 6x fallback."""
+        """Event-gated behaviors must all have a 3x or 6x fallback."""
         import ast
         import inspect
 
         source = inspect.getsource(start_scheduler_loop)
-        behaviors = (
-            "proactive_scan",
-            "lifecycle_review",
-            "skill_extraction",
-            "dream",
-            "deep_work",
-        )
-        for behavior in behaviors:
-            assert (
-                f"{behavior}_interval * 6" in source
-                or f"{behavior[:-1]}_interval * 6" in source
-                or "* 6" in source
-            ), f"{behavior} missing 6x fallback"
         tree = ast.parse(source)
         fallback_count = 0
         for node in ast.walk(tree):
@@ -499,11 +486,11 @@ class TestBehaviorEventMapping:
                         isinstance(comparator, ast.BinOp)
                         and isinstance(comparator.op, ast.Mult)
                         and isinstance(comparator.right, ast.Constant)
-                        and comparator.right.value == 6
+                        and comparator.right.value in (3, 6)
                     ):
                         fallback_count += 1
         assert fallback_count >= 9, (
-            f"Expected at least 9 behaviors with 6x fallback, found {fallback_count}"
+            f"Expected at least 9 behaviors with fallback multiplier, found {fallback_count}"
         )
 
 
