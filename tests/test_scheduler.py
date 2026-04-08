@@ -466,13 +466,13 @@ class TestBehaviorEventMapping:
                         and isinstance(comparator.right, ast.Constant)
                     ):
                         fallback_multipliers.append(comparator.right.value)
-        # Scorecard-tracked behaviors use 3x, others use 6x
-        assert all(m in (3, 6) for m in fallback_multipliers), (
-            f"Expected fallback multipliers to be 3 or 6, got {fallback_multipliers}"
+        # Scorecard-tracked behaviors use 2x (tighter frequency), others use 6x
+        assert all(m in (2, 3, 6) for m in fallback_multipliers), (
+            f"Expected fallback multipliers to be 2, 3, or 6, got {fallback_multipliers}"
         )
 
     def test_all_newly_gated_behaviors_have_fallback_multiplier(self) -> None:
-        """Event-gated behaviors must all have a 3x or 6x fallback."""
+        """Event-gated behaviors must all have a 2x, 3x, or 6x fallback."""
         import ast
         import inspect
 
@@ -486,7 +486,7 @@ class TestBehaviorEventMapping:
                         isinstance(comparator, ast.BinOp)
                         and isinstance(comparator.op, ast.Mult)
                         and isinstance(comparator.right, ast.Constant)
-                        and comparator.right.value in (3, 6)
+                        and comparator.right.value in (2, 3, 6)
                     ):
                         fallback_count += 1
         assert fallback_count >= 9, (
@@ -813,11 +813,11 @@ class TestBehaviorEventGating:
         mock_fn.assert_called_once()
 
     async def test_deep_work_skipped_without_goal_events(self) -> None:
-        """deep_work does not launch when no goal_updated events exist (and timer < 6x)."""
+        """deep_work does not launch when no goal_updated events exist (and timer < 2x)."""
         mock_settings = self._make_mock_settings(due_behavior="deep_work", interval=1.0)
         mock_db = self._make_mock_db(
             due_behavior="deep_work",
-            elapsed_seconds=2.0,
+            elapsed_seconds=1.5,
             unconsumed_count=0,
         )
 

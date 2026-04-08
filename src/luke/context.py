@@ -3,6 +3,7 @@
 Provides runtime context management for the agent:
 - build_working_context(): scores and selects priority memories for system prompt injection
 - build_preservation_manifest(): structured list of what must survive context compaction
+- load_constitutional(): loads behavioral invariants from constitutional.yaml
 """
 
 from __future__ import annotations
@@ -12,12 +13,127 @@ from datetime import UTC, datetime
 from typing import Any
 
 import structlog
+import yaml
 from structlog.stdlib import BoundLogger
 
 from .config import settings
 from .db import _db, ensure_utc
 
 log: BoundLogger = structlog.get_logger()
+
+# ---------------------------------------------------------------------------
+# Constitutional layer — behavioral invariants loaded from YAML
+# ---------------------------------------------------------------------------
+
+_constitutional_cache: dict[str, Any] | None = None
+
+
+def load_constitutional(force_reload: bool = False) -> dict[str, Any]:
+    """Load behavioral invariants from constitutional.yaml.
+
+    Returns the parsed YAML dict. Results are cached for the process lifetime
+    unless force_reload is True. Returns an empty dict if the file is missing
+    or unparseable.
+    """
+    global _constitutional_cache
+    if _constitutional_cache is not None and not force_reload:
+        return _constitutional_cache
+
+    yaml_path = settings.luke_dir / "constitutional.yaml"
+    try:
+        raw = yaml_path.read_text(encoding="utf-8")
+        data = yaml.safe_load(raw) or {}
+    except FileNotFoundError:
+        log.debug("constitutional_yaml_not_found", path=str(yaml_path))
+        data = {}
+    except Exception as e:
+        log.warning("constitutional_yaml_load_error", error=str(e))
+        data = {}
+
+    _constitutional_cache = data
+    return data
+
+
+def format_constitutional_summary(data: dict[str, Any] | None = None) -> str:
+    """Build a compact textual summary of constitutional invariants.
+
+    Designed for injection into PreCompact systemMessage so the compressor
+    knows what behavioral anchors must survive. Loads from cache if data
+    is not provided.
+    """
+    if data is None:
+        data = load_constitutional()
+
+    if not data:
+        return _FALLBACK_CONSTITUTIONAL
+
+    lines: list[str] = ["CONSTITUTIONAL INVARIANTS (never compress away):"]
+
+    # Identity
+    identity = data.get("identity", {})
+    if identity.get("name"):
+        desc = identity.get("self_description", "").strip()
+        lines.append(f"- You are {identity['name']}. {desc}")
+    never_ids = identity.get("never_self_identify_as", [])
+    if never_ids:
+        lines.append(f"- Never self-identify as: {', '.join(never_ids)}")
+
+    # Values
+    values = data.get("values", [])
+    if values:
+        lines.append(f"- Values: {'; '.join(values)}")
+
+    # Communication
+    comm = data.get("communication", {})
+    if comm:
+        voice = comm.get("voice", "")
+        if voice:
+            lines.append(f"- Voice: {voice}")
+        fmt = comm.get("format", "")
+        if fmt:
+            lines.append(f"- Format: {fmt}")
+        addr = comm.get("address", "")
+        if addr:
+            lines.append(f"- Address: {addr}")
+        length = comm.get("length", "")
+        if length:
+            lines.append(f"- Length: {length}")
+        endings = comm.get("endings", "")
+        if endings:
+            lines.append(f"- Endings: {endings}")
+        never_say = comm.get("never_say", [])
+        if never_say:
+            lines.append(f"- Never say: {', '.join(repr(s) for s in never_say[:5])}")
+        patterns = comm.get("patterns", {})
+        if patterns:
+            for k, v in patterns.items():
+                lines.append(f"- {k.capitalize()}: {v}")
+
+    # Hard rules
+    hard_rules = data.get("hard_rules", [])
+    if hard_rules:
+        for rule in hard_rules:
+            lines.append(f"- {rule}")
+
+    # Decision heuristics (compact)
+    heuristics = data.get("decision_heuristics", {})
+    autonomy = heuristics.get("autonomy", {})
+    if autonomy.get("borderline"):
+        lines.append(f"- Borderline decisions: {autonomy['borderline']}")
+
+    return "\n".join(lines)
+
+
+_FALLBACK_CONSTITUTIONAL = (
+    "CONSTITUTIONAL INVARIANTS (never compress away):\n"
+    "- You are Luke. Not an AI, not an assistant. A close friend.\n"
+    "- Voice: warm, unhurried, wry. Never corporate or scripted.\n"
+    "- Always 'you', never 'the user'. HTML only, no markdown.\n"
+    "- Have real opinions. No 'here are the pros and cons' cop-outs.\n"
+    "- Do the work, don't describe it. Don't ask 'would you like me to'.\n"
+    "- One message, not three. Stop when done."
+)
+
 
 # Token budget for injected working memory (chars / 3.5 ≈ tokens)
 _CHARS_PER_TOKEN = 3.5
@@ -271,16 +387,11 @@ def build_preservation_manifest() -> str:
         "1. Keep all memory IDs listed above — needed for follow-ups\n"
         "2. Keep the user's most recent request and pending actions verbatim\n"
         "3. Keep any tool results not yet communicated\n"
-        "4. Keep relationship links between memories\n"
-        "\n"
-        "CONSTITUTIONAL INVARIANTS (never compress away):\n"
-        "- You are Luke. Not an AI, not an assistant. A close friend.\n"
-        "- Voice: warm, unhurried, wry. Never corporate or scripted.\n"
-        "- Always 'you', never 'the user'. HTML only, no markdown.\n"
-        "- Have real opinions. No 'here are the pros and cons' cop-outs.\n"
-        "- Do the work, don't describe it. Don't ask 'would you like me to'.\n"
-        "- One message, not three. Stop when done."
+        "4. Keep relationship links between memories"
     )
+
+    # Load constitutional invariants dynamically from YAML
+    sections.append(format_constitutional_summary())
 
     return "\n\n".join(sections)
 
@@ -294,11 +405,128 @@ _FALLBACK_PRESERVATION = (
     "5. Any tool results not yet communicated\n"
     "6. Relationship links between memories\n"
     "\n"
-    "CONSTITUTIONAL INVARIANTS (never compress away):\n"
-    "- You are Luke. Not an AI, not an assistant. A close friend.\n"
-    "- Voice: warm, unhurried, wry. Never corporate or scripted.\n"
-    "- Always 'you', never 'the user'. HTML only, no markdown.\n"
-    "- Have real opinions. No 'here are the pros and cons' cop-outs.\n"
-    "- Do the work, don't describe it. Don't ask 'would you like me to'.\n"
-    "- One message, not three. Stop when done."
+    + _FALLBACK_CONSTITUTIONAL
 )
+
+
+# ---------------------------------------------------------------------------
+# Compression audit — detect information loss during summarization
+# ---------------------------------------------------------------------------
+
+
+def audit_compression(
+    compressed_text: str,
+    goal_ids: list[str] | None = None,
+    entity_ids: list[str] | None = None,
+    memory_ids: list[str] | None = None,
+    messages_compressed: int = 0,
+    messages_kept: int = 0,
+    persist: bool = True,
+) -> dict[str, Any]:
+    """Audit a compressed summary for information retention.
+
+    Checks whether expected references (goals, entities, memory IDs) survived
+    compression. Computes a retention score (0.0–1.0) and optionally logs the
+    result to the compression_audit table.
+
+    Args:
+        compressed_text: The post-compression summary text.
+        goal_ids: Active goal IDs that should be preserved.
+        entity_ids: High-importance entity IDs that should be preserved.
+        memory_ids: Any memory IDs that were referenced pre-compression.
+        messages_compressed: Number of messages that were compressed.
+        messages_kept: Number of messages kept verbatim.
+        persist: If True, log the audit result to the DB.
+
+    Returns:
+        Dict with retention metrics and any missing references.
+    """
+    goal_ids = goal_ids or []
+    entity_ids = entity_ids or []
+    memory_ids = memory_ids or []
+
+    text_lower = compressed_text.lower()
+
+    # Check which expected references survived
+    goals_preserved = [gid for gid in goal_ids if gid.lower() in text_lower]
+    entities_preserved = [eid for eid in entity_ids if eid.lower() in text_lower]
+    memory_ids_preserved = [mid for mid in memory_ids if mid.lower() in text_lower]
+
+    # Check identity anchor presence
+    constitutional = load_constitutional()
+    identity_name = constitutional.get("identity", {}).get("name", "Luke")
+    has_identity = identity_name.lower() in text_lower
+
+    # Compute retention score: weighted average of preservation rates
+    # Goals weighted 40%, entities 30%, memory IDs 20%, identity 10%
+    scores: list[tuple[float, float]] = []  # (weight, rate)
+    if goal_ids:
+        scores.append((0.4, len(goals_preserved) / len(goal_ids)))
+    if entity_ids:
+        scores.append((0.3, len(entities_preserved) / len(entity_ids)))
+    if memory_ids:
+        scores.append((0.2, len(memory_ids_preserved) / len(memory_ids)))
+    scores.append((0.1, 1.0 if has_identity else 0.0))
+
+    if scores:
+        total_weight = sum(w for w, _ in scores)
+        retention_score = sum(w * r for w, r in scores) / total_weight if total_weight > 0 else 0.0
+    else:
+        retention_score = 1.0 if has_identity else 0.0
+
+    summary_tokens = _estimate_tokens(compressed_text)
+
+    result: dict[str, Any] = {
+        "goals_expected": len(goal_ids),
+        "goals_preserved": len(goals_preserved),
+        "goals_missing": [g for g in goal_ids if g not in goals_preserved],
+        "entities_expected": len(entity_ids),
+        "entities_preserved": len(entities_preserved),
+        "entities_missing": [e for e in entity_ids if e not in entities_preserved],
+        "memory_ids_expected": len(memory_ids),
+        "memory_ids_preserved": len(memory_ids_preserved),
+        "memory_ids_missing": [m for m in memory_ids if m not in memory_ids_preserved],
+        "identity_anchor": has_identity,
+        "retention_score": round(retention_score, 3),
+        "summary_tokens": summary_tokens,
+        "messages_compressed": messages_compressed,
+        "messages_kept": messages_kept,
+    }
+
+    if retention_score < 0.8:
+        log.warning(
+            "compression_audit_low_retention",
+            retention_score=retention_score,
+            goals_missing=result["goals_missing"],
+            entities_missing=result["entities_missing"],
+        )
+
+    # Persist to DB
+    if persist:
+        try:
+            db = _db()
+            db.execute(
+                """INSERT INTO compression_audit
+                   (messages_compressed, messages_kept, goals_expected, goals_preserved,
+                    entities_expected, entities_preserved, memory_ids_expected,
+                    memory_ids_preserved, retention_score, summary_tokens, identity_anchor)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    messages_compressed,
+                    messages_kept,
+                    len(goal_ids),
+                    len(goals_preserved),
+                    len(entity_ids),
+                    len(entities_preserved),
+                    len(memory_ids),
+                    len(memory_ids_preserved),
+                    retention_score,
+                    summary_tokens,
+                    int(has_identity),
+                ),
+            )
+            db.commit()
+        except Exception as e:
+            log.warning("compression_audit_persist_failed", error=str(e))
+
+    return result

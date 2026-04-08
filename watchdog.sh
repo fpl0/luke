@@ -64,3 +64,23 @@ if (( age > MAX_STALE )); then
     # Clear heartbeat so we don't immediately re-trigger
     rm -f "$HEARTBEAT_FILE"
 fi
+
+# ─── Dashboard health check ───
+# Ensure the dashboard launcher service is running. The launcher supervises
+# both server.py and cloudflared itself, so we just need to make sure
+# the launcher is alive. Falls back to the old watchdog if launcher isn't installed.
+DASHBOARD_SERVICE="gui/$(id -u)/com.luke.dashboard"
+DASHBOARD_WATCHDOG="/Users/filipelm/Luke/workspace/dashboard/watchdog.py"
+
+if launchctl print "$DASHBOARD_SERVICE" >/dev/null 2>&1; then
+    # Launcher service exists — check if it's running
+    if ! launchctl print "$DASHBOARD_SERVICE" 2>/dev/null | grep -q "state = running"; then
+        log "Dashboard launcher not running — kickstarting"
+        launchctl kickstart "$DASHBOARD_SERVICE" 2>/dev/null || true
+    fi
+else
+    # Launcher not installed — fall back to old watchdog
+    if [[ -f "$DASHBOARD_WATCHDOG" ]]; then
+        /opt/homebrew/bin/python3 "$DASHBOARD_WATCHDOG" >> /tmp/dashboard-watchdog.log 2>&1 || true
+    fi
+fi

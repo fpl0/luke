@@ -56,6 +56,7 @@ from claude_agent_sdk.types import (
 from structlog.stdlib import BoundLogger
 
 from . import context, db, memory
+from .bus import bus
 from .config import settings
 from .memory import MEMORY_DIRS, read_frontmatter, read_memory_body, sanitize_memory_id
 
@@ -708,11 +709,11 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
         # Emit events for event-driven behavior triggers
         _EVENT_TYPES = {"episode": "new_episode", "insight": "new_insight", "goal": "goal_updated"}
         if mem_type in _EVENT_TYPES:
-            eid = db.emit_event(_EVENT_TYPES[mem_type], f'{{"id": "{mem_id}"}}')
+            evt = bus.emit(_EVENT_TYPES[mem_type], {"id": mem_id})
             log.info(
                 "event_emitted",
                 event_type=_EVENT_TYPES[mem_type],
-                event_id=eid,
+                event_id=evt.id,
                 mem_id=mem_id,
             )
         return _ok(status)
@@ -1322,7 +1323,7 @@ async def run_agent(
         if agent_type:
             payload["agent_type"] = agent_type
         log.info("tool_complete", tool=tool_name, duration_ms=duration_ms, agent_id=agent_id)
-        db.emit_event("tool_use", json.dumps(payload))
+        bus.emit("tool_use", payload)
         return {}
 
     async def _post_tool_failure_hook(
@@ -1344,7 +1345,7 @@ async def run_agent(
         if agent_type:
             payload["agent_type"] = agent_type
         log.warning("tool_failure", tool=tool_name, error=_trunc(str(error)), agent_id=agent_id)
-        db.emit_event("tool_failure", json.dumps(payload))
+        bus.emit("tool_failure", payload)
         return {}
 
     async def _subagent_start_hook(
@@ -1356,10 +1357,7 @@ async def run_agent(
         agent_type = input_data["agent_type"]
         subagent_start_times[agent_id] = time.monotonic()
         log.info("subagent_start", agent_id=agent_id, agent_type=agent_type)
-        db.emit_event(
-            "subagent_start",
-            json.dumps({"agent_id": agent_id, "agent_type": agent_type}),
-        )
+        bus.emit("subagent_start", {"agent_id": agent_id, "agent_type": agent_type})
         return {}
 
     async def _subagent_stop_hook(
@@ -1373,15 +1371,9 @@ async def run_agent(
         if agent_id in subagent_start_times:
             duration_ms = int((time.monotonic() - subagent_start_times.pop(agent_id)) * 1000)
         log.info("subagent_stop", agent_id=agent_id, agent_type=agent_type, duration_ms=duration_ms)
-        db.emit_event(
+        bus.emit(
             "subagent_stop",
-            json.dumps(
-                {
-                    "agent_id": agent_id,
-                    "agent_type": agent_type,
-                    "duration_ms": duration_ms,
-                }
-            ),
+            {"agent_id": agent_id, "agent_type": agent_type, "duration_ms": duration_ms},
         )
         return {}
 

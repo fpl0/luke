@@ -447,6 +447,28 @@ _MIGRATIONS: list[tuple[int, str, list[str]]] = [
             "ALTER TABLE cost_log ADD COLUMN cache_read_tokens INTEGER NOT NULL DEFAULT 0",
         ],
     ),
+    (
+        12,
+        "add compression_audit table for tracking information retention during compaction",
+        [
+            """CREATE TABLE IF NOT EXISTS compression_audit (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                created             TEXT NOT NULL DEFAULT (datetime('now')),
+                messages_compressed INTEGER NOT NULL DEFAULT 0,
+                messages_kept       INTEGER NOT NULL DEFAULT 0,
+                goals_expected      INTEGER NOT NULL DEFAULT 0,
+                goals_preserved     INTEGER NOT NULL DEFAULT 0,
+                entities_expected   INTEGER NOT NULL DEFAULT 0,
+                entities_preserved  INTEGER NOT NULL DEFAULT 0,
+                memory_ids_expected INTEGER NOT NULL DEFAULT 0,
+                memory_ids_preserved INTEGER NOT NULL DEFAULT 0,
+                retention_score     REAL NOT NULL DEFAULT 0.0,
+                summary_tokens      INTEGER NOT NULL DEFAULT 0,
+                identity_anchor     INTEGER NOT NULL DEFAULT 0
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_ca_created ON compression_audit(created DESC)",
+        ],
+    ),
 ]
 
 
@@ -697,7 +719,9 @@ def store_reaction_feedback(
     _commit(conn)
     # Emit event for negative reactions — triggers reflection behavior
     if sentiment == "negative":
-        emit_event("feedback_negative", f'{{"msg_id": {msg_id}, "emoji": "{emoji}"}}')
+        from .bus import bus  # deferred to avoid circular import
+
+        bus.emit("feedback_negative", {"msg_id": msg_id, "emoji": emoji})
 
 
 def get_reactions(
@@ -1343,3 +1367,22 @@ def get_quality_blocked_goals(threshold: float = 2.0, window: int = 3) -> list[s
         if scores and sum(scores) / len(scores) < threshold:
             blocked.append(row["goal_id"])
     return blocked
+
+
+def get_goal_quality_tier(goal_id: str, window: int = 3) -> str:
+    """Return 'paused', 'reflexion', or 'normal' based on recent quality scores.
+
+    Graduated quality gates:
+    - avg < 1.5 over `window` sessions -> 'paused'
+    - 1.5 <= avg < 2.5 over `window` sessions -> 'reflexion'
+    - avg >= 2.5 (or insufficient data) -> 'normal'
+    """
+    scores = get_recent_quality_scores(goal_id, window)
+    if len(scores) < window:
+        return "normal"
+    avg = sum(scores) / len(scores)
+    if avg < 1.5:
+        return "paused"
+    if avg < 2.5:
+        return "reflexion"
+    return "normal"

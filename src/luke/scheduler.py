@@ -6,7 +6,7 @@ import asyncio
 import os
 import time
 from collections.abc import Coroutine
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import structlog
 from aiogram import Bot
@@ -14,6 +14,7 @@ from croniter import croniter
 from structlog.stdlib import BoundLogger
 
 from . import db, memory
+from .bus import bus
 from .agent import run_agent
 from .behaviors import (
     run_consolidation,
@@ -24,6 +25,7 @@ from .behaviors import (
     run_lifecycle_review,
     run_proactive_scan,
     run_reflection,
+    run_reflexion,
     run_skill_extraction,
 )
 from .config import settings
@@ -203,6 +205,29 @@ async def start_scheduler_loop(
 
     write_heartbeat("startup")
 
+    # --- Reflexion event subscriptions (event-driven, no time-based schedule) ---
+    async def _on_reflexion_event(event: object) -> None:
+        """Handle events that trigger reflexion analysis."""
+        from .bus import Event
+
+        if not isinstance(event, Event):
+            return
+        # Filter deep_work_skipped to only trigger on relevant reasons
+        if event.kind == "deep_work_skipped":
+            reason = event.payload.get("reason", "")
+            if reason not in ("all_goals_filtered", "quality_blocked"):
+                return
+        await run_reflexion(
+            bot,
+            _behavior_sem,
+            event_kind=event.kind,
+            event_payload=event.payload,
+        )
+
+    bus.on("low_quality_work", _on_reflexion_event)
+    bus.on("deep_work_skipped", _on_reflexion_event)
+    bus.on("continuation_failure", _on_reflexion_event)
+
     while not (shutdown and shutdown.is_set()):
         # Use wait with timeout so we wake up promptly on shutdown
         if shutdown:
@@ -249,13 +274,20 @@ async def start_scheduler_loop(
         # doubles (up to 16x) until a relevant event resets the counter.
         maintenance_coros: list[tuple[str, Coroutine[object, object, None]]] = []
 
+        # Per-behavior backoff caps: high-frequency behaviors cap lower to hit targets
+        _BACKOFF_CAPS: dict[str, int] = {
+            "proactive_scan": 1,  # max 2x (6h) — must hit 2/day target
+            "consolidation": 2,   # max 4x (24h) — must hit 1/day target
+        }
+
         def _effective_interval(name: str, base: float) -> float:
             """Apply exponential backoff based on consecutive no-op runs."""
             try:
                 no_ops = int(db.get_behavior_no_ops(name))
             except (TypeError, ValueError):
                 no_ops = 0
-            return float(base * (2 ** min(no_ops, 4)))  # caps at 16x base interval
+            max_exp = _BACKOFF_CAPS.get(name, 4)
+            return float(base * (2 ** min(no_ops, max_exp)))
 
         # Consolidation: time-based + needs episode events
         consol_interval = _effective_interval(
@@ -265,7 +297,7 @@ async def start_scheduler_loop(
             has_episodes = (
                 db.count_unconsumed_events("new_episode") >= settings.consolidation_min_cluster
             )
-            if has_episodes or now_mono - last_consolidation >= consol_interval * 3:
+            if has_episodes or now_mono - last_consolidation >= consol_interval * 2:
                 last_consolidation = now_mono
                 maintenance_coros.append(("consolidation", run_consolidation(bot, sem)))
 
@@ -390,10 +422,11 @@ async def start_scheduler_loop(
         deep_work_running = _deep_work_task is not None and not _deep_work_task.done()
         if not deep_work_running and now_mono - last_deep_work >= settings.deep_work_interval:
             has_goal_activity = db.count_unconsumed_events("goal_updated") >= 1
-            if has_goal_activity or now_mono - last_deep_work >= settings.deep_work_interval * 3:
+            if has_goal_activity or now_mono - last_deep_work >= settings.deep_work_interval * 2:
                 # Track continuation: deep work launching after maintenance ran
-                if maintenance_coros:
-                    db.emit_event("post_trigger_continuation", '{}')
+                is_continuation = bool(maintenance_coros)
+                if is_continuation:
+                    bus.emit("post_trigger_continuation")
                 last_deep_work = now_mono
                 db.set_behavior_last_run("deep_work", datetime.now(UTC).isoformat())
                 _deep_work_task = asyncio.create_task(
@@ -413,6 +446,28 @@ async def start_scheduler_loop(
 
                 _deep_work_task.add_done_callback(_on_deep_work_done)
                 log.info("deep_work_launched")
+
+                # Continuation verification: check if deep_work actually oriented
+                if is_continuation:
+
+                    async def _verify_continuation() -> None:
+                        """Wait briefly then check if deep_work_oriented was emitted."""
+                        await asyncio.sleep(5)
+                        # Check for deep_work_oriented events in the last 30 seconds
+                        since = (
+                            datetime.now(UTC) - timedelta(seconds=30)
+                        ).isoformat()
+                        oriented = db.count_unconsumed_events(
+                            "deep_work_oriented", since=since
+                        )
+                        if oriented > 0:
+                            bus.emit("continuation_success")
+                            log.info("continuation_verified", result="success")
+                        else:
+                            bus.emit("continuation_failure")
+                            log.info("continuation_verified", result="failure")
+
+                    asyncio.create_task(_verify_continuation())
 
         try:
             now = datetime.now(UTC)
@@ -442,6 +497,11 @@ async def start_scheduler_loop(
                 )
         except Exception:
             log.exception("Scheduler loop error")
+
+    # Unsubscribe reflexion handlers on shutdown
+    bus.off("low_quality_work", _on_reflexion_event)
+    bus.off("deep_work_skipped", _on_reflexion_event)
+    bus.off("continuation_failure", _on_reflexion_event)
 
     # Drain in-flight tasks before exiting (snapshot to avoid mutation during gather)
     pending = list(_running_tasks.values())
