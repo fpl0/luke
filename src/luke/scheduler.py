@@ -30,6 +30,7 @@ from .behaviors import (
 )
 from .config import settings
 from .db import TaskRecord, ensure_utc
+from .planner import BEHAVIOR_EVENTS, generate_intents, plan
 
 log: BoundLogger = structlog.get_logger()
 
@@ -188,20 +189,8 @@ async def start_scheduler_loop(
         elapsed = (now_wall - last_wall).total_seconds()
         return now_mono - elapsed
 
+    # Only cleanup still uses monotonic tracking (planner handles all behaviors)
     last_cleanup = _load_offset("cleanup", settings.cleanup_interval)
-    last_consolidation = _load_offset("consolidation", settings.episode_consolidation_interval)
-    last_reflection = _load_offset("reflection", settings.reflection_interval)
-    last_proactive = _load_offset("proactive_scan", settings.proactive_scan_interval)
-    last_deep_work = _load_offset("deep_work", settings.deep_work_interval)
-    last_insight_consolidation = _load_offset(
-        "insight_consolidation", settings.insight_consolidation_interval
-    )
-    last_feedback_consolidation = _load_offset(
-        "feedback_consolidation", settings.feedback_consolidation_interval
-    )
-    last_lifecycle_review = _load_offset("lifecycle_review", settings.lifecycle_review_interval)
-    last_skill_extraction = _load_offset("skill_extraction", settings.skill_extraction_interval)
-    last_dream = _load_offset("dream", settings.dream_interval)
 
     write_heartbeat("startup")
 
@@ -268,112 +257,40 @@ async def start_scheduler_loop(
                 working_expired=expired_working,
             )
 
-        # Step 1: Collect and run due maintenance behaviors (short-lived, awaited)
-        # Each behavior uses a hybrid trigger: time-based interval AND event awareness.
-        # Smart backoff: if a behavior produced nothing useful, its effective interval
-        # doubles (up to 16x) until a relevant event resets the counter.
-        maintenance_coros: list[tuple[str, Coroutine[object, object, None]]] = []
+        # Step 1: Generate and plan intents (replaces per-behavior "am I due?" blocks)
+        # The planner checks all signal sources (goals, events, time) and returns
+        # a prioritized list of maintenance intents + an optional deep work intent.
+        intents = generate_intents()
+        maintenance_intents, deep_work_intent = plan(intents)
 
-        # Per-behavior backoff caps: high-frequency behaviors cap lower to hit targets
-        _BACKOFF_CAPS: dict[str, int] = {
-            "proactive_scan": 1,  # max 2x (6h) — must hit 2/day target
-            "consolidation": 2,   # max 4x (24h) — must hit 1/day target
+        if intents:
+            log.debug(
+                "planner_intents",
+                total=len(intents),
+                maintenance=len(maintenance_intents),
+                deep_work=deep_work_intent is not None,
+                top_intent=intents[0].kind if intents else None,
+                top_priority=max(i.priority for i in intents) if intents else 0,
+            )
+
+        # Intent-to-behavior mapping
+        _INTENT_BEHAVIOR = {
+            "consolidation": run_consolidation,
+            "reflection": run_reflection,
+            "proactive_scan": run_proactive_scan,
+            "insight_consolidation": run_insight_consolidation,
+            "feedback_consolidation": run_feedback_consolidation,
+            "lifecycle_review": run_lifecycle_review,
+            "skill_extraction": run_skill_extraction,
+            "dream": run_dream,
         }
 
-        def _effective_interval(name: str, base: float) -> float:
-            """Apply exponential backoff based on consecutive no-op runs."""
-            try:
-                no_ops = int(db.get_behavior_no_ops(name))
-            except (TypeError, ValueError):
-                no_ops = 0
-            max_exp = _BACKOFF_CAPS.get(name, 4)
-            return float(base * (2 ** min(no_ops, max_exp)))
-
-        # Consolidation: time-based + needs episode events
-        consol_interval = _effective_interval(
-            "consolidation", settings.episode_consolidation_interval
-        )
-        if now_mono - last_consolidation >= consol_interval:
-            has_episodes = (
-                db.count_unconsumed_events("new_episode") >= settings.consolidation_min_cluster
-            )
-            if has_episodes or now_mono - last_consolidation >= consol_interval * 2:
-                last_consolidation = now_mono
-                maintenance_coros.append(("consolidation", run_consolidation(bot, sem)))
-
-        # Proactive scan: time-based + needs goal or user activity
-        proactive_interval = _effective_interval("proactive_scan", settings.proactive_scan_interval)
-        if now_mono - last_proactive >= proactive_interval:
-            has_activity = db.count_unconsumed_events("goal_updated", "user_message") >= 1
-            if has_activity or now_mono - last_proactive >= proactive_interval * 3:
-                last_proactive = now_mono
-                maintenance_coros.append(("proactive_scan", run_proactive_scan(bot, sem)))
-
-        # Reflection: time-based + needs user interaction or feedback
-        reflection_interval = _effective_interval("reflection", settings.reflection_interval)
-        if now_mono - last_reflection >= reflection_interval:
-            has_feedback = db.count_unconsumed_events("feedback_negative", "user_message") >= 5
-            if has_feedback or now_mono - last_reflection >= reflection_interval * 6:
-                last_reflection = now_mono
-                maintenance_coros.append(("reflection", run_reflection(bot, sem)))
-                # Weekly FTS pruning (alongside reflection — not urgent)
-                pruned = memory.prune_old_fts_entries(settings.fts_retention_days)
-                if pruned:
-                    log.info("fts_pruned", count=pruned)
-
-        # Insight consolidation: time-based + needs insight events
-        insight_interval = _effective_interval(
-            "insight_consolidation", settings.insight_consolidation_interval
-        )
-        if now_mono - last_insight_consolidation >= insight_interval:
-            has_insights = db.count_unconsumed_events("new_insight") >= 3
-            if has_insights or now_mono - last_insight_consolidation >= insight_interval * 6:
-                last_insight_consolidation = now_mono
-                maintenance_coros.append(
-                    ("insight_consolidation", run_insight_consolidation(bot, sem))
-                )
-
-        # Feedback consolidation: time-based + needs negative feedback
-        feedback_interval = _effective_interval(
-            "feedback_consolidation", settings.feedback_consolidation_interval
-        )
-        if now_mono - last_feedback_consolidation >= feedback_interval:
-            has_negatives = db.count_unconsumed_events("feedback_negative") >= 2
-            if has_negatives or now_mono - last_feedback_consolidation >= feedback_interval * 6:
-                last_feedback_consolidation = now_mono
-                maintenance_coros.append(
-                    ("feedback_consolidation", run_feedback_consolidation(bot, sem))
-                )
-
-        # Lifecycle review: time-based + needs accumulated memory activity
-        if now_mono - last_lifecycle_review >= settings.lifecycle_review_interval:
-            has_activity = db.count_unconsumed_events("new_episode", "new_insight") >= 5
-            if (
-                has_activity
-                or now_mono - last_lifecycle_review >= settings.lifecycle_review_interval * 6
-            ):
-                last_lifecycle_review = now_mono
-                maintenance_coros.append(("lifecycle_review", run_lifecycle_review(bot, sem)))
-
-        # Skill extraction: time-based + needs multiple new episodes to infer a reusable pattern.
-        skill_extraction_interval = _effective_interval(
-            "skill_extraction", settings.skill_extraction_interval
-        )
-        if now_mono - last_skill_extraction >= skill_extraction_interval:
-            has_recent_episodes = db.count_unconsumed_events("new_episode") >= 2
-            if (
-                has_recent_episodes
-                or now_mono - last_skill_extraction >= skill_extraction_interval * 6
-            ):
-                last_skill_extraction = now_mono
-                maintenance_coros.append(("skill_extraction", run_skill_extraction(bot, sem)))
-
-        # Dream: autonomous thinking periods (quiet-gated internally + needs mental material)
-        if now_mono - last_dream >= settings.dream_interval:
-            has_material = db.count_unconsumed_events("new_insight", "new_episode") >= 1
-            if has_material or now_mono - last_dream >= settings.dream_interval * 6:
-                last_dream = now_mono
-                maintenance_coros.append(("dream", run_dream(bot, sem)))
+        # Build maintenance coroutines from planned intents
+        maintenance_coros: list[tuple[str, Coroutine[object, object, None]]] = []
+        for intent in maintenance_intents:
+            behavior_fn = _INTENT_BEHAVIOR.get(intent.kind)
+            if behavior_fn:
+                maintenance_coros.append((intent.kind, behavior_fn(bot, sem)))
 
         if maintenance_coros:
             names = [name for name, _ in maintenance_coros]
@@ -386,19 +303,6 @@ async def start_scheduler_loop(
                 return_exceptions=True,
             )
             now_iso = datetime.now(UTC).isoformat()
-            # Map behavior names to the events they consume
-            _BEHAVIOR_EVENTS: dict[str, tuple[str, ...]] = {
-                "consolidation": ("new_episode",),
-                "reflection": ("feedback_negative", "user_message"),
-                "proactive_scan": ("goal_updated",),
-                "insight_consolidation": ("new_insight",),
-                "feedback_consolidation": ("feedback_negative",),
-                "lifecycle_review": (),
-                # Shares new_episode as an input signal with consolidation, so it
-                # must not consume those events and starve the other behavior.
-                "skill_extraction": (),
-                "dream": (),
-            }
             with db.batch():
                 for (name, _), result in zip(maintenance_coros, results, strict=True):
                     if isinstance(result, BaseException):
@@ -406,7 +310,7 @@ async def start_scheduler_loop(
                     else:
                         db.set_behavior_last_run(name, now_iso)
                         # Consume events this behavior was triggered by
-                        events = _BEHAVIOR_EVENTS.get(name, ())
+                        events = BEHAVIOR_EVENTS.get(name, ())
                         if events:
                             consumed = db.consume_events(*events)
                             # Track no-ops for smart backoff
@@ -414,60 +318,64 @@ async def start_scheduler_loop(
                                 db.reset_behavior_no_ops(name)
                             else:
                                 db.increment_behavior_no_ops(name)
-                        else:
-                            # Behaviors without event gates don't backoff
-                            pass
+
+                        # Weekly FTS pruning alongside reflection
+                        if name == "reflection":
+                            pruned = memory.prune_old_fts_entries(settings.fts_retention_days)
+                            if pruned:
+                                log.info("fts_pruned", count=pruned)
 
         # Step 2: Launch deep work as background task (long-lived, NOT awaited)
         deep_work_running = _deep_work_task is not None and not _deep_work_task.done()
-        if not deep_work_running and now_mono - last_deep_work >= settings.deep_work_interval:
-            has_goal_activity = db.count_unconsumed_events("goal_updated") >= 1
-            if has_goal_activity or now_mono - last_deep_work >= settings.deep_work_interval * 2:
-                # Track continuation: deep work launching after maintenance ran
-                is_continuation = bool(maintenance_coros)
-                if is_continuation:
-                    bus.emit("post_trigger_continuation")
-                last_deep_work = now_mono
-                db.set_behavior_last_run("deep_work", datetime.now(UTC).isoformat())
-                _deep_work_task = asyncio.create_task(
-                    _limit_behavior(_behavior_sem, run_deep_work(bot, sem))
-                )
+        if not deep_work_running and deep_work_intent is not None:
+            # Track continuation: deep work launching after maintenance ran
+            is_continuation = bool(maintenance_coros)
+            if is_continuation:
+                bus.emit("post_trigger_continuation")
+            db.set_behavior_last_run("deep_work", datetime.now(UTC).isoformat())
+            _deep_work_task = asyncio.create_task(
+                _limit_behavior(_behavior_sem, run_deep_work(bot, sem))
+            )
 
-                def _on_deep_work_done(fut: asyncio.Task[None]) -> None:
-                    exc = fut.exception() if not fut.cancelled() else None
-                    if exc:
-                        log.exception("deep_work_task_error", exc_info=exc)
+            def _on_deep_work_done(fut: asyncio.Task[None]) -> None:
+                exc = fut.exception() if not fut.cancelled() else None
+                if exc:
+                    log.exception("deep_work_task_error", exc_info=exc)
+                else:
+                    # Consume goal events that deep work acts on
+                    consumed = db.consume_events("goal_updated")
+                    if consumed > 0:
+                        db.reset_behavior_no_ops("deep_work")
+                    log.info("deep_work_events_consumed", consumed=consumed)
+
+            _deep_work_task.add_done_callback(_on_deep_work_done)
+            log.info(
+                "deep_work_launched",
+                priority=deep_work_intent.priority,
+                source=deep_work_intent.source,
+            )
+
+            # Continuation verification: check if deep_work actually oriented
+            if is_continuation:
+
+                async def _verify_continuation() -> None:
+                    """Wait briefly then check if deep_work_oriented was emitted."""
+                    await asyncio.sleep(5)
+                    # Check for deep_work_oriented events in the last 30 seconds
+                    since = (
+                        datetime.now(UTC) - timedelta(seconds=30)
+                    ).isoformat()
+                    oriented = db.count_unconsumed_events(
+                        "deep_work_oriented", since=since
+                    )
+                    if oriented > 0:
+                        bus.emit("continuation_success")
+                        log.info("continuation_verified", result="success")
                     else:
-                        # Consume goal events that deep work acts on
-                        consumed = db.consume_events("goal_updated")
-                        if consumed > 0:
-                            db.reset_behavior_no_ops("deep_work")
-                        log.info("deep_work_events_consumed", consumed=consumed)
+                        bus.emit("continuation_failure")
+                        log.info("continuation_verified", result="failure")
 
-                _deep_work_task.add_done_callback(_on_deep_work_done)
-                log.info("deep_work_launched")
-
-                # Continuation verification: check if deep_work actually oriented
-                if is_continuation:
-
-                    async def _verify_continuation() -> None:
-                        """Wait briefly then check if deep_work_oriented was emitted."""
-                        await asyncio.sleep(5)
-                        # Check for deep_work_oriented events in the last 30 seconds
-                        since = (
-                            datetime.now(UTC) - timedelta(seconds=30)
-                        ).isoformat()
-                        oriented = db.count_unconsumed_events(
-                            "deep_work_oriented", since=since
-                        )
-                        if oriented > 0:
-                            bus.emit("continuation_success")
-                            log.info("continuation_verified", result="success")
-                        else:
-                            bus.emit("continuation_failure")
-                            log.info("continuation_verified", result="failure")
-
-                    asyncio.create_task(_verify_continuation())
+                asyncio.create_task(_verify_continuation())
 
         try:
             now = datetime.now(UTC)

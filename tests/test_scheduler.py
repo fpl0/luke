@@ -449,11 +449,14 @@ class TestBehaviorEventMapping:
         assert not uncovered, f"Event types emitted but never consumed: {uncovered}"
 
     def test_fallback_multiplier_range(self) -> None:
-        """Time-based fallback should be 3x-6x the effective interval."""
+        """Time-based fallback should be 2x-6x in the planner's intent generators."""
         import ast
         import inspect
 
-        source = inspect.getsource(start_scheduler_loop)
+        from luke.planner import _maintenance_intents, _deep_work_intents
+
+        source = inspect.getsource(_maintenance_intents)
+        source += "\n" + inspect.getsource(_deep_work_intents)
         tree = ast.parse(source)
         # Find all BinOp nodes that multiply by a constant (the fallback pattern)
         fallback_multipliers: list[int] = []
@@ -466,17 +469,20 @@ class TestBehaviorEventMapping:
                         and isinstance(comparator.right, ast.Constant)
                     ):
                         fallback_multipliers.append(comparator.right.value)
-        # Scorecard-tracked behaviors use 2x (tighter frequency), others use 6x
+        # deep_work uses 2x, proactive_scan uses 3x, others use 6x
         assert all(m in (2, 3, 6) for m in fallback_multipliers), (
             f"Expected fallback multipliers to be 2, 3, or 6, got {fallback_multipliers}"
         )
 
     def test_all_newly_gated_behaviors_have_fallback_multiplier(self) -> None:
-        """Event-gated behaviors must all have a 2x, 3x, or 6x fallback."""
+        """Event-gated behaviors must all have a 2x, 3x, or 6x fallback in the planner."""
         import ast
         import inspect
 
-        source = inspect.getsource(start_scheduler_loop)
+        from luke.planner import _maintenance_intents, _deep_work_intents
+
+        source = inspect.getsource(_maintenance_intents)
+        source += "\n" + inspect.getsource(_deep_work_intents)
         tree = ast.parse(source)
         fallback_count = 0
         for node in ast.walk(tree):
@@ -514,15 +520,32 @@ class TestBehaviorEventGating:
         due_ts = (datetime.now(UTC) - timedelta(seconds=elapsed_seconds)).isoformat()
 
         mock_db = MagicMock()
-        mock_db.get_behavior_last_run.side_effect = lambda name: (
-            due_ts if name == due_behavior else recent_ts
-        )
+        # Stateful last_run tracking: once set_behavior_last_run is called,
+        # subsequent get_behavior_last_run calls return the updated value.
+        _last_runs: dict[str, str] = {
+            due_behavior: due_ts,
+        }
+
+        def _get_last_run(name: str) -> str:
+            return _last_runs.get(name, recent_ts)
+
+        def _set_last_run(name: str, ts: str) -> None:
+            _last_runs[name] = ts
+
+        mock_db.get_behavior_last_run.side_effect = _get_last_run
+        mock_db.set_behavior_last_run.side_effect = _set_last_run
         mock_db.get_due_tasks.return_value = []
         mock_db.count_unconsumed_events.return_value = unconsumed_count
         # Prevent _effective_interval from doubling intervals via spurious no-op counts
         mock_db.get_behavior_no_ops.return_value = 0
         # Prevent TypeError in post-run event consumption
         mock_db.consume_events.return_value = 0
+        # Budget gate for deep work planner
+        mock_db.get_daily_deep_work_cost.return_value = 0.0
+        # Planner needs real ensure_utc for datetime calculations
+        from luke.db import ensure_utc as _real_ensure_utc
+
+        mock_db.ensure_utc = _real_ensure_utc
         return mock_db
 
     def _make_mock_settings(self, *, due_behavior: str, interval: float = 1.0) -> MagicMock:
@@ -546,6 +569,10 @@ class TestBehaviorEventGating:
         )
         mock_settings.dream_interval = interval if due_behavior == "dream" else 999999
         mock_settings.consolidation_min_cluster = 3
+        mock_settings.behavior_max_budget_usd = 1.5
+        mock_settings.daily_deep_work_budget_usd = 120.0
+        mock_settings.deep_work_max_budget_usd = 10.0
+        mock_settings.dream_max_budget_usd = 2.0
         return mock_settings
 
     async def _run_one_tick(
@@ -583,6 +610,8 @@ class TestBehaviorEventGating:
         with (
             patch("luke.scheduler.settings", new=mock_settings),
             patch("luke.scheduler.db", new=mock_db),
+            patch("luke.planner.db", new=mock_db),
+            patch("luke.planner.settings", new=mock_settings),
             patch("luke.scheduler.memory"),
             patch("luke.scheduler.run_proactive_scan", new_callable=AsyncMock) as mock_fn,
         ):
@@ -611,6 +640,8 @@ class TestBehaviorEventGating:
         with (
             patch("luke.scheduler.settings", new=mock_settings),
             patch("luke.scheduler.db", new=mock_db),
+            patch("luke.planner.db", new=mock_db),
+            patch("luke.planner.settings", new=mock_settings),
             patch("luke.scheduler.memory"),
             patch("luke.scheduler.run_proactive_scan", new_callable=AsyncMock) as mock_fn,
         ):
@@ -640,6 +671,8 @@ class TestBehaviorEventGating:
         with (
             patch("luke.scheduler.settings", new=mock_settings),
             patch("luke.scheduler.db", new=mock_db),
+            patch("luke.planner.db", new=mock_db),
+            patch("luke.planner.settings", new=mock_settings),
             patch("luke.scheduler.memory"),
             patch("luke.scheduler.run_proactive_scan", new_callable=AsyncMock) as mock_fn,
         ):
@@ -668,6 +701,8 @@ class TestBehaviorEventGating:
         with (
             patch("luke.scheduler.settings", new=mock_settings),
             patch("luke.scheduler.db", new=mock_db),
+            patch("luke.planner.db", new=mock_db),
+            patch("luke.planner.settings", new=mock_settings),
             patch("luke.scheduler.memory"),
             patch("luke.scheduler.run_lifecycle_review", new_callable=AsyncMock) as mock_fn,
         ):
@@ -696,6 +731,8 @@ class TestBehaviorEventGating:
         with (
             patch("luke.scheduler.settings", new=mock_settings),
             patch("luke.scheduler.db", new=mock_db),
+            patch("luke.planner.db", new=mock_db),
+            patch("luke.planner.settings", new=mock_settings),
             patch("luke.scheduler.memory"),
             patch("luke.scheduler.run_lifecycle_review", new_callable=AsyncMock) as mock_fn,
         ):
@@ -720,6 +757,8 @@ class TestBehaviorEventGating:
         with (
             patch("luke.scheduler.settings", new=mock_settings),
             patch("luke.scheduler.db", new=mock_db),
+            patch("luke.planner.db", new=mock_db),
+            patch("luke.planner.settings", new=mock_settings),
             patch("luke.scheduler.memory"),
             patch("luke.scheduler.run_dream", new_callable=AsyncMock) as mock_fn,
         ):
@@ -744,6 +783,8 @@ class TestBehaviorEventGating:
         with (
             patch("luke.scheduler.settings", new=mock_settings),
             patch("luke.scheduler.db", new=mock_db),
+            patch("luke.planner.db", new=mock_db),
+            patch("luke.planner.settings", new=mock_settings),
             patch("luke.scheduler.memory"),
             patch("luke.scheduler.run_dream", new_callable=AsyncMock) as mock_fn,
         ):
@@ -770,6 +811,8 @@ class TestBehaviorEventGating:
         with (
             patch("luke.scheduler.settings", new=mock_settings),
             patch("luke.scheduler.db", new=mock_db),
+            patch("luke.planner.db", new=mock_db),
+            patch("luke.planner.settings", new=mock_settings),
             patch("luke.scheduler.memory"),
             patch("luke.scheduler.run_skill_extraction", new_callable=AsyncMock) as mock_fn,
         ):
@@ -796,6 +839,8 @@ class TestBehaviorEventGating:
         with (
             patch("luke.scheduler.settings", new=mock_settings),
             patch("luke.scheduler.db", new=mock_db),
+            patch("luke.planner.db", new=mock_db),
+            patch("luke.planner.settings", new=mock_settings),
             patch("luke.scheduler.memory"),
             patch("luke.scheduler.run_skill_extraction", new_callable=AsyncMock) as mock_fn,
         ):
@@ -824,6 +869,8 @@ class TestBehaviorEventGating:
         with (
             patch("luke.scheduler.settings", new=mock_settings),
             patch("luke.scheduler.db", new=mock_db),
+            patch("luke.planner.db", new=mock_db),
+            patch("luke.planner.settings", new=mock_settings),
             patch("luke.scheduler.memory"),
             patch("luke.scheduler.run_deep_work", new_callable=AsyncMock) as mock_fn,
         ):
@@ -852,6 +899,8 @@ class TestBehaviorEventGating:
         with (
             patch("luke.scheduler.settings", new=mock_settings),
             patch("luke.scheduler.db", new=mock_db),
+            patch("luke.planner.db", new=mock_db),
+            patch("luke.planner.settings", new=mock_settings),
             patch("luke.scheduler.memory"),
             patch("luke.scheduler.run_deep_work", new_callable=AsyncMock) as mock_fn,
         ):
