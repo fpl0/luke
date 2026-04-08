@@ -391,6 +391,9 @@ async def start_scheduler_loop(
         if not deep_work_running and now_mono - last_deep_work >= settings.deep_work_interval:
             has_goal_activity = db.count_unconsumed_events("goal_updated") >= 1
             if has_goal_activity or now_mono - last_deep_work >= settings.deep_work_interval * 6:
+                # Track continuation: deep work launching after maintenance ran
+                if maintenance_coros:
+                    db.emit_event("post_trigger_continuation", '{}')
                 last_deep_work = now_mono
                 db.set_behavior_last_run("deep_work", datetime.now(UTC).isoformat())
                 _deep_work_task = asyncio.create_task(

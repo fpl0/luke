@@ -426,10 +426,12 @@ async def run_deep_work(bot: Bot, sem: asyncio.Semaphore) -> None:
     daily_cost = db.get_daily_deep_work_cost()
     if daily_cost >= settings.daily_deep_work_budget_usd:
         log.info("deep_work_budget_exhausted", daily_cost=daily_cost)
+        db.emit_event("deep_work_skipped", '{"reason": "budget_exhausted"}')
         return
 
     goals = memory.recall(mem_type="goal", limit=10)
     if not goals:
+        db.emit_event("deep_work_skipped", '{"reason": "no_goals"}')
         return
 
     # Quality gate: get goals blocked by low quality scores
@@ -526,6 +528,9 @@ async def run_deep_work(bot: Bot, sem: asyncio.Semaphore) -> None:
         "Prefer updating the plan's Blockers section over messaging.\n"
         "You have full tool access: web search, code, files, memory.\n"
     )
+
+    # Track that orient phase completed (all gates passed, goals reviewed)
+    db.emit_event("deep_work_oriented", f'{{"goals_reviewed": {len(goals)}}}')
 
     await _run_behavior(
         "deep_work",
