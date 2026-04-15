@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sqlite3
 import time
 from collections.abc import Coroutine
 from datetime import UTC, datetime, timedelta
@@ -233,29 +234,32 @@ async def start_scheduler_loop(
         # Hourly: FTS cleanup + adaptive importance decay + session cleanup
         if now_mono - last_cleanup >= settings.cleanup_interval:
             last_cleanup = now_mono
-            memory.cleanup_archived_fts()
-            updated = memory.decay_importance(settings.decay_rates)
-            cleaned_ids = db.cleanup_stale_sessions(settings.session_timeout)
-            # Clear model ratchet only for the specific expired sessions
-            if cleaned_ids:
-                from .app import _session_models
+            try:
+                memory.cleanup_archived_fts()
+                updated = memory.decay_importance(settings.decay_rates)
+                cleaned_ids = db.cleanup_stale_sessions(settings.session_timeout)
+                # Clear model ratchet only for the specific expired sessions
+                if cleaned_ids:
+                    from .app import _session_models
 
-                for cid in cleaned_ids:
-                    _session_models.pop(cid, None)
-            pruned_logs = db.cleanup_task_logs()
-            pruned_outbound = db.cleanup_outbound_log()
-            pruned_events = db.cleanup_events()
-            expired_working = memory.expire_working_memories()
-            db.set_behavior_last_run("cleanup", datetime.now(UTC).isoformat())
-            log.info(
-                "hourly_maintenance",
-                decayed=updated,
-                sessions_cleaned=len(cleaned_ids),
-                task_logs_pruned=pruned_logs,
-                outbound_pruned=pruned_outbound,
-                events_pruned=pruned_events,
-                working_expired=expired_working,
-            )
+                    for cid in cleaned_ids:
+                        _session_models.pop(cid, None)
+                pruned_logs = db.cleanup_task_logs()
+                pruned_outbound = db.cleanup_outbound_log()
+                pruned_events = db.cleanup_events()
+                expired_working = memory.expire_working_memories()
+                db.set_behavior_last_run("cleanup", datetime.now(UTC).isoformat())
+                log.info(
+                    "hourly_maintenance",
+                    decayed=updated,
+                    sessions_cleaned=len(cleaned_ids),
+                    task_logs_pruned=pruned_logs,
+                    outbound_pruned=pruned_outbound,
+                    events_pruned=pruned_events,
+                    working_expired=expired_working,
+                )
+            except sqlite3.OperationalError:
+                log.warning("hourly_maintenance_skipped", reason="database locked")
 
         # Step 1: Generate and plan intents (replaces per-behavior "am I due?" blocks)
         # The planner checks all signal sources (goals, events, time) and returns
