@@ -1248,10 +1248,13 @@ def invalidate_link(from_id: str, to_id: str, relationship: str) -> bool:
 def cleanup_archived_fts() -> None:
     """Remove archived memories from FTS5 index."""
     db = _db()
-    db.execute(
-        "DELETE FROM memory_fts WHERE id IN (SELECT id FROM memory_meta WHERE status = 'archived')"
-    )
-    _commit(db)
+    try:
+        db.execute(
+            "DELETE FROM memory_fts WHERE id IN (SELECT id FROM memory_meta WHERE status = 'archived')"
+        )
+        _commit(db)
+    except sqlite3.OperationalError:
+        db.rollback()  # release the lock, retry next cycle
 
 
 def prune_old_fts_entries(retention_days: int) -> int:
