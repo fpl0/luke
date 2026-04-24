@@ -602,7 +602,9 @@ def index_memory(
                 (mem_id, link_id, rel, now),
             )
 
-    # Embed for semantic search (None on runtime errors — FTS still works)
+    _commit(db)
+
+    # Embed AFTER committing the main writes — CPU-intensive, don't hold the lock
     embedding = _embed_passage(f"{title} {content}")
     if embedding is not None:
         blob = struct.pack(f"{len(embedding)}f", *embedding)
@@ -612,7 +614,7 @@ def index_memory(
             "INSERT INTO memory_vec (rowid, embedding, memory_id) VALUES (?, ?, ?)",
             (rowid, blob, mem_id),
         )
-    _commit(db)
+        _commit(db)
 
     # Assign to cluster (online BIRCH)
     assign_cluster_online(mem_id, embedding)
@@ -1512,26 +1514,32 @@ def apply_correction(
     elif relationship == "contradictory":
         new_content = corrected_content
         change_desc = "Contradiction resolved — replaced content"
-        link_memories(mem_id, mem_id, "supersedes")
     else:
         new_content = corrected_content
         change_desc = "Updated content"
 
-    now = datetime.now(UTC).isoformat()
-
-    conn.execute("UPDATE memory_fts SET content = ? WHERE id = ?", (new_content, mem_id))
-
+    # Compute embedding BEFORE acquiring write lock (CPU-intensive)
     embedding = _embed_passage(new_content)
+    packed_embedding: bytes | None = None
+    rowid: int | None = None
     if embedding is not None:
         rowid = _vec_rowid(mem_id)
+        packed_embedding = struct.pack(f"{len(embedding)}f", *embedding)
+
+    # All writes in one fast batch — minimise time holding the write lock
+    now = datetime.now(UTC).isoformat()
+    changes = [change_desc, f"Confidence: {confidence:.2f}, Source: {source}"]
+
+    if relationship == "contradictory":
+        link_memories(mem_id, mem_id, "supersedes")
+
+    conn.execute("UPDATE memory_fts SET content = ? WHERE id = ?", (new_content, mem_id))
+    if packed_embedding is not None and rowid is not None:
         conn.execute(
             "INSERT OR REPLACE INTO memory_vec (rowid, memory_id, embedding) VALUES (?, ?, ?)",
-            (rowid, mem_id, struct.pack(f"{len(embedding)}f", *embedding)),
+            (rowid, mem_id, packed_embedding),
         )
-
     conn.execute("UPDATE memory_meta SET updated = ? WHERE id = ?", (now, mem_id))
-
-    changes = [change_desc, f"Confidence: {confidence:.2f}, Source: {source}"]
     conn.execute(
         """INSERT INTO memory_history
            (mem_id, changed_fields, timestamp, old_content,
@@ -1548,7 +1556,6 @@ def apply_correction(
             confidence,
         ),
     )
-
     _commit(conn)
 
     return {
