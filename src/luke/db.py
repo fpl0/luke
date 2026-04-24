@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import sqlite3
 import threading
+import time
 import uuid
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
@@ -597,9 +598,38 @@ def store_message(
     reply_to: str | None = None,
     media_file_id: str | None = None,
 ) -> bool:
-    """Store a message. Returns False if duplicate detected."""
+    """Store a message. Retries on transient DB lock. Returns False if duplicate."""
+    for attempt in range(3):
+        try:
+            return _store_message_once(
+                chat_id=chat_id,
+                sender_name=sender_name,
+                sender_id=sender_id,
+                message_id=message_id,
+                content=content,
+                timestamp=timestamp,
+                reply_to=reply_to,
+                media_file_id=media_file_id,
+            )
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc) or attempt == 2:
+                raise
+            time.sleep(0.5 * (attempt + 1))
+    return False  # unreachable, keeps mypy happy
+
+
+def _store_message_once(
+    *,
+    chat_id: str,
+    sender_name: str,
+    sender_id: str,
+    message_id: int,
+    content: str,
+    timestamp: str,
+    reply_to: str | None,
+    media_file_id: str | None,
+) -> bool:
     conn = _db()
-    # Duplicate check: same chat, sender, msg_id, and content
     if sender_id and message_id:
         existing = conn.execute(
             """SELECT 1 FROM messages

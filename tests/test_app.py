@@ -487,6 +487,7 @@ class TestProcess:
             patch("luke.app.db") as mock_db,
             patch("luke.app.bot") as mock_bot,
             patch("luke.app.settings") as mock_settings,
+            patch("luke.app.bus"),
             patch("luke.app.build_prompt", new_callable=AsyncMock, return_value="prompt"),
             patch(
                 "luke.app.run_agent",
@@ -538,6 +539,7 @@ class TestProcess:
             patch("luke.app.db") as mock_db,
             patch("luke.app.bot") as mock_bot,
             patch("luke.app.settings") as mock_settings,
+            patch("luke.app.bus"),
             patch("luke.app.build_prompt", new_callable=AsyncMock, return_value="prompt"),
             patch(
                 "luke.app.run_agent",
@@ -593,6 +595,7 @@ class TestProcess:
             patch("luke.app.db") as mock_db,
             patch("luke.app.bot") as mock_bot,
             patch("luke.app.settings") as mock_settings,
+            patch("luke.app.bus"),
             patch("luke.app.build_prompt", new_callable=AsyncMock, return_value="prompt"),
             patch("luke.app.run_agent", new_callable=AsyncMock, return_value=mock_result),
             patch("luke.app.send_long_message", new_callable=AsyncMock),
