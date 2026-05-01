@@ -626,45 +626,37 @@ async def process(chat_id: str) -> None:
                 recalled_ids = [m["id"] for m in _recalled]
                 combined_response = " ".join(result.texts)
                 corrections = detect_corrections(recalled_ids, combined_response)
-                for correction in corrections:
-                    confidence = correction["confidence"]
-                    mem_id = correction["memory_id"]
-                    corrected = correction["corrected"]
-                    src = correction["source"]
-                    if confidence >= 0.7:
 
-                        async def _apply_corr(
-                            _mid: str = mem_id,
-                            _cor: str = corrected,
-                            _conf: float = confidence,
-                            _src: str = src,
-                        ) -> None:
-                            await asyncio.to_thread(
-                                apply_correction,
-                                _mid,
-                                _cor,
-                                confidence=_conf,
-                                source=_src,
-                            )
+                # Serialize corrections to avoid concurrent SQLite writers
+                # (fire-and-forget caused "database is locked" crashes)
+                async def _apply_all_corrections(corrs: list) -> None:
+                    for corr in corrs:
+                        confidence = corr["confidence"]
+                        mem_id = corr["memory_id"]
+                        corrected = corr["corrected"]
+                        src = corr["source"]
+                        try:
+                            if confidence >= 0.7:
+                                await asyncio.to_thread(
+                                    apply_correction,
+                                    mem_id,
+                                    corrected,
+                                    confidence=confidence,
+                                    source=src,
+                                )
+                            elif confidence >= 0.5:
+                                await asyncio.to_thread(
+                                    flag_for_review,
+                                    mem_id,
+                                    corrected,
+                                    confidence=confidence,
+                                    source=src,
+                                )
+                        except Exception:
+                            log.exception("correction_failed", mem_id=mem_id)
 
-                        _fire_and_forget(_apply_corr())
-                    elif confidence >= 0.5:
-
-                        async def _flag_corr(
-                            _mid: str = mem_id,
-                            _cor: str = corrected,
-                            _conf: float = confidence,
-                            _src: str = src,
-                        ) -> None:
-                            await asyncio.to_thread(
-                                flag_for_review,
-                                _mid,
-                                _cor,
-                                confidence=_conf,
-                                source=_src,
-                            )
-
-                        _fire_and_forget(_flag_corr())
+                if corrections:
+                    _fire_and_forget(_apply_all_corrections(corrections))
 
             # Session loss detection
             if session_id and result.session_id != session_id:
