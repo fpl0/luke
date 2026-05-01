@@ -650,6 +650,14 @@ def index_memory(
         except Exception:
             log.warning("memory_evolution_failed", mem_id=mem_id)
 
+    # Emit event for procedure updates (drives cron-memory sync)
+    if mem_type == "procedure":
+        try:
+            from .bus import bus
+            bus.emit("procedure_updated", {"procedure_id": mem_id, "title": title})
+        except Exception:
+            pass  # best-effort — don't fail index_memory over event
+
     return embedding
 
 

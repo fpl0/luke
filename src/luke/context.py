@@ -9,6 +9,7 @@ Provides runtime context management for the agent:
 from __future__ import annotations
 
 import math
+import struct
 from datetime import UTC, datetime
 from typing import Any
 
@@ -157,8 +158,26 @@ def _recency_score(updated_iso: str, half_life_days: float = 14.0) -> float:
     return math.exp(-math.log(2) * age_days / half_life_days)
 
 
-def _load_priority_memories() -> list[dict[str, Any]]:
+def _cosine_similarity(a: list[float], b_blob: bytes) -> float:
+    """Cosine similarity between a list[float] and a packed-float blob."""
+    dim = len(a)
+    try:
+        b = struct.unpack(f"{dim}f", b_blob)
+    except struct.error:
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = math.sqrt(sum(x * x for x in a))
+    norm_b = math.sqrt(sum(y * y for y in b))
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
+def _load_priority_memories(query: str = "") -> list[dict[str, Any]]:
     """Load active memories scored for context injection priority.
+
+    When *query* is non-empty, embeds it and adds semantic similarity as a
+    scoring factor (25% weight). Falls back to static scoring when empty.
 
     Returns dicts with: id, type, title, content, importance, updated,
     access_count, score.
@@ -174,6 +193,32 @@ def _load_priority_memories() -> list[dict[str, Any]]:
            ORDER BY m.importance DESC, m.updated DESC"""
     ).fetchall()
 
+    # --- Query-aware scoring: embed query and load memory vectors ---
+    query_vec: list[float] | None = None
+    vec_map: dict[str, bytes] = {}  # mem_id → packed embedding blob
+    if query.strip():
+        try:
+            from .memory import _embed_query
+
+            query_vec = _embed_query(query)
+        except Exception:
+            log.warning("context_query_embed_failed")
+            query_vec = None
+
+    if query_vec is not None:
+        id_set = [r["id"] for r in rows]
+        if id_set:
+            placeholders = ",".join("?" for _ in id_set)
+            vec_rows = db.execute(
+                f"SELECT memory_id, embedding FROM memory_vec "
+                f"WHERE memory_id IN ({placeholders})",
+                id_set,
+            ).fetchall()
+            for vr in vec_rows:
+                vec_map[vr["memory_id"]] = vr["embedding"]
+
+    has_query = query_vec is not None and len(vec_map) > 0
+
     now = datetime.now(UTC)
     max_access = max((r["access_count"] for r in rows), default=1) or 1
     log_max = math.log1p(max_access)
@@ -184,15 +229,26 @@ def _load_priority_memories() -> list[dict[str, Any]]:
         rec = _recency_score(r["updated"])
         freq = math.log1p(r["access_count"]) / log_max if log_max > 0 else 0.5
 
-        # Composite: importance 40%, recency 35%, access 25%
-        # Heavier on importance than recall scoring — we want stable context
-        score = 0.40 * imp + 0.35 * rec + 0.25 * freq
+        if has_query:
+            # Query-aware: importance 30%, recency 25%, access 20%, similarity 25%
+            sim = 0.0
+            blob = vec_map.get(r["id"])
+            if blob is not None and query_vec is not None:
+                sim = max(0.0, _cosine_similarity(query_vec, blob))
+            score = 0.30 * imp + 0.25 * rec + 0.20 * freq + 0.25 * sim
+        else:
+            # Static fallback: importance 40%, recency 35%, access 25%
+            score = 0.40 * imp + 0.35 * rec + 0.25 * freq
 
         # Type boost: goals and entities are always higher priority for context
         if r["type"] in ("goal", "entity"):
             score *= 1.3
         elif r["type"] == "insight":
             score *= 1.1
+
+        # Floor: high-importance memories never drop below 0.4
+        if r["importance"] >= 1.5:
+            score = max(score, 0.4)
 
         memories.append({
             "id": r["id"],
@@ -238,7 +294,7 @@ def build_working_context(
     Returns empty string if no memories qualify or DB is unavailable.
     """
     try:
-        memories = _load_priority_memories()
+        memories = _load_priority_memories(query=query)
     except Exception as e:
         log.warning("context_load_failed", error=str(e))
         return ""
