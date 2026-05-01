@@ -619,6 +619,37 @@ def index_memory(
     # Assign to cluster (online BIRCH)
     assign_cluster_online(mem_id, embedding)
 
+    # --- Memory evolution hook (A-MEM pattern) ---
+    # When a new memory is indexed, auto-link to semantically similar existing
+    # memories.  This builds the knowledge graph automatically instead of
+    # relying on the agent to specify links manually every time.
+    if embedding is not None:
+        try:
+            similar = _semantic_search(
+                embedding, limit=4, include_private=True
+            )
+            for cand in similar:
+                if cand["id"] == mem_id:
+                    continue
+                if cand["score"] < 0.40:  # too dissimilar
+                    continue
+                target_type_row = _db().execute(
+                    "SELECT type FROM memory_meta WHERE id = ?", (cand["id"],)
+                ).fetchone()
+                target_type = target_type_row["type"] if target_type_row else ""
+                rel = _DEFAULT_RELATIONSHIP.get(
+                    (mem_type, target_type), "related"
+                )
+                _db().execute(
+                    """INSERT OR IGNORE INTO memory_links
+                       (from_id, to_id, relationship, weight, created)
+                       VALUES (?, ?, ?, 1.0, ?)""",
+                    (mem_id, cand["id"], rel, datetime.now(UTC).isoformat()),
+                )
+            _commit(_db())
+        except Exception:
+            log.warning("memory_evolution_failed", mem_id=mem_id)
+
     return embedding
 
 
@@ -1530,8 +1561,9 @@ def apply_correction(
     now = datetime.now(UTC).isoformat()
     changes = [change_desc, f"Confidence: {confidence:.2f}, Source: {source}"]
 
-    if relationship == "contradictory":
-        link_memories(mem_id, mem_id, "supersedes")
+    # Note: contradictory corrections replace content in-place on the same
+    # mem_id, so there is no separate "old" memory to link.  The history
+    # table already captures the before/after snapshot.
 
     conn.execute("UPDATE memory_fts SET content = ? WHERE id = ?", (new_content, mem_id))
     if packed_embedding is not None and rowid is not None:
