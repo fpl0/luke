@@ -218,6 +218,49 @@ async def start_scheduler_loop(
     bus.on("deep_work_skipped", _on_reflexion_event)
     bus.on("continuation_failure", _on_reflexion_event)
 
+    # --- Cron-memory sync: detect cron ID drift when procedures are updated ---
+    import re as _re
+
+    _CRON_ID_RE = _re.compile(r"\b[0-9a-f]{8}\b")
+
+    async def _on_procedure_updated(event: object) -> None:
+        """Check if updated procedure references cron IDs that don't match live tasks."""
+        from .bus import Event
+
+        if not isinstance(event, Event):
+            return
+        proc_id = event.payload.get("procedure_id", "")
+        if not proc_id:
+            return
+        try:
+            body = memory.read_memory_body("procedure", proc_id, 3000)
+            if not body:
+                return
+            referenced_ids = set(_CRON_ID_RE.findall(body))
+            if not referenced_ids:
+                return
+            live_tasks = db.get_due_tasks()
+            live_ids = {t["id"][:8] for t in live_tasks}
+            stale = referenced_ids - live_ids
+            if stale:
+                log.warning(
+                    "cron_memory_drift",
+                    procedure=proc_id,
+                    stale_ids=list(stale),
+                    live_ids=list(live_ids),
+                )
+                memory.flag_for_review(
+                    proc_id,
+                    f"Procedure references cron IDs {stale} that don't match any active task. "
+                    f"Live task IDs: {live_ids}. Review and rebuild crons if prompts changed.",
+                    confidence=0.8,
+                    source="cron_memory_sync",
+                )
+        except Exception:
+            log.warning("cron_memory_sync_failed", procedure=proc_id)
+
+    bus.on("procedure_updated", _on_procedure_updated)
+
     while not (shutdown and shutdown.is_set()):
         # Use wait with timeout so we wake up promptly on shutdown
         if shutdown:
@@ -352,6 +395,40 @@ async def start_scheduler_loop(
                         db.reset_behavior_no_ops("deep_work")
                     log.info("deep_work_events_consumed", consumed=consumed)
 
+                    # --- Deep work output critic ---
+                    # Check if any plan file was actually advanced (steps checked off)
+                    try:
+                        plans_dir = settings.workspace_dir / "plans"
+                        if plans_dir.exists():
+                            for plan_file in plans_dir.glob("*.md"):
+                                text = plan_file.read_text(encoding="utf-8")[:3000]
+                                # Count checked vs unchecked steps
+                                checked = text.count("- [x]") + text.count("- [X]")
+                                unchecked = text.count("- [ ]")
+                                # Check for self-rating
+                                import re as _re2
+
+                                rating_m = _re2.search(
+                                    r"(?:rating|quality)[:\s]*(\d(?:\.\d)?)", text, _re2.IGNORECASE
+                                )
+                                if rating_m and checked == 0 and unchecked > 0:
+                                    claimed = float(rating_m.group(1))
+                                    if claimed >= 3.0:
+                                        log.warning(
+                                            "deep_work_critic_override",
+                                            plan=plan_file.name,
+                                            claimed_rating=claimed,
+                                            checked_steps=checked,
+                                            unchecked_steps=unchecked,
+                                        )
+                                        goal_id = plan_file.stem
+                                        bus.emit("low_quality_work", {
+                                            "goal_id": goal_id,
+                                            "reason": f"Critic: claimed {claimed}/5 but 0 steps checked off",
+                                        })
+                    except Exception:
+                        log.warning("deep_work_critic_failed")
+
             _deep_work_task.add_done_callback(_on_deep_work_done)
             log.info(
                 "deep_work_launched",
@@ -410,10 +487,11 @@ async def start_scheduler_loop(
         except Exception:
             log.exception("Scheduler loop error")
 
-    # Unsubscribe reflexion handlers on shutdown
+    # Unsubscribe event handlers on shutdown
     bus.off("low_quality_work", _on_reflexion_event)
     bus.off("deep_work_skipped", _on_reflexion_event)
     bus.off("continuation_failure", _on_reflexion_event)
+    bus.off("procedure_updated", _on_procedure_updated)
 
     # Drain in-flight tasks before exiting (snapshot to avoid mutation during gather)
     pending = list(_running_tasks.values())

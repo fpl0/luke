@@ -65,6 +65,41 @@ log: BoundLogger = structlog.get_logger()
 _INTERNAL_RE = re.compile(r"<internal>[\s\S]*?</internal>")
 _INTERNAL_OPEN_RE = re.compile(r"<internal>[\s\S]*$")  # unclosed tag at end
 _LOG_TRUNCATION = 100  # chars for log message truncation
+
+# --- Outbound message quality patterns (autonomous sends only) ---
+_CATCHUP_PATTERNS = re.compile(
+    r"(?i)(catching up|nothing (?:actionable|to report)|no (?:action|update)s? needed|"
+    r"just checking in|no response requested|all good on my end)",
+)
+_FILLER_PATTERNS = re.compile(
+    r"(?i)^(great question!?|absolutely!?|i apologize for the inconvenience|"
+    r"let me know if you need anything else|here are the pros and cons)$",
+)
+
+
+def _check_outbound_quality(text: str) -> str | None:
+    """Check an outbound message against quality rules. Returns rejection reason or None."""
+    if not text or not text.strip():
+        return "empty message"
+
+    # Internal tags leaked
+    if "<internal>" in text:
+        return "contains <internal> tags"
+
+    # Filler / never-say patterns
+    stripped = text.strip()
+    if _FILLER_PATTERNS.match(stripped):
+        return f"matches never-say pattern: {stripped[:50]}"
+
+    # Non-action announcements
+    if _CATCHUP_PATTERNS.search(text):
+        return "catchup/non-action announcement"
+
+    # Too short to be substantive (but allow emoji reactions)
+    if len(stripped) < 15 and not any(ord(c) > 0x1F600 for c in stripped):
+        return "message too short to be substantive"
+
+    return None
 _TG_MAX_MSG_LEN = 4096  # Telegram API hard limit
 _STREAMING_CURSOR = " ▍"  # visual typing indicator
 
@@ -540,6 +575,11 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
             )
         except ValueError as exc:
             return _ok(f"Error: {exc}")
+        bus.emit("cron_created", {
+            "task_id": task_id,
+            "schedule_type": args["schedule_type"],
+            "prompt_preview": args["prompt"][:200],
+        })
         return _ok(f"Scheduled: {task_id}")
 
     @tool(
@@ -568,6 +608,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
     )
     async def delete_task_tool(args: dict[str, Any]) -> dict[str, Any]:
         if db.delete_task(args["task_id"]):
+            bus.emit("cron_deleted", {"task_id": args["task_id"]})
             return _ok(f"Deleted task {args['task_id']}")
         return _ok(f"Task {args['task_id']} not found")
 
@@ -1255,8 +1296,13 @@ async def run_agent(
         )
 
     # Inject working memory — priority memories scored and selected at session start
+    # Adaptive budget: low-effort messages get less context (saves tokens + noise)
     prompt_text_for_context = prompt if isinstance(prompt, str) else str(prompt[0].get("text", ""))
-    working_ctx = context.build_working_context(query=prompt_text_for_context)
+    _EFFORT_BUDGET = {"low": 3_000, "medium": 6_000, "high": 12_000, "max": 12_000}
+    ctx_budget = 12_000 if autonomous else _EFFORT_BUDGET.get(effort or "high", 12_000)
+    working_ctx = context.build_working_context(
+        query=prompt_text_for_context, budget_tokens=ctx_budget
+    )
     if working_ctx:
         persona += "\n\n" + working_ctx
 
@@ -1301,6 +1347,24 @@ async def run_agent(
                         urgent=urgent,
                     )
                     return {"decision": "block", "reason": "Hourly message budget exceeded"}
+
+                # --- Outbound message quality gate (autonomous only) ---
+                tool_input = input_data.get("tool_input", {})
+                msg_text = tool_input.get("text", "") if isinstance(tool_input, dict) else ""
+                rejection = _check_outbound_quality(msg_text)
+                if rejection:
+                    log.warning(
+                        "message_rejected",
+                        chat_id=chat_id,
+                        reason=rejection,
+                        preview=msg_text[:100],
+                    )
+                    bus.emit("message_rejected", {
+                        "reason": rejection,
+                        "tool": tool_name,
+                        "preview": msg_text[:100],
+                    })
+                    return {"decision": "block", "reason": f"Quality gate: {rejection}"}
         return {}
 
     async def _post_tool_hook(
