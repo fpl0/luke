@@ -100,6 +100,12 @@ class Settings(BaseSettings):
     model_medium: str = "sonnet"  # casual conversation, simple questions
     model_high: str = "opus"  # deep reasoning, research, multi-step
 
+    # Outbound critic (F4) — last-mile quality gate on autonomous sends
+    critic_enabled: bool = True
+    critic_model: str = "claude-haiku-4-5-20251001"
+    critic_max_budget_usd: float = 0.01
+    critic_timeout_s: float = 5.0
+
     # Behavior model routing
     consolidation_model: str = "sonnet"
     reflection_model: str = "sonnet"

@@ -1441,6 +1441,40 @@ async def run_agent(
                             "actual memory."
                         ),
                     }
+
+                # --- Outbound critic (autonomous only) — F4 ---
+                # Last gate: cheap haiku pass for tone/factuality/fit. Runs
+                # AFTER cheap regex/state gates so we only spend on drafts
+                # that survived everything else. Fail-open semantics live
+                # inside critique_outbound itself.
+                if settings.critic_enabled and msg_text and len(msg_text) >= 20:
+                    from .critic import critique_outbound
+
+                    verdict = await critique_outbound(
+                        msg_text, {"tool": tool_name}
+                    )
+                    if verdict.decision != "pass":
+                        log.warning(
+                            "critic_blocked",
+                            chat_id=chat_id,
+                            tool=tool_name,
+                            verdict=verdict.decision,
+                            reason=verdict.reason,
+                            preview=msg_text[:100],
+                        )
+                        bus.emit("critic_blocked", {
+                            "tool": tool_name,
+                            "verdict": verdict.decision,
+                            "reason": verdict.reason,
+                            "preview": msg_text[:100],
+                        })
+                        return {
+                            "decision": "block",
+                            "reason": (
+                                f"Critic ({verdict.decision}): "
+                                f"{verdict.reason}"
+                            ),
+                        }
         return {}
 
     async def _post_tool_hook(

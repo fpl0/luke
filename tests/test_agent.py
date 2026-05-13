@@ -1075,6 +1075,251 @@ class TestRecallBeforeReference:
         assert emitted == []
 
 
+class TestCriticGate:
+    """Test the critic-agent gate inside _pre_tool_hook (F4).
+
+    Follows the closure-reproduction pattern from TestRecallBeforeReference:
+    we rebuild the hook's outer structure faithfully so the test exercises
+    the same branching logic the real run_agent installs.
+
+    `critique_outbound` is monkeypatched to control verdicts.
+    """
+
+    @staticmethod
+    def _build_hook(
+        *,
+        autonomous: bool,
+        critic_enabled: bool,
+        verdict_fn: Any,
+    ) -> tuple[Any, list[dict[str, Any]], list[tuple[str, dict[str, Any]]]]:
+        """Construct a faithful copy of _pre_tool_hook's critic gate.
+
+        Returns (hook, emitted_events, critic_calls).
+        """
+        from luke.agent import _RECALL_TOOLS, _SEND_TOOLS, _references_past_events
+
+        send_count: dict[str, int] = {"n": 0}
+        recall_count: dict[str, int] = {"n": 0}
+        emitted: list[dict[str, Any]] = []
+        critic_calls: list[tuple[str, dict[str, Any]]] = []
+
+        async def _hook(
+            input_data: dict[str, Any],
+            tool_use_id: str | None,
+            context: Any,
+        ) -> dict[str, Any]:
+            tool_name = input_data["tool_name"]
+            if tool_name in _RECALL_TOOLS:
+                recall_count["n"] += 1
+            if tool_name in _SEND_TOOLS:
+                send_count["n"] += 1
+                if autonomous:
+                    tool_input = input_data.get("tool_input", {})
+                    msg_text = (
+                        tool_input.get("text", "")
+                        if isinstance(tool_input, dict)
+                        else ""
+                    )
+                    # Reproduce the recall gate so we know the critic
+                    # only runs when the recall gate passes.
+                    if recall_count["n"] == 0 and _references_past_events(msg_text):
+                        emitted.append({
+                            "event": "send_blocked_no_recall",
+                            "tool": tool_name,
+                        })
+                        return {"decision": "block", "reason": "recall first"}
+
+                    # Critic gate — the slice under test.
+                    if critic_enabled and msg_text and len(msg_text) >= 20:
+                        critic_calls.append((msg_text, {"tool": tool_name}))
+                        verdict = await verdict_fn(msg_text, {"tool": tool_name})
+                        if verdict.decision != "pass":
+                            emitted.append({
+                                "event": "critic_blocked",
+                                "tool": tool_name,
+                                "verdict": verdict.decision,
+                                "reason": verdict.reason,
+                            })
+                            return {
+                                "decision": "block",
+                                "reason": (
+                                    f"Critic ({verdict.decision}): "
+                                    f"{verdict.reason}"
+                                ),
+                            }
+            return {}
+
+        return _hook, emitted, critic_calls
+
+    @staticmethod
+    def _verdict_factory(decision: str, reason: str = "") -> Any:
+        from luke.critic import CriticVerdict
+
+        async def _v(text: str, ctx: dict[str, Any]) -> CriticVerdict:
+            return CriticVerdict(decision, reason)
+
+        return _v
+
+    async def test_calls_critic_on_autonomous_send(self) -> None:
+        called: list[str] = []
+
+        async def _verdict(text: str, ctx: dict[str, Any]) -> Any:
+            from luke.critic import CriticVerdict
+
+            called.append(text)
+            return CriticVerdict("pass", "")
+
+        hook, emitted, _calls = self._build_hook(
+            autonomous=True, critic_enabled=True, verdict_fn=_verdict
+        )
+        result = await hook(
+            {
+                "tool_name": "mcp__luke__send_message",
+                "tool_input": {
+                    "text": "Heads up, your 3pm moved to Vega room upstairs.",
+                },
+                "tool_use_id": "tu_c1",
+            },
+            "tu_c1",
+            {},
+        )
+        assert result == {}
+        assert len(called) == 1
+        assert emitted == []
+
+    async def test_blocks_send_on_revise_verdict(self) -> None:
+        hook, emitted, _calls = self._build_hook(
+            autonomous=True,
+            critic_enabled=True,
+            verdict_fn=self._verdict_factory("revise", "tone too chipper"),
+        )
+        result = await hook(
+            {
+                "tool_name": "mcp__luke__send_message",
+                "tool_input": {
+                    "text": (
+                        "Absolutely! Great question — heads up your 3pm moved."
+                    ),
+                },
+                "tool_use_id": "tu_c2",
+            },
+            "tu_c2",
+            {},
+        )
+        assert result.get("decision") == "block"
+        assert "Critic (revise)" in result.get("reason", "")
+        assert "tone too chipper" in result.get("reason", "")
+        assert len(emitted) == 1
+        assert emitted[0]["event"] == "critic_blocked"
+        assert emitted[0]["verdict"] == "revise"
+
+    async def test_blocks_send_on_block_verdict(self) -> None:
+        hook, emitted, _calls = self._build_hook(
+            autonomous=True,
+            critic_enabled=True,
+            verdict_fn=self._verdict_factory("block", "filler boilerplate"),
+        )
+        result = await hook(
+            {
+                "tool_name": "mcp__luke__send_message",
+                "tool_input": {
+                    "text": "I apologize for the inconvenience, please bear with us.",
+                },
+                "tool_use_id": "tu_c3",
+            },
+            "tu_c3",
+            {},
+        )
+        assert result.get("decision") == "block"
+        assert "Critic (block)" in result.get("reason", "")
+        assert len(emitted) == 1
+        assert emitted[0]["verdict"] == "block"
+
+    async def test_passes_through_on_pass_verdict(self) -> None:
+        hook, emitted, calls = self._build_hook(
+            autonomous=True,
+            critic_enabled=True,
+            verdict_fn=self._verdict_factory("pass", ""),
+        )
+        result = await hook(
+            {
+                "tool_name": "mcp__luke__send_message",
+                "tool_input": {
+                    "text": "Heads up — your 3pm moved to Vega room upstairs.",
+                },
+                "tool_use_id": "tu_c4",
+            },
+            "tu_c4",
+            {},
+        )
+        assert result == {}
+        assert len(calls) == 1
+        assert emitted == []
+
+    async def test_skips_critic_when_disabled(self) -> None:
+        # If the critic would have blocked but it's disabled, send passes.
+        hook, emitted, calls = self._build_hook(
+            autonomous=True,
+            critic_enabled=False,
+            verdict_fn=self._verdict_factory("block", "would have blocked"),
+        )
+        result = await hook(
+            {
+                "tool_name": "mcp__luke__send_message",
+                "tool_input": {
+                    "text": "I apologize for the inconvenience, please bear with us.",
+                },
+                "tool_use_id": "tu_c5",
+            },
+            "tu_c5",
+            {},
+        )
+        assert result == {}
+        assert calls == []  # verdict_fn never invoked
+        assert emitted == []
+
+    async def test_skips_critic_for_short_text(self) -> None:
+        hook, emitted, calls = self._build_hook(
+            autonomous=True,
+            critic_enabled=True,
+            verdict_fn=self._verdict_factory("block", "would have blocked"),
+        )
+        result = await hook(
+            {
+                "tool_name": "mcp__luke__send_message",
+                "tool_input": {"text": "ok"},  # < 20 chars
+                "tool_use_id": "tu_c6",
+            },
+            "tu_c6",
+            {},
+        )
+        assert result == {}
+        assert calls == []
+        assert emitted == []
+
+    async def test_skips_critic_when_not_autonomous(self) -> None:
+        # Non-autonomous sends bypass all autonomous-only gates including critic.
+        hook, emitted, calls = self._build_hook(
+            autonomous=False,
+            critic_enabled=True,
+            verdict_fn=self._verdict_factory("block", "would have blocked"),
+        )
+        result = await hook(
+            {
+                "tool_name": "mcp__luke__send_message",
+                "tool_input": {
+                    "text": "I apologize for the inconvenience, please bear with us.",
+                },
+                "tool_use_id": "tu_c7",
+            },
+            "tu_c7",
+            {},
+        )
+        assert result == {}
+        assert calls == []
+        assert emitted == []
+
+
 class TestCleanStreamingText:
     def test_strips_complete_internal_tags(self) -> None:
         from luke.agent import _clean_streaming_text
