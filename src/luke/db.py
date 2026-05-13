@@ -93,11 +93,22 @@ def ensure_utc(dt: datetime) -> datetime:
 
 
 def _db() -> sqlite3.Connection:
-    """Return a thread-local SQLite connection (WAL handles concurrent access)."""
+    """Return a thread-local SQLite connection (WAL + process-wide write lock).
+
+    Returns a :class:`LockedConnection` that auto-acquires the global write
+    lock on write SQL. This serializes writes across all threads in the
+    process, eliminating the lock-contention crash class. Reads stay
+    concurrent via WAL.
+    """
     conn: sqlite3.Connection | None = getattr(_local, "conn", None)
     if conn is None:
+        from .dbwriter import LockedConnection
+
         settings.store_dir.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(settings.store_dir / "luke.db")
+        conn = sqlite3.connect(
+            settings.store_dir / "luke.db",
+            factory=LockedConnection,
+        )
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA foreign_keys=ON")
@@ -1072,7 +1083,13 @@ def reset_behavior_no_ops(name: str) -> None:
 
 
 def emit_event(event_type: str, payload: str = "{}") -> int:
-    """Emit an event. Returns the event ID."""
+    """Emit an event. Returns the event ID.
+
+    Serialized across threads via :class:`LockedConnection` — the connection
+    auto-acquires the process-wide write lock on every INSERT/UPDATE/DELETE.
+    This is the single highest-frequency write path (every message, tool use,
+    and behavior completion) and was the surface of the 2026-05-13 crash.
+    """
     conn = _db()
     cur = conn.execute(
         "INSERT INTO events (event_type, payload) VALUES (?, ?)",
