@@ -838,6 +838,243 @@ class TestActiveClientRegistry:
 # ---------------------------------------------------------------------------
 
 
+class TestRecallBeforeReference:
+    """Test the recall-before-reference gate inside _pre_tool_hook.
+
+    The hook is a closure built inside run_agent(). We test the gate logic
+    directly by reproducing the relevant closure state and calling a faithful
+    reconstruction of the gate, matching the pattern used by TestPostToolUseHooks.
+    """
+
+    # ----- _references_past_events helper -----
+
+    @pytest.mark.parametrize(
+        "phrase",
+        [
+            "yesterday",
+            "last week",
+            "earlier today",
+            "last time",
+            "the other day",
+            "previously",
+            "before",
+            "when we talked",
+            "you mentioned",
+            "you said",
+            "you told me",
+            "we discussed",
+            "the thing we",
+            "the topic",
+            "remember when",
+        ],
+    )
+    def test_references_past_events_matches_phrase(self, phrase: str) -> None:
+        from luke.agent import _references_past_events
+
+        text = f"Quick follow-up: {phrase} that thing — does it still hold?"
+        assert _references_past_events(text) is True
+
+    def test_references_past_events_case_insensitive(self) -> None:
+        from luke.agent import _references_past_events
+
+        assert _references_past_events("YESTERDAY we talked about the demo plan.") is True
+
+    def test_references_past_events_false_for_fresh_message(self) -> None:
+        from luke.agent import _references_past_events
+
+        fresh = "Heads up — your 3pm meeting room just changed to Vega upstairs."
+        assert _references_past_events(fresh) is False
+
+    def test_references_past_events_false_for_empty(self) -> None:
+        from luke.agent import _references_past_events
+
+        assert _references_past_events("") is False
+
+    def test_references_past_events_false_for_short_text(self) -> None:
+        from luke.agent import _references_past_events
+
+        # Even though "yesterday" appears, text is < 30 chars so it's not blocked
+        assert _references_past_events("yesterday?") is False
+
+    # ----- _pre_tool_hook recall gate -----
+    #
+    # We rebuild the same closure structure used by run_agent() so the test
+    # exercises the real branching logic.  Only the slice relevant to the
+    # recall gate is reproduced — the F4 critic feature will stack on top.
+
+    @staticmethod
+    def _build_hook(
+        *,
+        autonomous: bool,
+        initial_recall: int = 0,
+    ) -> tuple[Any, dict[str, int], dict[str, int], list[dict[str, Any]]]:
+        """Construct a faithful copy of _pre_tool_hook's recall gate.
+
+        Returns (hook, send_count, recall_count, emitted_events).
+        """
+        from luke.agent import (
+            _RECALL_TOOLS,
+            _SEND_TOOLS,
+            _references_past_events,
+        )
+
+        send_count: dict[str, int] = {"n": 0}
+        recall_count: dict[str, int] = {"n": initial_recall}
+        emitted: list[dict[str, Any]] = []
+
+        async def _hook(
+            input_data: dict[str, Any],
+            tool_use_id: str | None,
+            context: Any,
+        ) -> dict[str, Any]:
+            tool_name = input_data["tool_name"]
+            if tool_name in _RECALL_TOOLS:
+                recall_count["n"] += 1
+            if tool_name in _SEND_TOOLS:
+                send_count["n"] += 1
+                if autonomous:
+                    tool_input = input_data.get("tool_input", {})
+                    msg_text = (
+                        tool_input.get("text", "")
+                        if isinstance(tool_input, dict)
+                        else ""
+                    )
+                    if recall_count["n"] == 0 and _references_past_events(msg_text):
+                        emitted.append({
+                            "event": "send_blocked_no_recall",
+                            "tool": tool_name,
+                            "preview": msg_text[:100],
+                        })
+                        return {
+                            "decision": "block",
+                            "reason": (
+                                "Reference to past events detected; call "
+                                "recall (or recall_conversation) first to "
+                                "ground in actual memory."
+                            ),
+                        }
+            return {}
+
+        return _hook, send_count, recall_count, emitted
+
+    async def test_pre_tool_hook_blocks_autonomous_send_with_past_reference(self) -> None:
+        hook, _send, _recall, emitted = self._build_hook(autonomous=True)
+        result = await hook(
+            {
+                "tool_name": "mcp__luke__send_message",
+                "tool_input": {
+                    "text": (
+                        "Quick check — yesterday you mentioned the talk prep "
+                        "was almost done. Is it still on track?"
+                    ),
+                },
+                "tool_use_id": "tu_a",
+            },
+            "tu_a",
+            {},
+        )
+        assert result.get("decision") == "block"
+        assert "recall" in result.get("reason", "").lower()
+        assert len(emitted) == 1
+        assert emitted[0]["event"] == "send_blocked_no_recall"
+
+    async def test_pre_tool_hook_does_not_block_when_recall_called(self) -> None:
+        hook, _send, recall, emitted = self._build_hook(autonomous=True)
+        # Simulate recall being invoked earlier in the turn.
+        await hook(
+            {
+                "tool_name": "mcp__luke__recall",
+                "tool_input": {"query": "talk prep"},
+                "tool_use_id": "tu_r",
+            },
+            "tu_r",
+            {},
+        )
+        assert recall["n"] == 1
+
+        result = await hook(
+            {
+                "tool_name": "mcp__luke__send_message",
+                "tool_input": {
+                    "text": (
+                        "Quick check — yesterday you mentioned the talk prep "
+                        "was almost done. Is it still on track?"
+                    ),
+                },
+                "tool_use_id": "tu_s",
+            },
+            "tu_s",
+            {},
+        )
+        assert result == {}
+        assert emitted == []
+
+    async def test_pre_tool_hook_does_not_block_non_autonomous(self) -> None:
+        hook, _send, _recall, emitted = self._build_hook(autonomous=False)
+        result = await hook(
+            {
+                "tool_name": "mcp__luke__send_message",
+                "tool_input": {
+                    "text": (
+                        "Quick check — yesterday you mentioned the talk prep "
+                        "was almost done. Is it still on track?"
+                    ),
+                },
+                "tool_use_id": "tu_b",
+            },
+            "tu_b",
+            {},
+        )
+        assert result == {}
+        assert emitted == []
+
+    async def test_pre_tool_hook_does_not_block_fresh_text(self) -> None:
+        hook, _send, _recall, emitted = self._build_hook(autonomous=True)
+        result = await hook(
+            {
+                "tool_name": "mcp__luke__send_message",
+                "tool_input": {
+                    "text": "Heads up — your 3pm meeting moved to Vega room upstairs.",
+                },
+                "tool_use_id": "tu_c",
+            },
+            "tu_c",
+            {},
+        )
+        assert result == {}
+        assert emitted == []
+
+    async def test_pre_tool_hook_recall_conversation_also_satisfies_gate(self) -> None:
+        hook, _send, recall, emitted = self._build_hook(autonomous=True)
+        await hook(
+            {
+                "tool_name": "mcp__luke__recall_conversation",
+                "tool_input": {"query": "talk prep"},
+                "tool_use_id": "tu_rc",
+            },
+            "tu_rc",
+            {},
+        )
+        assert recall["n"] == 1
+
+        result = await hook(
+            {
+                "tool_name": "mcp__luke__send_message",
+                "tool_input": {
+                    "text": (
+                        "About the topic we discussed earlier — I have an "
+                        "update worth flagging now."
+                    ),
+                },
+                "tool_use_id": "tu_s2",
+            },
+            "tu_s2",
+            {},
+        )
+        assert result == {}
+        assert emitted == []
+
+
 class TestCleanStreamingText:
     def test_strips_complete_internal_tags(self) -> None:
         from luke.agent import _clean_streaming_text

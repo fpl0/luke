@@ -232,6 +232,54 @@ _SEND_TOOLS: frozenset[str] = frozenset(
 )
 
 
+# Patterns that suggest the draft references a past event/topic
+# Used by _references_past_events to gate autonomous sends behind a recall call.
+_TEMPORAL_PHRASES: tuple[str, ...] = (
+    "yesterday",
+    "last week",
+    "earlier today",
+    "last time",
+    "the other day",
+    "previously",
+    "before",
+    "when we talked",
+    "you mentioned",
+    "you said",
+    "you told me",
+    "we discussed",
+    "the thing we",
+    "the topic",
+    "remember when",
+)
+
+
+def _references_past_events(text: str) -> bool:
+    """Heuristic: does the draft reference a past event Luke should recall first?
+
+    Matches temporal phrases (yesterday/last week/etc) and conversational
+    deixis (you mentioned, we discussed).
+
+    Conservative by design: false negatives are fine (worst case: agent sends
+    a fresh-looking message that happens to reference past events — current
+    behavior).  False positives would block legit fresh messages, so the rule
+    requires BOTH a temporal/deictic phrase AND text length > 30 chars
+    (filters out trivial acknowledgments like "yesterday's question").
+    """
+    if not text or len(text) < 30:
+        return False
+    lowered = text.lower()
+    return any(phrase in lowered for phrase in _TEMPORAL_PHRASES)
+
+
+# Tools that count as "recall" for the recall-before-reference gate
+_RECALL_TOOLS: frozenset[str] = frozenset(
+    {
+        "mcp__luke__recall",
+        "mcp__luke__recall_conversation",
+    }
+)
+
+
 _AUTO_SKILL_THRESHOLD: int = 5  # tool calls to trigger procedure extraction in stop hook
 
 # Active client registry — enables external interruption of running agents
@@ -1308,6 +1356,7 @@ async def run_agent(
 
     # Per-run counters and timing state (closed over by hooks)
     send_count = {"n": 0}
+    recall_count = {"n": 0}  # incremented when recall/recall_conversation runs
     tool_count: dict[str, int] = {"n": 0}
     tool_start_times: dict[str, float] = {}  # tool_use_id -> monotonic start
     subagent_start_times: dict[str, float] = {}  # agent_id -> monotonic start
@@ -1325,6 +1374,9 @@ async def run_agent(
         tid = input_data.get("tool_use_id") or tool_use_id
         if tid:
             tool_start_times[tid] = time.monotonic()
+        # Track recall calls to gate references-to-past-events in send tools.
+        if tool_name in _RECALL_TOOLS:
+            recall_count["n"] += 1
         if tool_name in _SEND_TOOLS:
             send_count["n"] += 1
             if send_count["n"] > effective_max_sends:
@@ -1365,6 +1417,30 @@ async def run_agent(
                         "preview": msg_text[:100],
                     })
                     return {"decision": "block", "reason": f"Quality gate: {rejection}"}
+
+                # --- Recall-before-reference gate (autonomous only) ---
+                # If the draft references past events but no recall was called
+                # this turn, block so the agent grounds in actual memory before
+                # asking about something it should already know.
+                if recall_count["n"] == 0 and _references_past_events(msg_text):
+                    log.warning(
+                        "send_blocked_no_recall",
+                        chat_id=chat_id,
+                        tool=tool_name,
+                        preview=msg_text[:100],
+                    )
+                    bus.emit("send_blocked_no_recall", {
+                        "tool": tool_name,
+                        "preview": msg_text[:100],
+                    })
+                    return {
+                        "decision": "block",
+                        "reason": (
+                            "Reference to past events detected; call recall "
+                            "(or recall_conversation) first to ground in "
+                            "actual memory."
+                        ),
+                    }
         return {}
 
     async def _post_tool_hook(
