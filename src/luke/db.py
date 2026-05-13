@@ -1296,7 +1296,21 @@ def count_recent_outbound(chat_id: str, window_seconds: int = 3600) -> int:
         )
         .fetchone()
     )
-    return row[0] if row else 0
+    return int(row[0]) if row else 0
+
+
+def get_daily_outbound_count(chat_id: str) -> int:
+    """Count outbound messages sent today (since UTC midnight)."""
+    row = (
+        _db()
+        .execute(
+            "SELECT COUNT(*) FROM outbound_log "
+            "WHERE chat_id = ? AND timestamp >= date('now')",
+            (chat_id,),
+        )
+        .fetchone()
+    )
+    return int(row[0]) if row else 0
 
 
 def cleanup_outbound_log(retention_hours: int = 24) -> int:

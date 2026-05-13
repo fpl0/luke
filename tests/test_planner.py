@@ -13,12 +13,12 @@ from luke.planner import (
     MAINTENANCE_BEHAVIORS,
     Intent,
     _deep_work_intents,
+    _enforce_attention_budget,
     _maintenance_intents,
     effective_interval,
     generate_intents,
     plan,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -410,3 +410,175 @@ class TestBehaviorEventsMapping:
         """BEHAVIOR_EVENTS shouldn't list behaviors that aren't maintenance."""
         for b in BEHAVIOR_EVENTS:
             assert b in MAINTENANCE_BEHAVIORS, f"{b} in BEHAVIOR_EVENTS but not MAINTENANCE_BEHAVIORS"
+
+
+# ---------------------------------------------------------------------------
+# Attention budget enforcement
+# ---------------------------------------------------------------------------
+
+
+def _attn_settings(
+    *,
+    chat_id: str = "12345",
+    daily_attention_budget: int = 12,
+    attention_urgent_reserve: int = 2,
+) -> MagicMock:
+    """Mock settings for attention-budget tests."""
+    m = MagicMock()
+    m.chat_id = chat_id
+    m.daily_attention_budget = daily_attention_budget
+    m.attention_urgent_reserve = attention_urgent_reserve
+    return m
+
+
+class TestEnforceAttentionBudget:
+    def test_drops_when_budget_exhausted(self) -> None:
+        """Attention-asking intents are dropped when daily count >= budget."""
+        db = MagicMock()
+        db.get_daily_outbound_count.return_value = 12  # full budget spent
+        s = _attn_settings()
+        bus = MagicMock()
+        with (
+            patch("luke.planner.db", new=db),
+            patch("luke.planner.settings", new=s),
+            patch("luke.bus.bus", new=bus),
+        ):
+            intents = [
+                Intent(
+                    "dream",
+                    0.30,
+                    "event",
+                    2.0,
+                    asks_attention=True,
+                    attention_cost=1,
+                    attention_urgency=0.2,
+                )
+            ]
+            kept = _enforce_attention_budget(intents)
+            assert kept == []
+
+    def test_urgent_can_use_reserve(self) -> None:
+        """When budget is spent, urgent intents still pass via reserve."""
+        db = MagicMock()
+        db.get_daily_outbound_count.return_value = 12  # full budget spent
+        s = _attn_settings(daily_attention_budget=12, attention_urgent_reserve=2)
+        bus = MagicMock()
+        with (
+            patch("luke.planner.db", new=db),
+            patch("luke.planner.settings", new=s),
+            patch("luke.bus.bus", new=bus),
+        ):
+            urgent = Intent(
+                "proactive_scan",
+                0.55,
+                "event",
+                1.5,
+                asks_attention=True,
+                attention_cost=2,
+                attention_urgency=0.7,
+            )
+            kept = _enforce_attention_budget([urgent])
+            assert len(kept) == 1
+            assert kept[0].kind == "proactive_scan"
+
+    def test_non_attention_intents_never_dropped(self) -> None:
+        """Intents with asks_attention=False are passed through untouched."""
+        db = MagicMock()
+        db.get_daily_outbound_count.return_value = 100  # way over budget
+        s = _attn_settings()
+        bus = MagicMock()
+        with (
+            patch("luke.planner.db", new=db),
+            patch("luke.planner.settings", new=s),
+            patch("luke.bus.bus", new=bus),
+        ):
+            silent = Intent("consolidation", 0.50, "event", 1.5)  # asks_attention=False default
+            kept = _enforce_attention_budget([silent])
+            assert kept == [silent]
+
+    def test_no_chat_id_passes_through(self) -> None:
+        """When settings.chat_id is empty, no dropping happens."""
+        db = MagicMock()
+        s = _attn_settings(chat_id="")
+        bus = MagicMock()
+        with (
+            patch("luke.planner.db", new=db),
+            patch("luke.planner.settings", new=s),
+            patch("luke.bus.bus", new=bus),
+        ):
+            attn_intent = Intent(
+                "dream",
+                0.30,
+                "event",
+                2.0,
+                asks_attention=True,
+                attention_cost=1,
+                attention_urgency=0.2,
+            )
+            kept = _enforce_attention_budget([attn_intent])
+            assert kept == [attn_intent]
+            # db should never be queried when chat_id is missing
+            db.get_daily_outbound_count.assert_not_called()
+
+    def test_emits_dropped_event(self) -> None:
+        """A dropped intent emits an 'intent_dropped_attention' bus event."""
+        db = MagicMock()
+        db.get_daily_outbound_count.return_value = 12  # budget spent
+        s = _attn_settings()
+        bus = MagicMock()
+        with (
+            patch("luke.planner.db", new=db),
+            patch("luke.planner.settings", new=s),
+            patch("luke.bus.bus", new=bus),
+        ):
+            intent = Intent(
+                "dream",
+                0.30,
+                "event",
+                2.0,
+                asks_attention=True,
+                attention_cost=1,
+                attention_urgency=0.2,
+            )
+            _enforce_attention_budget([intent])
+            bus.emit.assert_called_once()
+            kind, payload = bus.emit.call_args[0]
+            assert kind == "intent_dropped_attention"
+            assert payload["kind"] == "dream"
+            assert payload["source"] == "event"
+            assert payload["attention_cost"] == 1
+            assert payload["urgent"] is False
+
+    def test_partial_budget_keeps_some_drops_rest(self) -> None:
+        """With partial budget remaining, fitting intents pass and overflow drops."""
+        db = MagicMock()
+        db.get_daily_outbound_count.return_value = 10  # 2 left of 12
+        s = _attn_settings()
+        bus = MagicMock()
+        with (
+            patch("luke.planner.db", new=db),
+            patch("luke.planner.settings", new=s),
+            patch("luke.bus.bus", new=bus),
+        ):
+            first = Intent(
+                "dream",
+                0.30,
+                "event",
+                2.0,
+                asks_attention=True,
+                attention_cost=1,
+                attention_urgency=0.2,
+            )
+            second = Intent(
+                "dream",
+                0.30,
+                "event",
+                2.0,
+                asks_attention=True,
+                attention_cost=2,  # 1 left after first → would need reserve, not urgent
+                attention_urgency=0.2,
+            )
+            kept = _enforce_attention_budget([first, second])
+            assert len(kept) == 1
+            assert kept[0] is first
+            bus.emit.assert_called_once()

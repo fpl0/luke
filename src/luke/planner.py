@@ -41,6 +41,9 @@ class Intent:
     source: str  # "goal", "event", "time"
     budget_usd: float  # estimated cost
     context: dict[str, Any] = field(default_factory=dict)
+    asks_attention: bool = False  # True if this intent will likely send outbound messages
+    attention_cost: int = 0  # estimated outbound message count
+    attention_urgency: float = 0.0  # 0-1; >=0.7 means urgent (can dip into reserve)
 
 
 # ---------------------------------------------------------------------------
@@ -135,6 +138,9 @@ def _deep_work_intents() -> list[Intent]:
                 source="goal",
                 budget_usd=min(settings.deep_work_max_budget_usd, remaining),
                 context={"daily_remaining_usd": remaining},
+                asks_attention=True,
+                attention_cost=2,
+                attention_urgency=0.5,
             )
         ]
 
@@ -147,6 +153,9 @@ def _deep_work_intents() -> list[Intent]:
                 source="time",
                 budget_usd=min(settings.deep_work_max_budget_usd, remaining),
                 context={"daily_remaining_usd": remaining},
+                asks_attention=True,
+                attention_cost=2,
+                attention_urgency=0.5,
             )
         ]
 
@@ -176,9 +185,29 @@ def _maintenance_intents() -> list[Intent]:
     if elapsed >= interval:
         has_activity = db.count_unconsumed_events("goal_updated", "user_message") >= 1
         if has_activity:
-            intents.append(Intent("proactive_scan", 0.55, "event", cost))
+            intents.append(
+                Intent(
+                    "proactive_scan",
+                    0.55,
+                    "event",
+                    cost,
+                    asks_attention=True,
+                    attention_cost=2,
+                    attention_urgency=0.7,
+                )
+            )
         elif elapsed >= interval * 3:
-            intents.append(Intent("proactive_scan", 0.40, "time", cost))
+            intents.append(
+                Intent(
+                    "proactive_scan",
+                    0.40,
+                    "time",
+                    cost,
+                    asks_attention=True,
+                    attention_cost=2,
+                    attention_urgency=0.7,
+                )
+            )
 
     # --- Reflection (weekly) ---
     interval = effective_interval("reflection", settings.reflection_interval)
@@ -238,9 +267,29 @@ def _maintenance_intents() -> list[Intent]:
     if elapsed >= settings.dream_interval:
         has_material = db.count_unconsumed_events("new_insight", "new_episode") >= 1
         if has_material:
-            intents.append(Intent("dream", 0.30, "event", settings.dream_max_budget_usd))
+            intents.append(
+                Intent(
+                    "dream",
+                    0.30,
+                    "event",
+                    settings.dream_max_budget_usd,
+                    asks_attention=True,
+                    attention_cost=1,
+                    attention_urgency=0.2,
+                )
+            )
         elif elapsed >= settings.dream_interval * 6:
-            intents.append(Intent("dream", 0.20, "time", settings.dream_max_budget_usd))
+            intents.append(
+                Intent(
+                    "dream",
+                    0.20,
+                    "time",
+                    settings.dream_max_budget_usd,
+                    asks_attention=True,
+                    attention_cost=1,
+                    attention_urgency=0.2,
+                )
+            )
 
     return intents
 
@@ -258,12 +307,64 @@ def generate_intents() -> list[Intent]:
     return intents
 
 
+def _enforce_attention_budget(intents: list[Intent]) -> list[Intent]:
+    """Drop attention-asking intents that exceed today's outbound budget.
+
+    Silence is a designed default: when the daily attention budget is spent,
+    intents that would send outbound messages get dropped rather than queued.
+    Urgent intents (urgency >= 0.7) can dip into the reserve, but the deduction
+    still comes from the normal budget so the reserve isn't itself overspent.
+    """
+    chat_id = settings.chat_id
+    if not chat_id:
+        return intents
+    if not any(i.asks_attention for i in intents):
+        return intents
+    sent_today = db.get_daily_outbound_count(chat_id)
+    daily_budget = settings.daily_attention_budget
+    urgent_reserve = settings.attention_urgent_reserve
+    remaining = daily_budget - sent_today
+    kept: list[Intent] = []
+    for intent in intents:
+        if not intent.asks_attention:
+            kept.append(intent)
+            continue
+        is_urgent = intent.attention_urgency >= 0.7
+        cost = max(1, intent.attention_cost)
+        effective_remaining = remaining + (urgent_reserve if is_urgent else 0)
+        if cost <= effective_remaining:
+            kept.append(intent)
+            remaining -= cost  # always deduct from the normal budget
+        else:
+            from .bus import bus
+
+            bus.emit(
+                "intent_dropped_attention",
+                {
+                    "kind": intent.kind,
+                    "source": intent.source,
+                    "attention_cost": cost,
+                    "budget_remaining": remaining,
+                    "urgent": is_urgent,
+                },
+            )
+            log.info(
+                "intent_dropped_attention",
+                kind=intent.kind,
+                cost=cost,
+                remaining=remaining,
+                urgent=is_urgent,
+            )
+    return kept
+
+
 def plan(intents: list[Intent]) -> tuple[list[Intent], Intent | None]:
     """Partition intents into maintenance work and deep work.
 
     Returns (maintenance_intents, deep_work_intent_or_none).
     Both lists are sorted by priority descending.
     """
+    intents = _enforce_attention_budget(intents)
     maintenance = sorted(
         [i for i in intents if i.kind in MAINTENANCE_BEHAVIORS],
         key=lambda i: i.priority,
