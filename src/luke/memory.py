@@ -2235,8 +2235,13 @@ def assign_cluster_online(mem_id: str, embedding: list[float] | None) -> int | N
         _commit(db)
         return label
 
-    except Exception:
-        log.warning("cluster_assignment_failed", mem_id=mem_id)
+    except Exception as e:
+        log.warning(
+            "cluster_assignment_failed",
+            mem_id=mem_id,
+            error=str(e),
+            error_type=type(e).__name__,
+        )
         return None
 
 
