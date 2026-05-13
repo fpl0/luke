@@ -434,3 +434,162 @@ class TestAuditCompression:
         text = "Some compressed text about Luke and goals."
         result = context.audit_compression(compressed_text=text, persist=False)
         assert result["summary_tokens"] > 0
+
+
+# ---------------------------------------------------------------------------
+# Recent outputs injection (L3) — verbatim mirror of own outbound sends
+# ---------------------------------------------------------------------------
+
+
+class TestRecentOutputsBlock:
+    """Tests for _build_recent_outputs_block()."""
+
+    def test_recent_outputs_none_when_no_outputs(self, test_db: Any) -> None:
+        """Returns None when no outbound messages exist for chat."""
+        result = context._build_recent_outputs_block("100", limit=3)
+        assert result is None
+
+    def test_recent_outputs_block_format(self, test_db: Any) -> None:
+        """Builds a properly formatted block when outputs exist."""
+        for i in range(3):
+            test_db.store_message(
+                chat_id="100",
+                sender_name="Luke",
+                content=f"reply-{i}",
+                timestamp=f"2026-05-13T22:0{i}:00",
+            )
+        result = context._build_recent_outputs_block("100", limit=3)
+        assert result is not None
+        assert "<my-recent-outputs>" in result
+        assert "</my-recent-outputs>" in result
+        assert "verbatim, not reconstructed" in result
+        # All three messages should appear, chronological (oldest first)
+        assert "reply-0" in result
+        assert "reply-1" in result
+        assert "reply-2" in result
+        assert result.index("reply-0") < result.index("reply-2")
+        # Timestamp formatted to 19 chars (seconds precision)
+        assert "[2026-05-13T22:00:00]" in result
+
+    def test_recent_outputs_respects_limit(self, test_db: Any) -> None:
+        """Only the last N outbound messages are returned."""
+        for i in range(5):
+            test_db.store_message(
+                chat_id="100",
+                sender_name="Luke",
+                content=f"reply-{i}",
+                timestamp=f"2026-05-13T22:0{i}:00",
+            )
+        result = context._build_recent_outputs_block("100", limit=2)
+        assert result is not None
+        # Last two should be reply-3 and reply-4
+        assert "reply-3" in result
+        assert "reply-4" in result
+        assert "reply-0" not in result
+        assert "reply-1" not in result
+        assert "reply-2" not in result
+
+    def test_recent_outputs_truncates_long_messages(self, test_db: Any) -> None:
+        """Messages over the truncation threshold are clipped with an ellipsis."""
+        long_content = "x" * 2000
+        test_db.store_message(
+            chat_id="100",
+            sender_name="Luke",
+            content=long_content,
+            timestamp="2026-05-13T22:00:00",
+        )
+        result = context._build_recent_outputs_block("100", limit=3)
+        assert result is not None
+        assert "…" in result
+        # Original 2000-char string should not survive intact
+        assert long_content not in result
+
+    def test_recent_outputs_excludes_inbound(self, test_db: Any) -> None:
+        """Only Luke-sent messages are pulled; user messages are filtered out."""
+        test_db.store_message(
+            chat_id="100",
+            sender_name="Filipe",
+            content="user-msg",
+            timestamp="2026-05-13T22:00:00",
+        )
+        test_db.store_message(
+            chat_id="100",
+            sender_name="Luke",
+            content="luke-reply",
+            timestamp="2026-05-13T22:01:00",
+        )
+        result = context._build_recent_outputs_block("100", limit=3)
+        assert result is not None
+        assert "luke-reply" in result
+        assert "user-msg" not in result
+
+    def test_recent_outputs_zero_limit_returns_none(self, test_db: Any) -> None:
+        """A non-positive limit short-circuits to None."""
+        test_db.store_message(
+            chat_id="100",
+            sender_name="Luke",
+            content="reply",
+            timestamp="2026-05-13T22:00:00",
+        )
+        assert context._build_recent_outputs_block("100", limit=0) is None
+
+    def test_recent_outputs_empty_chat_id_returns_none(self, test_db: Any) -> None:
+        """An empty chat_id short-circuits to None."""
+        assert context._build_recent_outputs_block("", limit=3) is None
+
+    def test_build_working_context_includes_recent_outputs(
+        self, tmp_settings: Any, test_db: Any
+    ) -> None:
+        """build_working_context() prepends the recent-outputs block."""
+        tmp_settings.chat_id = "100"
+        tmp_settings.recent_outputs_enabled = True
+        tmp_settings.recent_outputs_limit = 3
+        test_db.store_message(
+            chat_id="100",
+            sender_name="Luke",
+            content="verbatim-output",
+            timestamp="2026-05-13T22:00:00",
+        )
+        conn = db._db()
+        _insert_memory(conn, "goal-test", "goal", "T", "Active", importance=1.5)
+        result = context.build_working_context()
+        assert "<my-recent-outputs>" in result
+        assert "verbatim-output" in result
+        # Recent outputs section appears before working memory header
+        assert result.index("<my-recent-outputs>") < result.index("# Injected Working Memory")
+
+    def test_build_working_context_recent_outputs_disabled(
+        self, tmp_settings: Any, test_db: Any
+    ) -> None:
+        """When the setting is off, no recent-outputs block is emitted."""
+        tmp_settings.chat_id = "100"
+        tmp_settings.recent_outputs_enabled = False
+        test_db.store_message(
+            chat_id="100",
+            sender_name="Luke",
+            content="should-not-appear",
+            timestamp="2026-05-13T22:00:00",
+        )
+        conn = db._db()
+        _insert_memory(conn, "goal-test", "goal", "T", "Active", importance=1.5)
+        result = context.build_working_context()
+        assert "<my-recent-outputs>" not in result
+        assert "should-not-appear" not in result
+
+    def test_build_working_context_recent_outputs_only_no_memories(
+        self, tmp_settings: Any, test_db: Any
+    ) -> None:
+        """Recent outputs survive even when no memories are selected."""
+        tmp_settings.chat_id = "100"
+        tmp_settings.recent_outputs_enabled = True
+        tmp_settings.recent_outputs_limit = 3
+        test_db.store_message(
+            chat_id="100",
+            sender_name="Luke",
+            content="only-output",
+            timestamp="2026-05-13T22:00:00",
+        )
+        # No memories inserted — selection will be empty.
+        result = context.build_working_context()
+        assert "<my-recent-outputs>" in result
+        assert "only-output" in result

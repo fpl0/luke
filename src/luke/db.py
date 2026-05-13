@@ -721,6 +721,25 @@ def get_recent_messages(chat_id: str, limit: int = 50) -> list[dict[str, Any]]:
     return [dict(r) for r in reversed(rows)]
 
 
+def get_recent_outbound_messages(chat_id: str, limit: int = 3) -> list[dict[str, Any]]:
+    """Return Luke's last N outbound messages for a chat, most recent last.
+
+    Used by the context-injection layer (L3) so the agent can read its own
+    recent outputs verbatim, preventing stale-context resends by construction.
+    """
+    rows = (
+        _db()
+        .execute(
+            "SELECT content, ts AS timestamp FROM messages "
+            "WHERE chat_id = ? AND sender = ? "
+            "ORDER BY id DESC LIMIT ?",
+            (chat_id, "Luke", limit),
+        )
+        .fetchall()
+    )
+    return [dict(r) for r in reversed(rows)]
+
+
 # ---------------------------------------------------------------------------
 # Reaction feedback
 # ---------------------------------------------------------------------------

@@ -17,6 +17,7 @@ import structlog
 import yaml
 from structlog.stdlib import BoundLogger
 
+from . import db as _db_module
 from .config import settings
 from .db import _db, ensure_utc
 
@@ -140,6 +141,7 @@ _FALLBACK_CONSTITUTIONAL = (
 _CHARS_PER_TOKEN = 3.5
 _WORKING_MEMORY_BUDGET = 12_000  # tokens
 _MAX_CONTENT_PREVIEW = 400  # chars per memory in injection block
+_RECENT_OUTPUT_MAX_CHARS = 800  # chars per outbound message in recent-outputs block
 
 
 def _estimate_tokens(text: str) -> int:
@@ -281,6 +283,40 @@ def _select_within_budget(
     return selected
 
 
+def _build_recent_outputs_block(chat_id: str, limit: int) -> str | None:
+    """Build the verbatim recent-outputs section.
+
+    Returns the formatted ``<my-recent-outputs>`` block as a string, or
+    ``None`` when no outbound messages exist for the chat. This block is
+    a verbatim mirror of Luke's own recent sends — not a reconstruction —
+    so the agent can spot stale-context resends by construction (feature L3).
+    """
+    if limit <= 0 or not chat_id:
+        return None
+    try:
+        rows = _db_module.get_recent_outbound_messages(chat_id, limit)
+    except Exception as e:
+        log.warning("recent_outputs_load_failed", error=str(e))
+        return None
+    if not rows:
+        return None
+
+    lines: list[str] = [
+        "<my-recent-outputs>",
+        "# What I most recently sent to you — verbatim, not reconstructed",
+        "",
+    ]
+    for r in rows:
+        ts_raw = r.get("timestamp") or ""
+        ts = ts_raw[:19]  # strip microseconds / tz
+        content = (r.get("content") or "").strip()
+        if len(content) > _RECENT_OUTPUT_MAX_CHARS:
+            content = content[:_RECENT_OUTPUT_MAX_CHARS] + "…"
+        lines.append(f"[{ts}] {content}")
+    lines.append("</my-recent-outputs>")
+    return "\n".join(lines)
+
+
 def build_working_context(
     query: str = "",
     budget_tokens: int = _WORKING_MEMORY_BUDGET,
@@ -293,18 +329,26 @@ def build_working_context(
 
     Returns empty string if no memories qualify or DB is unavailable.
     """
+    # Recent outputs (L3) — verbatim mirror of Luke's own recent sends.
+    # Built first so we can prepend it even if memory selection fails.
+    recent_outputs: str | None = None
+    if settings.recent_outputs_enabled:
+        recent_outputs = _build_recent_outputs_block(
+            settings.chat_id, settings.recent_outputs_limit
+        )
+
     try:
         memories = _load_priority_memories(query=query)
     except Exception as e:
         log.warning("context_load_failed", error=str(e))
-        return ""
+        return recent_outputs or ""
 
     if not memories:
-        return ""
+        return recent_outputs or ""
 
     selected = _select_within_budget(memories, budget_tokens)
     if not selected:
-        return ""
+        return recent_outputs or ""
 
     # Separate by type for structured injection
     goals = [m for m in selected if m["type"] == "goal"]
@@ -314,6 +358,10 @@ def build_working_context(
     episodes = [m for m in selected if m["type"] == "episode"]
 
     sections: list[str] = []
+    # Verbatim recent outputs go above the reconstructed working memory so the
+    # agent sees its actual prior sends before any compressed/summarized state.
+    if recent_outputs:
+        sections.append(recent_outputs)
     sections.append("# Injected Working Memory")
 
     if goals:

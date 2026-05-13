@@ -18,6 +18,9 @@ class Settings(BaseSettings):
     max_concurrent: int = 8
     scheduler_interval: float = 60.0
     recall_content_limit: int = 3000
+    # Recent outputs injection (L3) — verbatim mirror of own outbound messages
+    recent_outputs_enabled: bool = True
+    recent_outputs_limit: int = 3
     luke_dir: Path = Path.home() / ".luke"  # user-configurable via LUKE_DIR env var
 
     # Timeouts

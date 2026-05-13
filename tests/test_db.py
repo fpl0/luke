@@ -103,6 +103,46 @@ class TestMessages:
         recent = test_db.get_recent_messages("100", limit=3)
         assert len(recent) == 3
 
+    def test_recent_outbound_messages_filters_by_sender(self, test_db: Any) -> None:
+        """get_recent_outbound_messages returns only Luke-sent messages."""
+        test_db.store_message(
+            chat_id="100", sender_name="Filipe",
+            content="user-1", timestamp="2024-01-01T00:00:00",
+        )
+        test_db.store_message(
+            chat_id="100", sender_name="Luke",
+            content="luke-1", timestamp="2024-01-01T00:01:00",
+        )
+        test_db.store_message(
+            chat_id="100", sender_name="Filipe",
+            content="user-2", timestamp="2024-01-01T00:02:00",
+        )
+        test_db.store_message(
+            chat_id="100", sender_name="Luke",
+            content="luke-2", timestamp="2024-01-01T00:03:00",
+        )
+        result = test_db.get_recent_outbound_messages("100", limit=5)
+        assert [r["content"] for r in result] == ["luke-1", "luke-2"]
+
+    def test_recent_outbound_messages_chronological_order(self, test_db: Any) -> None:
+        """Result is most-recent-last (chronological)."""
+        for i in range(4):
+            test_db.store_message(
+                chat_id="100", sender_name="Luke",
+                content=f"out-{i}", timestamp=f"2024-01-01T00:0{i}:00",
+            )
+        result = test_db.get_recent_outbound_messages("100", limit=3)
+        # Last 3 messages, oldest first
+        assert [r["content"] for r in result] == ["out-1", "out-2", "out-3"]
+
+    def test_recent_outbound_messages_empty(self, test_db: Any) -> None:
+        """Empty list when no Luke messages exist."""
+        test_db.store_message(
+            chat_id="100", sender_name="Filipe",
+            content="hi", timestamp="2024-01-01T00:00:00",
+        )
+        assert test_db.get_recent_outbound_messages("100", limit=3) == []
+
 
 # ---------------------------------------------------------------------------
 # Sessions
