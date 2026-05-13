@@ -287,6 +287,66 @@ class TestRunProactiveScan:
 
 
 # ---------------------------------------------------------------------------
+# run_reflexion
+# ---------------------------------------------------------------------------
+
+
+class TestRunReflexion:
+    async def test_no_chat_id(self) -> None:
+        from luke.behaviors import run_reflexion
+
+        with patch("luke.behaviors.settings") as mock_settings:
+            mock_settings.chat_id = ""
+            await run_reflexion(AsyncMock(), _SEM)
+
+    async def _capture_prompt(self, payload: dict[str, Any]) -> str:
+        from luke.behaviors import run_reflexion
+
+        with (
+            patch("luke.behaviors.db") as mock_db,
+            patch("luke.behaviors.memory") as mock_memory,
+            patch("luke.behaviors.read_memory_body", return_value=""),
+            patch("luke.behaviors._run_behavior", new_callable=AsyncMock) as mock_run_behavior,
+            patch("luke.behaviors.settings") as mock_settings,
+        ):
+            mock_settings.chat_id = "12345"
+            mock_settings.consolidation_model = "sonnet"
+            mock_db.get_recent_quality_scores.return_value = []
+            mock_memory.recall.return_value = []
+            await run_reflexion(
+                AsyncMock(), _SEM, event_kind="quality_low", event_payload=payload
+            )
+
+        mock_run_behavior.assert_called_once()
+        prompt = mock_run_behavior.call_args.args[1]
+        assert isinstance(prompt, str)
+        return prompt
+
+    async def test_prompt_contains_counterfactual_question(self) -> None:
+        prompt = await self._capture_prompt({"goal_id": "g1", "reason": "low quality"})
+        # Counterfactual question must be present with "smallest change" phrasing.
+        assert "Counterfactual" in prompt
+        assert "SMALLEST change" in prompt
+        assert "flipped" in prompt
+
+    async def test_prompt_instructs_counterfactual_tags_and_link(self) -> None:
+        prompt = await self._capture_prompt({"goal_id": "g1", "reason": "low quality"})
+        # Counterfactual save instructions must reference the right tags and link
+        # back to the parent reflexion insight.
+        assert "'counterfactual', 'g1'" in prompt
+        assert "counterfactual-g1-" in prompt
+        assert "reflexion-g1-" in prompt
+        assert "links=" in prompt
+        assert "importance=1.3" in prompt
+
+    async def test_prompt_keeps_existing_reflexion_save(self) -> None:
+        prompt = await self._capture_prompt({"goal_id": "g1", "reason": "low quality"})
+        # The original reflexion-save instruction must still be present.
+        assert "'reflexion', 'g1'" in prompt
+        assert "Root cause" in prompt
+
+
+# ---------------------------------------------------------------------------
 # run_skill_extraction
 # ---------------------------------------------------------------------------
 
