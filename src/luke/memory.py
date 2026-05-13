@@ -1575,8 +1575,13 @@ def apply_correction(
 
     conn.execute("UPDATE memory_fts SET content = ? WHERE id = ?", (new_content, mem_id))
     if packed_embedding is not None and rowid is not None:
+        # vec0 virtual tables don't support INSERT OR REPLACE on the rowid PK —
+        # the upsert path that works is DELETE-then-INSERT (same as index_memory
+        # at line 611-616). REPLACE raises UNIQUE constraint failed because the
+        # virtual table treats the rowid PK separately from the row contents.
+        conn.execute("DELETE FROM memory_vec WHERE rowid = ?", (rowid,))
         conn.execute(
-            "INSERT OR REPLACE INTO memory_vec (rowid, memory_id, embedding) VALUES (?, ?, ?)",
+            "INSERT INTO memory_vec (rowid, memory_id, embedding) VALUES (?, ?, ?)",
             (rowid, mem_id, packed_embedding),
         )
     conn.execute("UPDATE memory_meta SET updated = ? WHERE id = ?", (now, mem_id))
