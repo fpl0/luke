@@ -78,6 +78,39 @@ tail -f ~/.luke/luke.log
 tail -f ~/.luke/luke.err
 ```
 
+## Git Workflow
+
+**Commit message format — Conventional Commits, always.**
+
+```
+<type>: <imperative subject in lowercase>
+
+<optional body — wrap at ~72 cols, explain why, not what>
+```
+
+Allowed types: `feat`, `fix`, `docs`, `test`, `refactor`, `chore`, `perf`, `build`, `ci`, `style`. Use `feat!:` / `fix!:` for breaking changes.
+
+- Subject ≤ 72 chars, imperative mood ("add", "fix", "remove" — not "added"), no trailing period.
+- Body is optional but encouraged for non-trivial changes. Focus on the *why*.
+- One logical change per commit. Squash WIP commits before merging a PR.
+
+**Authorship — sole author only.**
+
+- Author and committer **must** be `Filipe Lima <me@fpl0.io>`. No exceptions.
+- **Never** add `Co-Authored-By: Claude …`, `Co-Authored-By: Paperclip …`, or any agent attribution trailer.
+- **Never** add `🤖 Generated with …` footers.
+- If a tool config injects these by default, strip them before committing.
+
+**Branches.**
+
+- `main` is the only long-lived branch. All other branches are temporary and deleted after merge.
+- Feature branches: `feat/<slug>`, `fix/<slug>`, `chore/<slug>`. Delete locally and remotely once merged.
+
+**PRs.**
+
+- PR title follows the same Conventional Commits format as commits.
+- Squash-merge to keep `main` linear and the convention enforceable.
+
 ## Type Safety
 
 - **mypy strict** — all source and test files pass `mypy --strict` with zero errors
