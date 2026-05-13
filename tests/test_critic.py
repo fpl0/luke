@@ -10,7 +10,12 @@ from typing import Any
 import pytest
 
 from luke import critic
-from luke.critic import CriticVerdict, _parse_verdict, critique_outbound
+from luke.critic import (
+    CriticVerdict,
+    _parse_verdict,
+    check_freshness,
+    critique_outbound,
+)
 
 # ---------------------------------------------------------------------------
 # CriticVerdict dataclass
@@ -189,3 +194,159 @@ class TestCritiqueOutbound:
         v = await critique_outbound("Heads up, your 3pm moved.", {"tool": "send"})
         assert v.decision == "pass"
         assert "timeout" in v.reason
+
+
+# ---------------------------------------------------------------------------
+# check_freshness — stubs SDK query, compares drafts vs user-latest
+# ---------------------------------------------------------------------------
+
+
+def _make_prompt_capturing_query(response_text: str) -> tuple[Any, list[str]]:
+    """Return a fake query and a list that accumulates prompt arguments."""
+    from claude_agent_sdk import AssistantMessage, TextBlock
+
+    captured: list[str] = []
+
+    async def _fake(
+        *,
+        prompt: str | Any,
+        options: Any = None,
+        transport: Any = None,
+    ) -> AsyncIterator[Any]:
+        captured.append(prompt if isinstance(prompt, str) else str(prompt))
+        yield AssistantMessage(
+            content=[TextBlock(text=response_text)],
+            model="haiku",
+        )
+
+    return _fake, captured
+
+
+class TestCheckFreshness:
+    async def test_pass_when_aligned(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(critic, "query", _make_fake_query("DECISION: pass"))
+        user_msgs = [
+            {
+                "sender_name": "Filipe",
+                "content": "what time is the meeting?",
+                "timestamp": "2026-05-13T10:00:00+00:00",
+            }
+        ]
+        v = await check_freshness(
+            "The meeting is at 3pm in Vega room.", user_msgs
+        )
+        assert v.decision == "pass"
+
+    async def test_block_on_retraction(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            critic,
+            "query",
+            _make_fake_query(
+                "DECISION: block draft answers a cancelled question"
+            ),
+        )
+        user_msgs = [
+            {
+                "sender_name": "Filipe",
+                "content": "what time is the meeting?",
+                "timestamp": "2026-05-13T10:00:00+00:00",
+            },
+            {
+                "sender_name": "Filipe",
+                "content": "never mind, found it",
+                "timestamp": "2026-05-13T10:00:30+00:00",
+            },
+        ]
+        v = await check_freshness(
+            "The meeting is at 3pm in Vega room upstairs.", user_msgs
+        )
+        assert v.decision == "block"
+        assert "cancelled" in v.reason
+
+    async def test_revise_on_stale_question(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            critic,
+            "query",
+            _make_fake_query(
+                "DECISION: revise answers earlier question, ignores latest"
+            ),
+        )
+        user_msgs = [
+            {
+                "sender_name": "Filipe",
+                "content": "actually, what about tomorrow?",
+                "timestamp": "2026-05-13T10:01:00+00:00",
+            }
+        ]
+        v = await check_freshness(
+            "Today's meeting is at 3pm in Vega room.", user_msgs
+        )
+        assert v.decision == "revise"
+        assert "earlier" in v.reason
+
+    async def test_network_error_fails_open(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            critic, "query", _make_failing_query(ConnectionError("boom"))
+        )
+        user_msgs = [
+            {
+                "sender_name": "Filipe",
+                "content": "hey",
+                "timestamp": "2026-05-13T10:00:00+00:00",
+            }
+        ]
+        v = await check_freshness("Heads up, your 3pm moved.", user_msgs)
+        assert v.decision == "pass"
+        assert "critic-error" in v.reason
+        assert "ConnectionError" in v.reason
+
+    async def test_timeout_fails_open(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from luke.config import settings
+
+        monkeypatch.setattr(critic, "query", _make_hanging_query())
+        monkeypatch.setattr(settings, "critic_timeout_s", 0.05)
+        user_msgs = [
+            {
+                "sender_name": "Filipe",
+                "content": "hey",
+                "timestamp": "2026-05-13T10:00:00+00:00",
+            }
+        ]
+        v = await check_freshness("Heads up, your 3pm moved.", user_msgs)
+        assert v.decision == "pass"
+        assert "timeout" in v.reason
+
+    async def test_prompt_includes_user_messages(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fake, captured = _make_prompt_capturing_query("DECISION: pass")
+        monkeypatch.setattr(critic, "query", fake)
+        user_msgs = [
+            {
+                "sender_name": "Filipe",
+                "content": "never mind, found it",
+                "timestamp": "2026-05-13T10:00:30+00:00",
+            }
+        ]
+        await check_freshness("The meeting is at 3pm.", user_msgs)
+        assert len(captured) == 1
+        prompt = captured[0]
+        assert "never mind, found it" in prompt
+        assert "The meeting is at 3pm." in prompt
+        assert "Filipe" in prompt
+
+    async def test_empty_user_messages_still_runs(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Defensive: empty list should still issue a query and pass-through.
+        monkeypatch.setattr(critic, "query", _make_fake_query("DECISION: pass"))
+        v = await check_freshness("Anything to talk about?", [])
+        assert v.decision == "pass"

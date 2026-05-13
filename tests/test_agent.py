@@ -1320,6 +1320,342 @@ class TestCriticGate:
         assert emitted == []
 
 
+class TestFreshnessGate:
+    """Test the freshness gate inside _pre_tool_hook (L1).
+
+    The gate fetches the user's latest inbound messages and asks the
+    freshness critic whether the draft is coherent with them. We
+    reproduce the gate as a faithful closure (same pattern as
+    TestCriticGate) so behavior is exercised in isolation from the SDK.
+    """
+
+    @staticmethod
+    def _build_hook(
+        *,
+        autonomous: bool,
+        freshness_enabled: bool,
+        recent_msgs: list[dict[str, Any]],
+        check_fn: Any,
+        window_minutes: int = 15,
+    ) -> tuple[Any, list[dict[str, Any]], list[tuple[str, list[dict[str, Any]]]]]:
+        """Construct a faithful copy of _pre_tool_hook's freshness gate.
+
+        Returns (hook, emitted_events, freshness_calls).
+        """
+        from datetime import UTC, datetime
+
+        from luke.agent import _SEND_TOOLS
+        from luke.config import settings as _s
+
+        send_count: dict[str, int] = {"n": 0}
+        emitted: list[dict[str, Any]] = []
+        fresh_calls: list[tuple[str, list[dict[str, Any]]]] = []
+
+        async def _hook(
+            input_data: dict[str, Any],
+            tool_use_id: str | None,
+            context: Any,
+        ) -> dict[str, Any]:
+            tool_name = input_data["tool_name"]
+            if tool_name in _SEND_TOOLS:
+                send_count["n"] += 1
+                if autonomous:
+                    tool_input = input_data.get("tool_input", {})
+                    msg_text = (
+                        tool_input.get("text", "")
+                        if isinstance(tool_input, dict)
+                        else ""
+                    )
+                    if freshness_enabled and msg_text and len(msg_text) >= 30:
+                        user_msgs = [
+                            r
+                            for r in recent_msgs
+                            if r.get("sender_name") != _s.assistant_name
+                        ][-2:]
+                        if user_msgs:
+                            try:
+                                latest_ts = str(
+                                    user_msgs[-1].get("timestamp", "")
+                                )
+                                latest = datetime.fromisoformat(latest_ts)
+                                if latest.tzinfo is None:
+                                    latest = latest.replace(tzinfo=UTC)
+                                age_minutes = (
+                                    datetime.now(UTC) - latest
+                                ).total_seconds() / 60
+                            except (ValueError, TypeError):
+                                age_minutes = 999.0
+                            if age_minutes <= window_minutes:
+                                fresh_calls.append((msg_text, user_msgs))
+                                verdict = await check_fn(msg_text, user_msgs)
+                                if verdict.decision != "pass":
+                                    emitted.append({
+                                        "event": "freshness_blocked",
+                                        "tool": tool_name,
+                                        "verdict": verdict.decision,
+                                        "reason": verdict.reason,
+                                    })
+                                    return {
+                                        "decision": "block",
+                                        "reason": (
+                                            f"Freshness ({verdict.decision}): "
+                                            f"{verdict.reason}"
+                                        ),
+                                    }
+            return {}
+
+        return _hook, emitted, fresh_calls
+
+    @staticmethod
+    def _verdict_factory(decision: str, reason: str = "") -> Any:
+        from luke.critic import CriticVerdict
+
+        async def _v(
+            text: str, user_msgs: list[dict[str, Any]]
+        ) -> CriticVerdict:
+            return CriticVerdict(decision, reason)
+
+        return _v
+
+    @staticmethod
+    def _fresh_user_msg(content: str, age_seconds: float = 30.0) -> dict[str, Any]:
+        from datetime import UTC, datetime, timedelta
+
+        ts = (datetime.now(UTC) - timedelta(seconds=age_seconds)).isoformat()
+        return {
+            "sender_name": "Filipe",
+            "content": content,
+            "timestamp": ts,
+        }
+
+    @staticmethod
+    def _stale_user_msg(
+        content: str, age_minutes: float = 60.0
+    ) -> dict[str, Any]:
+        from datetime import UTC, datetime, timedelta
+
+        ts = (datetime.now(UTC) - timedelta(minutes=age_minutes)).isoformat()
+        return {
+            "sender_name": "Filipe",
+            "content": content,
+            "timestamp": ts,
+        }
+
+    async def test_calls_freshness_when_window_matches(self) -> None:
+        recent = [self._fresh_user_msg("never mind, found it")]
+        hook, emitted, calls = self._build_hook(
+            autonomous=True,
+            freshness_enabled=True,
+            recent_msgs=recent,
+            check_fn=self._verdict_factory("pass", ""),
+        )
+        result = await hook(
+            {
+                "tool_name": "mcp__luke__send_message",
+                "tool_input": {
+                    "text": (
+                        "The meeting is at 3pm in Vega room upstairs."
+                    ),
+                },
+                "tool_use_id": "tu_f1",
+            },
+            "tu_f1",
+            {},
+        )
+        assert result == {}
+        assert len(calls) == 1
+        assert calls[0][1][0]["content"] == "never mind, found it"
+        assert emitted == []
+
+    async def test_skips_when_no_recent_user_messages(self) -> None:
+        # Last user message is far older than the window.
+        recent = [self._stale_user_msg("hey", age_minutes=120.0)]
+        hook, emitted, calls = self._build_hook(
+            autonomous=True,
+            freshness_enabled=True,
+            recent_msgs=recent,
+            check_fn=self._verdict_factory("block", "would have blocked"),
+        )
+        result = await hook(
+            {
+                "tool_name": "mcp__luke__send_message",
+                "tool_input": {
+                    "text": "Heads up — your 3pm moved to Vega room upstairs.",
+                },
+                "tool_use_id": "tu_f2",
+            },
+            "tu_f2",
+            {},
+        )
+        assert result == {}
+        assert calls == []
+        assert emitted == []
+
+    async def test_skips_when_disabled(self) -> None:
+        recent = [self._fresh_user_msg("never mind")]
+        hook, emitted, calls = self._build_hook(
+            autonomous=True,
+            freshness_enabled=False,
+            recent_msgs=recent,
+            check_fn=self._verdict_factory("block", "would have blocked"),
+        )
+        result = await hook(
+            {
+                "tool_name": "mcp__luke__send_message",
+                "tool_input": {
+                    "text": "Heads up — your 3pm moved to Vega room upstairs.",
+                },
+                "tool_use_id": "tu_f3",
+            },
+            "tu_f3",
+            {},
+        )
+        assert result == {}
+        assert calls == []
+        assert emitted == []
+
+    async def test_skips_for_short_drafts(self) -> None:
+        recent = [self._fresh_user_msg("never mind")]
+        hook, emitted, calls = self._build_hook(
+            autonomous=True,
+            freshness_enabled=True,
+            recent_msgs=recent,
+            check_fn=self._verdict_factory("block", "would have blocked"),
+        )
+        result = await hook(
+            {
+                "tool_name": "mcp__luke__send_message",
+                "tool_input": {"text": "ok cool"},  # < 30 chars
+                "tool_use_id": "tu_f4",
+            },
+            "tu_f4",
+            {},
+        )
+        assert result == {}
+        assert calls == []
+        assert emitted == []
+
+    async def test_skips_when_not_autonomous(self) -> None:
+        recent = [self._fresh_user_msg("never mind")]
+        hook, emitted, calls = self._build_hook(
+            autonomous=False,
+            freshness_enabled=True,
+            recent_msgs=recent,
+            check_fn=self._verdict_factory("block", "would have blocked"),
+        )
+        result = await hook(
+            {
+                "tool_name": "mcp__luke__send_message",
+                "tool_input": {
+                    "text": "Heads up — your 3pm moved to Vega room upstairs.",
+                },
+                "tool_use_id": "tu_f5",
+            },
+            "tu_f5",
+            {},
+        )
+        assert result == {}
+        assert calls == []
+        assert emitted == []
+
+    async def test_blocks_send_on_block_verdict(self) -> None:
+        recent = [self._fresh_user_msg("never mind, found it")]
+        hook, emitted, calls = self._build_hook(
+            autonomous=True,
+            freshness_enabled=True,
+            recent_msgs=recent,
+            check_fn=self._verdict_factory(
+                "block", "answers a cancelled question"
+            ),
+        )
+        result = await hook(
+            {
+                "tool_name": "mcp__luke__send_message",
+                "tool_input": {
+                    "text": "The meeting is at 3pm in Vega room upstairs.",
+                },
+                "tool_use_id": "tu_f6",
+            },
+            "tu_f6",
+            {},
+        )
+        assert result.get("decision") == "block"
+        assert "Freshness (block)" in result.get("reason", "")
+        assert "cancelled" in result.get("reason", "")
+        assert len(emitted) == 1
+        assert emitted[0]["event"] == "freshness_blocked"
+        assert emitted[0]["verdict"] == "block"
+        assert len(calls) == 1
+
+    async def test_blocks_send_on_revise_verdict(self) -> None:
+        recent = [self._fresh_user_msg("actually, what about tomorrow?")]
+        hook, emitted, _calls = self._build_hook(
+            autonomous=True,
+            freshness_enabled=True,
+            recent_msgs=recent,
+            check_fn=self._verdict_factory(
+                "revise", "answers earlier question"
+            ),
+        )
+        result = await hook(
+            {
+                "tool_name": "mcp__luke__send_message",
+                "tool_input": {
+                    "text": "Today's meeting is at 3pm in Vega room upstairs.",
+                },
+                "tool_use_id": "tu_f7",
+            },
+            "tu_f7",
+            {},
+        )
+        assert result.get("decision") == "block"
+        assert "Freshness (revise)" in result.get("reason", "")
+        assert len(emitted) == 1
+        assert emitted[0]["verdict"] == "revise"
+
+    async def test_excludes_luke_messages_from_user_latest(self) -> None:
+        # Even though Luke's message is the most recent, the gate only
+        # considers messages from senders != assistant_name.
+        from luke.config import settings as _s
+
+        recent = [
+            self._fresh_user_msg(
+                "never mind, found it", age_seconds=120.0
+            ),
+            {
+                "sender_name": _s.assistant_name,
+                "content": "got it, standing down",
+                "timestamp": self._fresh_user_msg(
+                    "x", age_seconds=10.0
+                )["timestamp"],
+            },
+        ]
+        hook, _emitted, calls = self._build_hook(
+            autonomous=True,
+            freshness_enabled=True,
+            recent_msgs=recent,
+            check_fn=self._verdict_factory("pass", ""),
+        )
+        await hook(
+            {
+                "tool_name": "mcp__luke__send_message",
+                "tool_input": {
+                    "text": "The meeting is at 3pm in Vega room upstairs.",
+                },
+                "tool_use_id": "tu_f8",
+            },
+            "tu_f8",
+            {},
+        )
+        # Only one call, and the latest is Filipe's message.
+        assert len(calls) == 1
+        user_latest = calls[0][1]
+        assert all(
+            m.get("sender_name") != _s.assistant_name for m in user_latest
+        )
+        assert user_latest[-1]["content"] == "never mind, found it"
+
+
 class TestCleanStreamingText:
     def test_strips_complete_internal_tags(self) -> None:
         from luke.agent import _clean_streaming_text

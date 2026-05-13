@@ -106,6 +106,11 @@ class Settings(BaseSettings):
     critic_max_budget_usd: float = 0.01
     critic_timeout_s: float = 5.0
 
+    # Freshness gate (L1) — abort sends that have gone stale relative to
+    # the user's latest inbound message. Reuses critic infrastructure.
+    freshness_enabled: bool = True
+    freshness_window_minutes: int = 15
+
     # Behavior model routing
     consolidation_model: str = "sonnet"
     reflection_model: str = "sonnet"

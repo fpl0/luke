@@ -1442,6 +1442,62 @@ async def run_agent(
                         ),
                     }
 
+                # --- Freshness gate (autonomous only) — L1 ---
+                # Pre-send structural check: re-read user's latest message
+                # and abort if the draft contradicts or stale-responds to
+                # it. Runs BEFORE the critic so we only spend on drafts
+                # that survived everything else. Fail-open via check_freshness.
+                if (
+                    settings.freshness_enabled
+                    and msg_text
+                    and len(msg_text) >= 30
+                ):
+                    recent_rows = db.get_recent_messages(chat_id, limit=4)
+                    user_msgs = [
+                        r
+                        for r in recent_rows
+                        if r.get("sender_name") != settings.assistant_name
+                    ][-2:]
+                    if user_msgs:
+                        try:
+                            latest_ts = str(user_msgs[-1].get("timestamp", ""))
+                            latest = datetime.fromisoformat(latest_ts)
+                            if latest.tzinfo is None:
+                                latest = latest.replace(tzinfo=UTC)
+                            age_minutes = (
+                                datetime.now(UTC) - latest
+                            ).total_seconds() / 60
+                        except (ValueError, TypeError):
+                            age_minutes = 999.0
+                        if age_minutes <= settings.freshness_window_minutes:
+                            from .critic import check_freshness
+
+                            fresh_verdict = await check_freshness(
+                                msg_text, user_msgs
+                            )
+                            if fresh_verdict.decision != "pass":
+                                log.warning(
+                                    "freshness_blocked",
+                                    chat_id=chat_id,
+                                    tool=tool_name,
+                                    verdict=fresh_verdict.decision,
+                                    reason=fresh_verdict.reason,
+                                    preview=msg_text[:100],
+                                )
+                                bus.emit("freshness_blocked", {
+                                    "tool": tool_name,
+                                    "verdict": fresh_verdict.decision,
+                                    "reason": fresh_verdict.reason,
+                                    "preview": msg_text[:100],
+                                })
+                                return {
+                                    "decision": "block",
+                                    "reason": (
+                                        f"Freshness ({fresh_verdict.decision}): "
+                                        f"{fresh_verdict.reason}"
+                                    ),
+                                }
+
                 # --- Outbound critic (autonomous only) — F4 ---
                 # Last gate: cheap haiku pass for tone/factuality/fit. Runs
                 # AFTER cheap regex/state gates so we only spend on drafts

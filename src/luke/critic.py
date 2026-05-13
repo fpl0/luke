@@ -47,6 +47,28 @@ _CRITIC_USER_TEMPLATE = (
 )
 
 
+_FRESHNESS_SYSTEM_PROMPT = (
+    "You compare an outbound draft from Luke against the user's most "
+    "recent messages. Decide if the draft is coherent with what the "
+    "user just said, or if it would feel stale, contradictory, or like "
+    "a response to an earlier state of the conversation."
+)
+
+
+_FRESHNESS_USER_TEMPLATE = (
+    "User's most recent messages (oldest first):\n"
+    "{user_messages}\n\n"
+    "Draft Luke is about to send:\n"
+    "{draft}\n\n"
+    "Reply with exactly one line:\n"
+    '- "DECISION: pass" if the draft is coherent\n'
+    '- "DECISION: revise <reason>" if it needs adjustment\n'
+    '- "DECISION: block <reason>" if it\'s incompatible (e.g. contradicts '
+    "a retraction or answers a cancelled question)\n\n"
+    "The reason should be under 100 chars."
+)
+
+
 # Permissive parser — case-insensitive, tolerates leading whitespace/quotes.
 _DECISION_RE = re.compile(
     r"DECISION:\s*(pass|revise|block)\b\s*(.*)",
@@ -73,11 +95,11 @@ def _parse_verdict(raw: str) -> CriticVerdict:
     return CriticVerdict(decision, reason)
 
 
-async def _collect_text(prompt: str) -> str:
+async def _collect_text(prompt: str, system_prompt: str = _CRITIC_SYSTEM_PROMPT) -> str:
     """Run the SDK query and concatenate assistant text blocks."""
     options = ClaudeAgentOptions(
         model=settings.critic_model,
-        system_prompt=_CRITIC_SYSTEM_PROMPT,
+        system_prompt=system_prompt,
         max_turns=1,
         max_budget_usd=settings.critic_max_budget_usd,
         permission_mode="bypassPermissions",
@@ -127,5 +149,63 @@ async def critique_outbound(text: str, context: dict[str, Any]) -> CriticVerdict
         decision=verdict.decision,
         reason=verdict.reason,
         tool=context.get("tool"),
+    )
+    return verdict
+
+
+def _format_user_messages(user_latest: list[dict[str, Any]]) -> str:
+    """Render the user's recent messages for the freshness prompt."""
+    if not user_latest:
+        return "(none)"
+    lines: list[str] = []
+    for m in user_latest:
+        sender = str(m.get("sender_name", "user"))
+        ts = str(m.get("timestamp", ""))
+        content = str(m.get("content", "")).strip()
+        # Cap each message preview so a long inbound doesn't blow the prompt.
+        if len(content) > 800:
+            content = content[:800] + "..."
+        if ts:
+            lines.append(f"[{sender} @ {ts}] {content}")
+        else:
+            lines.append(f"[{sender}] {content}")
+    return "\n".join(lines)
+
+
+async def check_freshness(
+    draft: str, user_latest: list[dict[str, Any]]
+) -> CriticVerdict:
+    """Compare a draft outbound against the user's latest inbound messages.
+
+    Returns CriticVerdict where:
+    - "pass": draft is coherent with what the user just said
+    - "revise": draft contradicts or stale-responds to the user
+    - "block": draft is fundamentally incompatible (e.g. answering a
+       question the user already cancelled)
+
+    Fail-open: errors return pass.
+    """
+    prompt = _FRESHNESS_USER_TEMPLATE.format(
+        user_messages=_format_user_messages(user_latest),
+        draft=draft,
+    )
+    try:
+        raw = await asyncio.wait_for(
+            _collect_text(prompt, system_prompt=_FRESHNESS_SYSTEM_PROMPT),
+            timeout=settings.critic_timeout_s,
+        )
+    except TimeoutError:
+        log.warning("freshness_timeout", preview=draft[:80])
+        return CriticVerdict("pass", "critic-error: timeout")
+    except Exception as e:  # fail open on any SDK / network failure
+        log.warning("freshness_error", error=str(e)[:200], preview=draft[:80])
+        return CriticVerdict("pass", f"critic-error: {type(e).__name__}")
+
+    verdict = _parse_verdict(raw)
+    log.info(
+        "freshness_verdict",
+        decision=verdict.decision,
+        reason=verdict.reason,
+        user_msgs=len(user_latest),
     )
     return verdict
