@@ -278,6 +278,16 @@ CREATE TABLE IF NOT EXISTS schema_version (
     version INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS active_attention (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id      TEXT NOT NULL,
+    content      TEXT NOT NULL,
+    origin       TEXT NOT NULL DEFAULT 'user',
+    created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+    related_id   TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_attn_chat ON active_attention(chat_id, created_at DESC);
+
 """
 
 # ---------------------------------------------------------------------------
@@ -479,6 +489,22 @@ _MIGRATIONS: list[tuple[int, str, list[str]]] = [
                 identity_anchor     INTEGER NOT NULL DEFAULT 0
             )""",
             "CREATE INDEX IF NOT EXISTS idx_ca_created ON compression_audit(created DESC)",
+        ],
+    ),
+    (
+        13,
+        "add active_attention table for persistent foreground commitments",
+        [
+            """CREATE TABLE IF NOT EXISTS active_attention (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id      TEXT NOT NULL,
+                content      TEXT NOT NULL,
+                origin       TEXT NOT NULL DEFAULT 'user',
+                created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+                related_id   TEXT
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_attn_chat "
+            "ON active_attention(chat_id, created_at DESC)",
         ],
     ),
 ]

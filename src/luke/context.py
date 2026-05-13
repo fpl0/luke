@@ -17,6 +17,7 @@ import structlog
 import yaml
 from structlog.stdlib import BoundLogger
 
+from . import attention as _attention_module
 from . import db as _db_module
 from .config import settings
 from .db import _db, ensure_utc
@@ -337,18 +338,31 @@ def build_working_context(
             settings.chat_id, settings.recent_outputs_limit
         )
 
+    # Active attention (L2) — persistent foreground commitments.
+    attn_block: str | None = None
+    if settings.chat_id:
+        try:
+            attn_block = _attention_module.build_attention_block(settings.chat_id)
+        except Exception as e:
+            log.warning("attention_load_failed", error=str(e))
+
+    def _prepended(body: str | None) -> str:
+        """Combine recent-outputs + attention with a base body string."""
+        parts = [p for p in (recent_outputs, attn_block, body) if p]
+        return "\n\n".join(parts)
+
     try:
         memories = _load_priority_memories(query=query)
     except Exception as e:
         log.warning("context_load_failed", error=str(e))
-        return recent_outputs or ""
+        return _prepended(None)
 
     if not memories:
-        return recent_outputs or ""
+        return _prepended(None)
 
     selected = _select_within_budget(memories, budget_tokens)
     if not selected:
-        return recent_outputs or ""
+        return _prepended(None)
 
     # Separate by type for structured injection
     goals = [m for m in selected if m["type"] == "goal"]
@@ -362,6 +376,10 @@ def build_working_context(
     # agent sees its actual prior sends before any compressed/summarized state.
     if recent_outputs:
         sections.append(recent_outputs)
+    # Active attention (L2) sits above memory injection so foreground
+    # commitments have visual priority over reconstructed working memory.
+    if attn_block:
+        sections.append(attn_block)
     sections.append("# Injected Working Memory")
 
     if goals:

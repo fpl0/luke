@@ -1005,6 +1005,43 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
         else:
             return _ok(f"Unknown action: {action}. Use: list, approve, reject, modify")
 
+    # --- Active attention (2 tools) ---
+
+    @tool(
+        "pin_attention",
+        "Pin a commitment to active attention so it stays in working context "
+        "across sessions. Use when the user says something matters or asks you "
+        "to track something. Examples: 'track the Fanatics prep', 'watch for "
+        "Naiara's email', 'remember I want to focus on deep work this week'.",
+        {"content": str, "related_id": str},
+        annotations=_OPEN_WORLD,
+    )
+    async def t_pin_attention(args: dict[str, Any]) -> dict[str, Any]:
+        from . import attention
+
+        related = args.get("related_id") or None
+        item_id = attention.pin(
+            chat_id=chat_id,
+            content=args["content"],
+            origin="luke",
+            related_id=related,
+        )
+        return _ok(f"Pinned attention #{item_id}: {args['content']}")
+
+    @tool(
+        "unpin_attention",
+        "Remove an active-attention item by id. Use when a commitment is "
+        "complete, cancelled, or resolved.",
+        {"attention_id": int},
+        annotations=_DESTRUCTIVE,
+    )
+    async def t_unpin_attention(args: dict[str, Any]) -> dict[str, Any]:
+        from . import attention
+
+        removed = attention.unpin(chat_id, int(args["attention_id"]))
+        status = "removed" if removed else "not found"
+        return _ok(f"Attention #{args['attention_id']}: {status}")
+
     # --- Cost (1 tool) ---
 
     @tool(
@@ -1119,6 +1156,8 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
             mem_restore,
             mem_bulk,
             mem_history,
+            t_pin_attention,
+            t_unpin_attention,
             t_cost,
             t_quality,
             t_browse,
@@ -1277,6 +1316,8 @@ _ALL_MCP_TOOL_NAMES: list[str] = [
     "restore",
     "bulk_memory",
     "memory_history",
+    "pin_attention",
+    "unpin_attention",
     "get_cost_report",
     "log_deep_work_quality",
     "browse",

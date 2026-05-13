@@ -593,3 +593,78 @@ class TestRecentOutputsBlock:
         result = context.build_working_context()
         assert "<my-recent-outputs>" in result
         assert "only-output" in result
+
+
+# ---------------------------------------------------------------------------
+# Active attention injection (L2) — persistent foreground commitments
+# ---------------------------------------------------------------------------
+
+
+class TestActiveAttentionInContext:
+    """Tests for active-attention block integration with build_working_context()."""
+
+    def test_attention_block_included_when_items_exist(
+        self, tmp_settings: Any, test_db: Any
+    ) -> None:
+        """Pinned attention items appear in the context block."""
+        from luke import attention
+
+        tmp_settings.chat_id = "100"
+        tmp_settings.recent_outputs_enabled = False
+        attention.pin("100", "track Fanatics prep", origin="luke")
+        conn = db._db()
+        _insert_memory(conn, "goal-test", "goal", "T", "Active", importance=1.5)
+        result = context.build_working_context()
+        assert "<active-attention>" in result
+        assert "track Fanatics prep" in result
+        # Attention block sits above the memory injection header.
+        assert result.index("<active-attention>") < result.index("# Injected Working Memory")
+
+    def test_no_attention_block_when_empty(
+        self, tmp_settings: Any, test_db: Any
+    ) -> None:
+        """No attention block is emitted when no items are pinned."""
+        tmp_settings.chat_id = "100"
+        tmp_settings.recent_outputs_enabled = False
+        conn = db._db()
+        _insert_memory(conn, "goal-test", "goal", "T", "Active", importance=1.5)
+        result = context.build_working_context()
+        assert "<active-attention>" not in result
+
+    def test_attention_survives_when_no_memories(
+        self, tmp_settings: Any, test_db: Any
+    ) -> None:
+        """Attention items appear even when no memories are selected."""
+        from luke import attention
+
+        tmp_settings.chat_id = "100"
+        tmp_settings.recent_outputs_enabled = False
+        attention.pin("100", "watch for Naiara's email")
+        # No memories inserted — only attention should be in output.
+        result = context.build_working_context()
+        assert "<active-attention>" in result
+        assert "watch for Naiara's email" in result
+
+    def test_attention_below_recent_outputs(
+        self, tmp_settings: Any, test_db: Any
+    ) -> None:
+        """Attention block sits between recent-outputs and memory injection."""
+        from luke import attention
+
+        tmp_settings.chat_id = "100"
+        tmp_settings.recent_outputs_enabled = True
+        tmp_settings.recent_outputs_limit = 3
+        test_db.store_message(
+            chat_id="100",
+            sender_name="Luke",
+            content="some-output",
+            timestamp="2026-05-13T22:00:00",
+        )
+        attention.pin("100", "matters")
+        conn = db._db()
+        _insert_memory(conn, "goal-test", "goal", "T", "Active", importance=1.5)
+        result = context.build_working_context()
+        out_pos = result.index("<my-recent-outputs>")
+        attn_pos = result.index("<active-attention>")
+        mem_pos = result.index("# Injected Working Memory")
+        assert out_pos < attn_pos < mem_pos
