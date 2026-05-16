@@ -431,6 +431,16 @@ def _attn_settings(
     return m
 
 
+@pytest.fixture(autouse=True)
+def _reset_drop_log_cache():
+    """Clear per-kind drop-log back-off cache between tests."""
+    from luke.planner import _last_drop_log_ts
+
+    _last_drop_log_ts.clear()
+    yield
+    _last_drop_log_ts.clear()
+
+
 class TestEnforceAttentionBudget:
     def test_drops_when_budget_exhausted(self) -> None:
         """Attention-asking intents are dropped when daily count >= budget."""
@@ -582,3 +592,33 @@ class TestEnforceAttentionBudget:
             assert len(kept) == 1
             assert kept[0] is first
             bus.emit.assert_called_once()
+
+    def test_repeat_drops_same_kind_are_throttled(self) -> None:
+        """Same (kind, urgent) dropped twice within back-off window emits only once.
+
+        Repro of May 14 flood: planner ticks every minute, regenerates intents,
+        and the same kind gets dropped each tick. Back-off cache must suppress
+        the duplicate emission so the bus and log don't get flooded.
+        """
+        db = MagicMock()
+        db.get_daily_outbound_count.return_value = 12  # budget spent
+        s = _attn_settings()
+        bus = MagicMock()
+        with (
+            patch("luke.planner.db", new=db),
+            patch("luke.planner.settings", new=s),
+            patch("luke.bus.bus", new=bus),
+        ):
+            intent = Intent(
+                "dream",
+                0.30,
+                "event",
+                2.0,
+                asks_attention=True,
+                attention_cost=1,
+                attention_urgency=0.2,
+            )
+            _enforce_attention_budget([intent])
+            _enforce_attention_budget([intent])
+            _enforce_attention_budget([intent])
+            assert bus.emit.call_count == 1  # only the first drop emits

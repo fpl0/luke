@@ -14,6 +14,7 @@ The scheduler executes the plan.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
@@ -25,6 +26,16 @@ from . import db
 from .config import settings
 
 log: BoundLogger = structlog.get_logger()
+
+# Per-(kind, urgent) back-off cache for intent_dropped_attention emission.
+# The planner runs every scheduler_interval seconds and regenerates intents
+# fresh each tick. Once the daily attention budget is spent, the same intent
+# kinds get re-dropped on every tick — flooding the bus and log with hundreds
+# of identical events per hour (May 14: 1862 events in 10 hours). This cache
+# rate-limits the emission per (kind, urgent) tuple so we keep the first drop
+# (visibility) and drop the noise (back-off).
+_DROP_LOG_INTERVAL_S: float = 600.0
+_last_drop_log_ts: dict[tuple[str, bool], float] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -128,6 +139,13 @@ def _deep_work_intents() -> list[Intent]:
     if remaining <= 0:
         return []
 
+    # Deep work runs silent by design (max_sends=1, often 0). Its budget is
+    # daily_deep_work_budget_usd, not the outbound attention budget. If an
+    # actual send happens inside the session, the send-time gate enforces
+    # hourly/daily outbound caps. So deep_work itself must not be dropped
+    # by _enforce_attention_budget — otherwise Luke stops working entirely
+    # once the daily message budget is spent (May 14 overnight bug).
+
     # Event-driven: goal_updated events → higher priority
     has_goal_events = db.count_unconsumed_events("goal_updated") >= 1
     if has_goal_events:
@@ -138,9 +156,6 @@ def _deep_work_intents() -> list[Intent]:
                 source="goal",
                 budget_usd=min(settings.deep_work_max_budget_usd, remaining),
                 context={"daily_remaining_usd": remaining},
-                asks_attention=True,
-                attention_cost=2,
-                attention_urgency=0.5,
             )
         ]
 
@@ -153,9 +168,6 @@ def _deep_work_intents() -> list[Intent]:
                 source="time",
                 budget_usd=min(settings.deep_work_max_budget_usd, remaining),
                 context={"daily_remaining_usd": remaining},
-                asks_attention=True,
-                attention_cost=2,
-                attention_urgency=0.5,
             )
         ]
 
@@ -336,6 +348,13 @@ def _enforce_attention_budget(intents: list[Intent]) -> list[Intent]:
             kept.append(intent)
             remaining -= cost  # always deduct from the normal budget
         else:
+            key = (intent.kind, is_urgent)
+            now = time.monotonic()
+            last = _last_drop_log_ts.get(key, 0.0)
+            if now - last < _DROP_LOG_INTERVAL_S:
+                continue  # back-off: same kind dropped recently, suppress noise
+            _last_drop_log_ts[key] = now
+
             from .bus import bus
 
             bus.emit(
@@ -346,6 +365,7 @@ def _enforce_attention_budget(intents: list[Intent]) -> list[Intent]:
                     "attention_cost": cost,
                     "budget_remaining": remaining,
                     "urgent": is_urgent,
+                    "backoff_window_s": _DROP_LOG_INTERVAL_S,
                 },
             )
             log.info(
@@ -354,6 +374,7 @@ def _enforce_attention_budget(intents: list[Intent]) -> list[Intent]:
                 cost=cost,
                 remaining=remaining,
                 urgent=is_urgent,
+                backoff_window_s=_DROP_LOG_INTERVAL_S,
             )
     return kept
 

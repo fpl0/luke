@@ -442,12 +442,14 @@ class TestRunDeepWork:
             patch("luke.behaviors.db") as mock_db,
             patch("luke.behaviors.bus"),
             patch("luke.behaviors.memory") as mock_memory,
+            patch("luke.behaviors.attention") as mock_attention,
             patch("luke.behaviors.settings") as mock_settings,
         ):
             mock_settings.chat_id = "12345"
             mock_settings.daily_deep_work_budget_usd = 60.0
             mock_db.get_daily_deep_work_cost.return_value = 0.0
             mock_memory.recall.return_value = []
+            mock_attention.list_attention.return_value = []
             await run_deep_work(AsyncMock(), _SEM)
 
     async def test_with_goals(self, tmp_settings: Any) -> None:
@@ -514,6 +516,7 @@ class TestRunDeepWork:
             patch("luke.behaviors.db") as mock_db,
             patch("luke.behaviors.bus"),
             patch("luke.behaviors.memory") as mock_memory,
+            patch("luke.behaviors.attention") as mock_attention,
             patch("luke.behaviors.read_memory_body", return_value=""),
             patch("luke.behaviors.settings") as mock_settings,
             patch("luke.behaviors.run_agent", new_callable=AsyncMock) as mock_agent,
@@ -528,6 +531,7 @@ class TestRunDeepWork:
             mock_memory.recall.return_value = [
                 {"id": "g1", "type": "goal", "title": "G1", "score": 1.0}
             ]
+            mock_attention.list_attention.return_value = []
             await run_deep_work(AsyncMock(), _SEM)
 
         mock_agent.assert_not_called()

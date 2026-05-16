@@ -388,7 +388,10 @@ def get_consolidation_candidates(min_shared: int = 3) -> list[list[dict[str, Any
         {
             "id": r["id"],
             "tags": set(json.loads(r["tags_json"])),
-            "links": set(json.loads(r["links_json"])),
+            "links": {
+                link["id"] if isinstance(link, dict) else link
+                for link in json.loads(r["links_json"])
+            },
             "created": r["created"],
             "updated": r["updated"],
         }
@@ -1710,7 +1713,7 @@ def detect_corrections(
         original_content = row["content"]
         semantic_sim = _compute_semantic_similarity(original_content, agent_response)
 
-        if semantic_sim > 0.5:
+        if semantic_sim > 0.5 and has_explicit_signal:
             confidence = compute_correction_confidence(
                 explicit_language=has_explicit_signal,
                 source="agent_inferred",

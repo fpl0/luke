@@ -1075,6 +1075,236 @@ class TestRecallBeforeReference:
         assert emitted == []
 
 
+class TestOvernightCommitmentGate:
+    """Test the overnight-commitment gate inside _pre_tool_hook.
+
+    Blocks outbound sends that commit to future delivery ("overnight",
+    "by morning", etc.) when no agent or scheduled task has been spawned
+    in the same turn. Runs for both autonomous and interactive runs.
+    """
+
+    # ----- _commits_future_work helper -----
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "Got it. Sleep — I've got it. I'll have both docs before 8am.",
+            "Perfect. I'll deliver the refined prep doc overnight. Sleep.",
+            "I'll have the analysis ready by morning — sleep well.",
+            "Got you covered. The script will be ready tomorrow morning.",
+            "Consider it done before you wake. I'll ship both files overnight.",
+            "Working on it tonight — I'll send the refactored module first thing.",
+        ],
+    )
+    def test_commits_future_work_matches_commitment(self, text: str) -> None:
+        from luke.agent import _commits_future_work
+
+        assert _commits_future_work(text) is True
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "Heads up — your 3pm meeting room just changed to Vega upstairs.",
+            "The earnings release happens tomorrow morning, fyi.",
+            "Overnight oats are good but I prefer toast.",
+            "By morning the freeze ends — non-critical merges resume.",
+            "I'll have a look at this later when I can.",  # no time anchor
+        ],
+    )
+    def test_commits_future_work_false_for_non_commitments(self, text: str) -> None:
+        from luke.agent import _commits_future_work
+
+        assert _commits_future_work(text) is False
+
+    def test_commits_future_work_false_for_short_text(self) -> None:
+        from luke.agent import _commits_future_work
+
+        # "got it overnight" is too short to count
+        assert _commits_future_work("got it overnight") is False
+
+    def test_commits_future_work_false_for_empty(self) -> None:
+        from luke.agent import _commits_future_work
+
+        assert _commits_future_work("") is False
+
+    # ----- _pre_tool_hook commitment gate -----
+
+    @staticmethod
+    def _build_hook() -> tuple[
+        Any, dict[str, int], dict[str, int], list[dict[str, Any]]
+    ]:
+        """Reproduce _pre_tool_hook's commitment-gate slice.
+
+        Returns (hook, send_count, work_scheduled_count, emitted_events).
+        """
+        from luke.agent import (
+            _AGENT_SCHEDULE_TOOLS,
+            _SEND_TOOLS,
+            _commits_future_work,
+        )
+
+        send_count: dict[str, int] = {"n": 0}
+        work_scheduled_count: dict[str, int] = {"n": 0}
+        emitted: list[dict[str, Any]] = []
+
+        async def _hook(
+            input_data: dict[str, Any],
+            tool_use_id: str | None,
+            context: Any,
+        ) -> dict[str, Any]:
+            tool_name = input_data["tool_name"]
+            if tool_name in _AGENT_SCHEDULE_TOOLS:
+                work_scheduled_count["n"] += 1
+            if tool_name in _SEND_TOOLS:
+                send_count["n"] += 1
+                tool_input = input_data.get("tool_input", {})
+                if isinstance(tool_input, dict):
+                    msg_text = tool_input.get("text", "") or tool_input.get(
+                        "caption", ""
+                    )
+                else:
+                    msg_text = ""
+                if (
+                    work_scheduled_count["n"] == 0
+                    and _commits_future_work(msg_text)
+                ):
+                    emitted.append({
+                        "event": "commitment_blocked_no_execution",
+                        "tool": tool_name,
+                        "preview": msg_text[:100],
+                    })
+                    return {
+                        "decision": "block",
+                        "reason": (
+                            "Commitment to future delivery detected but no "
+                            "agent or scheduled task was spawned this turn."
+                        ),
+                    }
+            return {}
+
+        return _hook, send_count, work_scheduled_count, emitted
+
+    async def test_blocks_send_with_overnight_commitment_and_no_spawn(self) -> None:
+        hook, _send, _work, emitted = self._build_hook()
+        result = await hook(
+            {
+                "tool_name": "mcp__luke__send_message",
+                "tool_input": {
+                    "text": (
+                        "Got it. Sleep — I've got it. I'll have both docs "
+                        "refined and ready before 8am."
+                    ),
+                },
+                "tool_use_id": "tu_a",
+            },
+            "tu_a",
+            {},
+        )
+        assert result.get("decision") == "block"
+        assert "commitment" in result.get("reason", "").lower()
+        assert len(emitted) == 1
+        assert emitted[0]["event"] == "commitment_blocked_no_execution"
+
+    async def test_passes_send_when_task_was_spawned_first(self) -> None:
+        hook, _send, work, emitted = self._build_hook()
+        # Simulate an agent spawn earlier in the turn.
+        await hook(
+            {
+                "tool_name": "Task",
+                "tool_input": {"description": "refine prep doc"},
+                "tool_use_id": "tu_t",
+            },
+            "tu_t",
+            {},
+        )
+        assert work["n"] == 1
+
+        result = await hook(
+            {
+                "tool_name": "mcp__luke__send_message",
+                "tool_input": {
+                    "text": (
+                        "Got it. Sleep — I've got it. I'll have both docs "
+                        "refined and ready before 8am."
+                    ),
+                },
+                "tool_use_id": "tu_s",
+            },
+            "tu_s",
+            {},
+        )
+        assert result == {}
+        assert emitted == []
+
+    async def test_passes_send_when_schedule_task_was_called_first(self) -> None:
+        hook, _send, work, emitted = self._build_hook()
+        await hook(
+            {
+                "tool_name": "mcp__luke__schedule_task",
+                "tool_input": {
+                    "prompt": "deliver refined prep doc",
+                    "schedule_type": "once",
+                    "schedule_value": "2026-05-14T07:30:00+00:00",
+                },
+                "tool_use_id": "tu_sched",
+            },
+            "tu_sched",
+            {},
+        )
+        assert work["n"] == 1
+
+        result = await hook(
+            {
+                "tool_name": "mcp__luke__send_message",
+                "tool_input": {
+                    "text": "I'll have the refined doc ready by morning. Sleep.",
+                },
+                "tool_use_id": "tu_s2",
+            },
+            "tu_s2",
+            {},
+        )
+        assert result == {}
+        assert emitted == []
+
+    async def test_passes_send_with_no_commitment_language(self) -> None:
+        hook, _send, _work, emitted = self._build_hook()
+        result = await hook(
+            {
+                "tool_name": "mcp__luke__send_message",
+                "tool_input": {
+                    "text": "Heads up — your 3pm meeting moved to Vega room.",
+                },
+                "tool_use_id": "tu_c",
+            },
+            "tu_c",
+            {},
+        )
+        assert result == {}
+        assert emitted == []
+
+    async def test_caption_also_checked_for_send_document(self) -> None:
+        """send_document carries text in 'caption', not 'text' — must still gate."""
+        hook, _send, _work, emitted = self._build_hook()
+        result = await hook(
+            {
+                "tool_name": "mcp__luke__send_document",
+                "tool_input": {
+                    "path": "/tmp/foo.md",
+                    "caption": (
+                        "Here's the outline. I'll have the full doc ready "
+                        "before 8am — sleep well."
+                    ),
+                },
+                "tool_use_id": "tu_doc",
+            },
+            "tu_doc",
+            {},
+        )
+        assert result.get("decision") == "block"
+        assert len(emitted) == 1
+
+
 class TestCriticGate:
     """Test the critic-agent gate inside _pre_tool_hook (F4).
 

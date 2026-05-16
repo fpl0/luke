@@ -11,7 +11,7 @@ import structlog
 from aiogram import Bot
 from structlog.stdlib import BoundLogger
 
-from . import db, memory
+from . import attention, db, memory
 from .agent import AgentResult, run_agent
 from .bus import bus
 from .config import settings
@@ -520,6 +520,65 @@ def _parse_plan_status(goal_id: str) -> str | None:
         return None
 
 
+async def _run_attention_deep_work(
+    bot: Bot, sem: asyncio.Semaphore, *, reason: str
+) -> bool:
+    """Fallback deep work when no goals are eligible: drive from active-attention pins.
+
+    Returns True if a session was actually launched. When active-attention is
+    empty, returns False so the caller can emit the original deep_work_skipped
+    event. Follows proc-all-goals-filtered-work-selection.
+    """
+    chat_id = settings.chat_id
+    if not chat_id:
+        return False
+    pins = attention.list_attention(chat_id)
+    if not pins:
+        return False
+
+    daily_cost = db.get_daily_deep_work_cost()
+    remaining = settings.daily_deep_work_budget_usd - daily_cost
+    now_str = datetime.now(UTC).isoformat(timespec="minutes")
+    pin_lines = [f"[#{p['id']}, {p.get('origin', 'luke')}] {p['content']}" for p in pins]
+
+    prompt = (
+        f"Deep work session — no active goals ({reason}). "
+        f"Current time: {now_str}. Daily budget remaining: ${remaining:.2f}.\n\n"
+        "Active-attention pins (these are the things Filipe said matter):\n"
+        + "\n".join(pin_lines)
+        + "\n\n"
+        "Select ONE pin and do real work against it. Prefer concrete artifacts "
+        "(findings, fixes, prep docs) over meta-work (entity cleanup, cron "
+        "audits). If a pin is genuinely actionable without user input, execute "
+        "fully; if all pins are blocked on Filipe, save an episode noting why "
+        "and stop.\n\n"
+        "Quality check before wrap-up:\n"
+        "- Did you produce a tangible result, or just analysis?\n"
+        "- Rate this session 1-5 and call log_deep_work_quality(\"attention-\" "
+        "+ pin-id, rating).\n"
+        "- Save a summary episode of what shipped.\n\n"
+        "You may send at most ONE message to the user per session — only if "
+        "truly blocked.\n"
+    )
+
+    bus.emit("deep_work_attention_fallback", {"reason": reason, "pins": len(pins)})
+    log.info("deep_work_attention_fallback", reason=reason, pins=len(pins))
+
+    await _run_behavior(
+        "deep_work",
+        prompt,
+        bot,
+        sem,
+        model=settings.deep_work_model,
+        max_turns=settings.deep_work_max_turns,
+        max_budget_usd=settings.deep_work_max_budget_usd,
+        max_sends=1,
+        attention_pins=len(pins),
+        fallback_reason=reason,
+    )
+    return True
+
+
 async def run_deep_work(bot: Bot, sem: asyncio.Semaphore) -> None:
     """Autonomous goal loop: sustained multi-step work on active goals."""
     if not settings.chat_id:
@@ -534,6 +593,8 @@ async def run_deep_work(bot: Bot, sem: asyncio.Semaphore) -> None:
 
     goals = memory.recall(mem_type="goal", limit=10)
     if not goals:
+        if await _run_attention_deep_work(bot, sem, reason="no_goals"):
+            return
         bus.emit("deep_work_skipped", {"reason": "no_goals"})
         return
 
@@ -569,6 +630,8 @@ async def run_deep_work(bot: Bot, sem: asyncio.Semaphore) -> None:
         log.info("deep_work_goals_skipped", skipped=skipped_goals)
 
     if not goal_sections:
+        if await _run_attention_deep_work(bot, sem, reason="all_goals_filtered"):
+            return
         bus.emit("deep_work_skipped", {"reason": "all_goals_filtered"})
         return
 

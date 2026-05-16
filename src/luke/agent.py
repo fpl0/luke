@@ -76,6 +76,32 @@ _FILLER_PATTERNS = re.compile(
     r"let me know if you need anything else|here are the pros and cons)$",
 )
 
+# --- Overnight-commitment gate patterns ---
+# Triggers when an outbound message commits to future delivery (time anchor
+# + commitment verb) AND no agent/schedule_task has been spawned in this turn.
+# See: insight-overnight-commitment-no-execution-pattern, luke-code-change-backlog.
+_COMMITMENT_TIME_ANCHORS = re.compile(
+    r"(?i)\b("
+    r"overnight|"
+    r"tonight|"
+    r"by (?:morning|breakfast|the morning|tomorrow morning|6\s*am|7\s*am|8\s*am|9\s*am)|"
+    r"before (?:morning|breakfast|you wake|sleep|8\s*am|7\s*am|9\s*am|6\s*am)|"
+    r"while you sleep|"
+    r"first thing(?: tomorrow)?|"
+    r"tomorrow morning|"
+    r"in the morning|"
+    r"by sunrise"
+    r")\b"
+)
+_COMMITMENT_VERBS = re.compile(
+    r"(?i)\b("
+    r"i'?ll have|you'?ll have|i'?ve got (?:it|this|you)|got it|got you(?: covered)?|"
+    r"i'?ll ship|i'?ll deliver|i'?ll build|i'?ll send|i'?ll finish|"
+    r"i'?ll get (?:it|this) done|i can have (?:it|this)|"
+    r"will be ready|will deliver|consider it done"
+    r")\b"
+)
+
 
 def _check_outbound_quality(text: str) -> str | None:
     """Check an outbound message against quality rules. Returns rejection reason or None."""
@@ -253,6 +279,26 @@ _TEMPORAL_PHRASES: tuple[str, ...] = (
 )
 
 
+def _commits_future_work(text: str) -> bool:
+    """Heuristic: does the draft commit to delivering work by a future time?
+
+    Detects co-occurrence of a time anchor ('overnight', 'by morning', etc.)
+    with a commitment verb ("I'll have", 'got it', etc.). Used by the
+    overnight-commitment gate to require that an agent has been spawned
+    or a task scheduled in the same turn before such a message can be sent.
+
+    Conservative by design: both anchors must be present; short texts
+    (< 20 chars) are skipped to avoid catching trivial acknowledgments.
+
+    Reference: insight-overnight-commitment-no-execution-pattern.
+    """
+    if not text or len(text) < 20:
+        return False
+    return bool(_COMMITMENT_TIME_ANCHORS.search(text)) and bool(
+        _COMMITMENT_VERBS.search(text)
+    )
+
+
 def _references_past_events(text: str) -> bool:
     """Heuristic: does the draft reference a past event Luke should recall first?
 
@@ -276,6 +322,15 @@ _RECALL_TOOLS: frozenset[str] = frozenset(
     {
         "mcp__luke__recall",
         "mcp__luke__recall_conversation",
+    }
+)
+
+# Tools that count as "work scheduled" for the overnight-commitment gate.
+# Task = Claude Code sub-agent spawn; schedule_task = cron/interval/once job.
+_AGENT_SCHEDULE_TOOLS: frozenset[str] = frozenset(
+    {
+        "Task",
+        "mcp__luke__schedule_task",
     }
 )
 
@@ -692,8 +747,53 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
 
         is_update = path.exists() and mem_type == "entity"
 
-        tags: list[str] = args.get("tags", [])
-        links: list[str] = args.get("links", [])
+        # Defensive coercion: agents sometimes pass tags/links as dicts or
+        # lists-of-dicts. The downstream sqlite bind will fail with
+        # "type 'dict' is not supported", so normalize to list[str] here and
+        # log a warning when we drop non-string entries (or unwrap a dict).
+        def _coerce_str_list(raw: Any, field_name: str) -> list[str]:
+            if raw is None:
+                return []
+            if isinstance(raw, dict):
+                log.warning(
+                    "remember_arg_coerced",
+                    field=field_name,
+                    received_type="dict",
+                    fix="taking keys",
+                    mem_id=mem_id,
+                )
+                raw = list(raw.keys())
+            if not isinstance(raw, list):
+                log.warning(
+                    "remember_arg_coerced",
+                    field=field_name,
+                    received_type=type(raw).__name__,
+                    fix="wrapped",
+                    mem_id=mem_id,
+                )
+                raw = [raw]
+            cleaned: list[str] = []
+            for item in raw:
+                if isinstance(item, str):
+                    cleaned.append(item)
+                elif isinstance(item, dict):
+                    # Common agent mistake: [{"name": "tag1"}, ...]
+                    val = item.get("id") or item.get("name") or item.get("value")
+                    if isinstance(val, str):
+                        cleaned.append(val)
+                        continue
+                    log.warning(
+                        "remember_arg_dropped_item",
+                        field=field_name,
+                        item_type="dict",
+                        mem_id=mem_id,
+                    )
+                else:
+                    cleaned.append(str(item))
+            return cleaned
+
+        tags: list[str] = _coerce_str_list(args.get("tags", []), "tags")
+        links: list[str] = _coerce_str_list(args.get("links", []), "links")
         raw_imp = args.get("importance")
         imp: float | None = max(0.1, min(2.0, float(raw_imp))) if raw_imp is not None else None
         existing_skill_meta = memory.get_skill_meta(mem_id) if mem_type == "procedure" else None
@@ -1398,6 +1498,7 @@ async def run_agent(
     # Per-run counters and timing state (closed over by hooks)
     send_count = {"n": 0}
     recall_count = {"n": 0}  # incremented when recall/recall_conversation runs
+    work_scheduled_count = {"n": 0}  # incremented when Task/schedule_task runs
     tool_count: dict[str, int] = {"n": 0}
     tool_start_times: dict[str, float] = {}  # tool_use_id -> monotonic start
     subagent_start_times: dict[str, float] = {}  # agent_id -> monotonic start
@@ -1418,10 +1519,48 @@ async def run_agent(
         # Track recall calls to gate references-to-past-events in send tools.
         if tool_name in _RECALL_TOOLS:
             recall_count["n"] += 1
+        # Track agent/schedule spawns for the overnight-commitment gate.
+        if tool_name in _AGENT_SCHEDULE_TOOLS:
+            work_scheduled_count["n"] += 1
         if tool_name in _SEND_TOOLS:
             send_count["n"] += 1
             if send_count["n"] > effective_max_sends:
                 return {"decision": "block", "reason": "Rate limit: too many outbound messages"}
+
+            # --- Overnight-commitment gate (all runs) ---
+            # Block sends that commit to future delivery when no agent/
+            # schedule_task has been spawned this turn. Without this, the
+            # commitment exists only as text and no execution path runs
+            # (the May 14 2026 overnight-prep failure).
+            tool_input = input_data.get("tool_input", {})
+            if isinstance(tool_input, dict):
+                msg_text = tool_input.get("text", "") or tool_input.get("caption", "")
+            else:
+                msg_text = ""
+            if (
+                work_scheduled_count["n"] == 0
+                and _commits_future_work(msg_text)
+            ):
+                log.warning(
+                    "commitment_blocked_no_execution",
+                    chat_id=chat_id,
+                    tool=tool_name,
+                    preview=msg_text[:100],
+                )
+                bus.emit("commitment_blocked_no_execution", {
+                    "tool": tool_name,
+                    "preview": msg_text[:100],
+                })
+                return {
+                    "decision": "block",
+                    "reason": (
+                        "Commitment to future delivery detected but no "
+                        "agent or scheduled task was spawned this turn. "
+                        "Either spawn the work via Task / schedule_task "
+                        "before sending, or rephrase the message to "
+                        "remove the commitment."
+                    ),
+                }
             # Global hourly attention budget for autonomous runs (behaviors + crons).
             # Urgent behaviors (e.g. proactive_scan) can draw from a small reserve
             # beyond the normal cap so they can still reach the user when the normal
@@ -1516,6 +1655,12 @@ async def run_agent(
                             fresh_verdict = await check_freshness(
                                 msg_text, user_msgs
                             )
+                            bus.emit("freshness_ran", {
+                                "tool": tool_name,
+                                "decision": fresh_verdict.decision,
+                                "reason": fresh_verdict.reason,
+                                "age_minutes": round(age_minutes, 1),
+                            })
                             if fresh_verdict.decision != "pass":
                                 log.warning(
                                     "freshness_blocked",
@@ -1550,6 +1695,12 @@ async def run_agent(
                     verdict = await critique_outbound(
                         msg_text, {"tool": tool_name}
                     )
+                    bus.emit("critic_ran", {
+                        "tool": tool_name,
+                        "decision": verdict.decision,
+                        "reason": verdict.reason,
+                        "msg_len": len(msg_text),
+                    })
                     if verdict.decision != "pass":
                         log.warning(
                             "critic_blocked",
