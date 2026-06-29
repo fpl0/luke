@@ -330,6 +330,45 @@ async def run_reflexion(
     goal_id = payload.get("goal_id", "unknown")
     reason = payload.get("reason", "")
 
+    # --- Two circuit-breakers before any expensive analysis ---
+    # (insight-reflexion-loop-structural-failure: "the smallest change").
+    # The reflexion loop's recurring failure was firing a sonnet analysis for
+    # events it could not act on — empty payloads (nothing to analyze) and
+    # already-saturated failure modes (the same lesson re-saved N times). Both
+    # are caught deterministically here, BEFORE spawning the behavior.
+    has_goal = goal_id and goal_id != "unknown"
+    if reason:
+        sig = f"{event_kind}:{reason}"
+    elif has_goal:
+        sig = f"{event_kind}:{goal_id}"
+    else:
+        sig = event_kind
+
+    # Gate 1 — payload completeness. An event with no goal_id AND no reason
+    # (e.g. `continuation_failure {}`) carries zero diagnostic signal. This is
+    # an instrumentation bug upstream, not a behavioral failure to analyze.
+    # File it ONCE per event_kind, then suppress — there is nothing to analyze.
+    if not has_goal and not reason:
+        already = db.count_events_matching("reflexion_empty_payload", event_kind)
+        if already == 0:
+            bus.emit("reflexion_empty_payload", {"event_kind": event_kind})
+            log.warning("reflexion.empty_payload", event_kind=event_kind)
+        return
+
+    # Gate 2 — saturation. If this exact failure signature has already triggered
+    # reflexion 3+ times in the recent window, stop re-analyzing it. Escalate
+    # once (a single marker event, not a per-occurrence message), then return.
+    prior_fires = db.count_events_matching("reflexion_fired", sig)
+    if prior_fires >= 3:
+        saturated_already = db.count_events_matching("reflexion_saturated", sig)
+        if saturated_already == 0:
+            bus.emit("reflexion_saturated", {"signature": sig, "fires": prior_fires})
+            log.warning("reflexion.saturated", signature=sig, fires=prior_fires)
+        return
+
+    # Record this fire so the saturation counter can converge.
+    bus.emit("reflexion_fired", {"signature": sig, "event_kind": event_kind})
+
     # Gather context about the failure
     context_sections: list[str] = []
 

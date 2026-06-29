@@ -1181,6 +1181,30 @@ def count_unconsumed_events(*event_types: str, since: str | None = None) -> int:
     return int(row["cnt"]) if row else 0
 
 
+def count_events_matching(
+    event_type: str, payload_like: str | None = None, *, since: str | None = None
+) -> int:
+    """Count events of a type whose payload matches a substring, regardless of
+    consumed status, optionally since a timestamp.
+
+    Used by the reflexion saturation circuit-breaker: counts how many times the
+    same failure signature has already triggered analysis in the recent window.
+    Because :func:`cleanup_events` trims the events table (~7-28d), this is a
+    rolling-window count by design — a failure mode that returns months later
+    re-opens analysis instead of being permanently suppressed.
+    """
+    params: list[Any] = [event_type]
+    where = "event_type = ?"
+    if payload_like:
+        where += " AND payload LIKE ?"
+        params.append(f"%{payload_like}%")
+    if since:
+        where += " AND created > ?"
+        params.append(since)
+    row = _db().execute(f"SELECT COUNT(*) AS cnt FROM events WHERE {where}", params).fetchone()
+    return int(row["cnt"]) if row else 0
+
+
 def consume_events(*event_types: str, since: str | None = None) -> int:
     """Mark events as consumed. Returns count consumed."""
     if not event_types:

@@ -308,3 +308,46 @@ class TestFeedbackNegativeEventEmission:
             timestamp="2026-03-31T21:00:00",
         )
         assert test_db.count_unconsumed_events("feedback_negative") == 0
+
+
+class TestCountEventsMatching:
+    """Deterministic core of the reflexion saturation circuit-breaker
+    (insight-reflexion-loop-structural-failure)."""
+
+    def test_counts_by_type_only(self, test_db: Any) -> None:
+        test_db.emit_event("reflexion_fired", '{"signature": "a"}')
+        test_db.emit_event("reflexion_fired", '{"signature": "b"}')
+        test_db.emit_event("other", '{"signature": "a"}')
+        assert test_db.count_events_matching("reflexion_fired") == 2
+
+    def test_counts_by_payload_substring(self, test_db: Any) -> None:
+        skipped = '{"signature": "deep_work_skipped:all_goals_filtered"}'
+        cont = '{"signature": "continuation_failure:goal-x"}'
+        test_db.emit_event("reflexion_fired", skipped)
+        test_db.emit_event("reflexion_fired", skipped)
+        test_db.emit_event("reflexion_fired", cont)
+        assert test_db.count_events_matching(
+            "reflexion_fired", "deep_work_skipped:all_goals_filtered"
+        ) == 2
+        assert test_db.count_events_matching(
+            "reflexion_fired", "continuation_failure:goal-x"
+        ) == 1
+
+    def test_counts_consumed_too(self, test_db: Any) -> None:
+        # saturation must count regardless of consumed status (unlike count_unconsumed)
+        test_db.emit_event("reflexion_fired", '{"signature": "s"}')
+        test_db.emit_event("reflexion_fired", '{"signature": "s"}')
+        test_db.consume_events("reflexion_fired")
+        assert test_db.count_events_matching("reflexion_fired", "s") == 2
+
+    def test_no_match_returns_zero(self, test_db: Any) -> None:
+        test_db.emit_event("reflexion_fired", '{"signature": "s"}')
+        assert test_db.count_events_matching("reflexion_fired", "absent") == 0
+
+    def test_saturation_threshold_logic(self, test_db: Any) -> None:
+        # 3 fires of the same signature => saturated; a different sig is independent
+        sig = "deep_work_skipped:all_goals_filtered"
+        for _ in range(3):
+            test_db.emit_event("reflexion_fired", f'{{"signature": "{sig}"}}')
+        assert test_db.count_events_matching("reflexion_fired", sig) >= 3
+        assert test_db.count_events_matching("reflexion_fired", "other:sig") == 0

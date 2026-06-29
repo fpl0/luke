@@ -304,6 +304,7 @@ class TestRunReflexion:
 
         with (
             patch("luke.behaviors.db") as mock_db,
+            patch("luke.behaviors.bus"),
             patch("luke.behaviors.memory") as mock_memory,
             patch("luke.behaviors.read_memory_body", return_value=""),
             patch("luke.behaviors._run_behavior", new_callable=AsyncMock) as mock_run_behavior,
@@ -312,6 +313,7 @@ class TestRunReflexion:
             mock_settings.chat_id = "12345"
             mock_settings.consolidation_model = "sonnet"
             mock_db.get_recent_quality_scores.return_value = []
+            mock_db.count_events_matching.return_value = 0  # not saturated
             mock_memory.recall.return_value = []
             await run_reflexion(
                 AsyncMock(), _SEM, event_kind="quality_low", event_payload=payload
@@ -344,6 +346,104 @@ class TestRunReflexion:
         # The original reflexion-save instruction must still be present.
         assert "'reflexion', 'g1'" in prompt
         assert "Root cause" in prompt
+
+    # --- Gate 1: empty-payload circuit-breaker -----------------------------
+    async def test_empty_payload_skips_analysis(self) -> None:
+        """`continuation_failure {}` carries no diagnostic signal — file once,
+        do not spawn the analysis (insight-reflexion-loop-structural-failure)."""
+        from luke.behaviors import run_reflexion
+
+        with (
+            patch("luke.behaviors.db") as mock_db,
+            patch("luke.behaviors.bus") as mock_bus,
+            patch("luke.behaviors._run_behavior", new_callable=AsyncMock) as mock_run_behavior,
+            patch("luke.behaviors.settings") as mock_settings,
+        ):
+            mock_settings.chat_id = "12345"
+            mock_db.count_events_matching.return_value = 0  # not yet filed
+            await run_reflexion(
+                AsyncMock(), _SEM, event_kind="continuation_failure", event_payload={}
+            )
+
+        mock_run_behavior.assert_not_called()
+        mock_bus.emit.assert_called_once()
+        assert mock_bus.emit.call_args.args[0] == "reflexion_empty_payload"
+
+    async def test_empty_payload_files_only_once(self) -> None:
+        from luke.behaviors import run_reflexion
+
+        with (
+            patch("luke.behaviors.db") as mock_db,
+            patch("luke.behaviors.bus") as mock_bus,
+            patch("luke.behaviors._run_behavior", new_callable=AsyncMock) as mock_run_behavior,
+            patch("luke.behaviors.settings") as mock_settings,
+        ):
+            mock_settings.chat_id = "12345"
+            mock_db.count_events_matching.return_value = 1  # already filed
+            await run_reflexion(
+                AsyncMock(), _SEM, event_kind="continuation_failure", event_payload={}
+            )
+
+        mock_run_behavior.assert_not_called()
+        mock_bus.emit.assert_not_called()  # de-duped
+
+    # --- Gate 2: saturation circuit-breaker --------------------------------
+    async def test_saturation_skips_analysis_and_escalates_once(self) -> None:
+        from luke.behaviors import run_reflexion
+
+        with (
+            patch("luke.behaviors.db") as mock_db,
+            patch("luke.behaviors.bus") as mock_bus,
+            patch("luke.behaviors._run_behavior", new_callable=AsyncMock) as mock_run_behavior,
+            patch("luke.behaviors.settings") as mock_settings,
+        ):
+            mock_settings.chat_id = "12345"
+
+            # 3 prior fires of this signature, 0 prior saturation markers
+            def _counts(event_type: str, like: str | None = None, **_: Any) -> int:
+                if event_type == "reflexion_fired":
+                    return 3
+                return 0
+
+            mock_db.count_events_matching.side_effect = _counts
+            await run_reflexion(
+                AsyncMock(),
+                _SEM,
+                event_kind="deep_work_skipped",
+                event_payload={"reason": "all_goals_filtered"},
+            )
+
+        mock_run_behavior.assert_not_called()
+        emitted = [c.args[0] for c in mock_bus.emit.call_args_list]
+        assert "reflexion_saturated" in emitted
+        assert "reflexion_fired" not in emitted  # did not record a 4th fire
+
+    async def test_below_saturation_records_fire_and_proceeds(self) -> None:
+        from luke.behaviors import run_reflexion
+
+        with (
+            patch("luke.behaviors.db") as mock_db,
+            patch("luke.behaviors.bus") as mock_bus,
+            patch("luke.behaviors.memory") as mock_memory,
+            patch("luke.behaviors.read_memory_body", return_value=""),
+            patch("luke.behaviors._run_behavior", new_callable=AsyncMock) as mock_run_behavior,
+            patch("luke.behaviors.settings") as mock_settings,
+        ):
+            mock_settings.chat_id = "12345"
+            mock_settings.consolidation_model = "sonnet"
+            mock_db.get_recent_quality_scores.return_value = []
+            mock_db.count_events_matching.return_value = 2  # below threshold
+            mock_memory.recall.return_value = []
+            await run_reflexion(
+                AsyncMock(),
+                _SEM,
+                event_kind="deep_work_skipped",
+                event_payload={"reason": "all_goals_filtered"},
+            )
+
+        mock_run_behavior.assert_called_once()
+        emitted = [c.args[0] for c in mock_bus.emit.call_args_list]
+        assert "reflexion_fired" in emitted  # recorded the fire for the counter
 
 
 # ---------------------------------------------------------------------------
