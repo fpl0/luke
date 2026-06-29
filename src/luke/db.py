@@ -1456,6 +1456,39 @@ def get_recent_quality_scores(goal_id: str, n: int = 3) -> list[int]:
     return [int(r["rating"]) for r in rows]
 
 
+def get_engagement_signals(chat_id: str, since_iso: str) -> dict[str, int]:
+    """Real signals of whether Filipe actually engaged with my output since
+    `since_iso`. This is the antidote to Goodhart self-assessment: quality is
+    measured by his response, not by how much I did.
+
+    - replies: count of Filipe's (non-Luke) messages in the window
+    - positive_reactions / negative_reactions: reaction sentiment in the window
+    - corrections: memory corrections detected in the window (I got something wrong)
+    """
+    conn = _db()
+    replies = conn.execute(
+        "SELECT COUNT(*) AS c FROM messages "
+        "WHERE chat_id = ? AND sender != 'Luke' AND ts >= ?",
+        (chat_id, since_iso),
+    ).fetchone()["c"]
+    react_rows = conn.execute(
+        "SELECT sentiment, COUNT(*) AS c FROM reaction_feedback "
+        "WHERE chat_id = ? AND timestamp >= ? GROUP BY sentiment",
+        (chat_id, since_iso),
+    ).fetchall()
+    reacts = {r["sentiment"]: r["c"] for r in react_rows}
+    corrections = conn.execute(
+        "SELECT COUNT(*) AS c FROM pending_corrections WHERE created_at >= ?",
+        (since_iso,),
+    ).fetchone()["c"]
+    return {
+        "replies": int(replies or 0),
+        "positive_reactions": int(reacts.get("positive", 0)),
+        "negative_reactions": int(reacts.get("negative", 0)),
+        "corrections": int(corrections or 0),
+    }
+
+
 def get_quality_blocked_goals(threshold: float = 2.0, window: int = 3) -> list[str]:
     """Return goal IDs where avg of last `window` ratings is below threshold."""
     # Get all goals with enough ratings

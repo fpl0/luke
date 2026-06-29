@@ -695,6 +695,23 @@ async def run_deep_work(bot: Bot, sem: asyncio.Semaphore) -> None:
         },
     )
 
+    # Self-assessment grounding: real signals of whether Filipe engaged with my
+    # output since the last session. The rating must anchor to HIS response, not
+    # my activity volume (the Goodhart loop). Window = since last deep-work run.
+    since_iso = db.get_behavior_last_run("deep_work") or (
+        datetime.now(UTC) - timedelta(hours=24)
+    ).isoformat()
+    signals = db.get_engagement_signals(settings.chat_id, since_iso)
+    bus.emit("deep_work_engagement_signals", {"since": since_iso, **signals})
+    engagement_block = (
+        "\n\nENGAGEMENT SIGNALS since your last session (this is how your work is "
+        "actually judged — by Filipe's response, NOT by how much you did):\n"
+        f"- Filipe replies: {signals['replies']}\n"
+        f"- positive reactions: {signals['positive_reactions']}, "
+        f"negative: {signals['negative_reactions']}\n"
+        f"- corrections (you got something wrong): {signals['corrections']}\n"
+    )
+
     remaining = settings.daily_deep_work_budget_usd - daily_cost
     now_str = datetime.now(UTC).isoformat(timespec="minutes")
 
@@ -713,6 +730,7 @@ async def run_deep_work(bot: Bot, sem: asyncio.Semaphore) -> None:
             if reflexion_context
             else ""
         )
+        + engagement_block
         + "\n\n"
         "Phase 1 — PLAN (do this first):\n"
         "1. Pick the highest-priority goal\n"
@@ -730,11 +748,18 @@ async def run_deep_work(bot: Bot, sem: asyncio.Semaphore) -> None:
         "   - Update steps_completed count and last_updated\n"
         "   - Update the goal memory with new progress %\n\n"
         "Phase 3 — QUALITY CHECK (mandatory before wrap-up):\n"
-        "9. Review what you produced this session. Ask yourself:\n"
-        "   - Would the user actually want or use this output?\n"
-        "   - Is this advancing the goal meaningfully, or is it busywork?\n"
-        "   - Rate this session 1-5: 1=wasted, 3=okay, 5=substantial progress\n"
-        "   Add the rating to your plan file under '## Session Quality'\n"
+        "9. Rate this session 1-5, anchored to the ENGAGEMENT SIGNALS above — "
+        "NOT to how much you produced. Volume of your own activity is not the "
+        "signal; Filipe's response is.\n"
+        "   - If you shipped output in a prior session and the signals show zero "
+        "replies, zero positive reactions, and no use of it, that is NOT a 4 or 5 "
+        "no matter how much you did — it means he hasn't engaged. Be honest.\n"
+        "   - Corrections in the window are a negative signal: you got something wrong.\n"
+        "   - Positive reactions / substantive replies / him using an artifact are "
+        "what earns a 4-5.\n"
+        "   - 1=ignored or wrong, 3=engaged but neutral, 5=clearly valued and used.\n"
+        "   Add the rating + a one-line justification citing which signal drove it "
+        "to your plan file under '## Session Quality'.\n"
         "   IMPORTANT: Also call log_deep_work_quality(goal_id, rating) to record it.\n"
         "   If the last 3 sessions average below 2: pause the goal and note why.\n\n"
         "Phase 4 — WRAP UP:\n"
