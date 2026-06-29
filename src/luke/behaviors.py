@@ -544,11 +544,28 @@ async def _run_attention_deep_work(
     now_str = datetime.now(UTC).isoformat(timespec="minutes")
     pin_lines = [f"[#{p['id']}, {p.get('origin', 'luke')}] {p['content']}" for p in pins]
 
+    # Same engagement grounding as the goal path: rating anchors to Filipe's
+    # response since the last session, not to how much got produced (Goodhart).
+    since_iso = db.get_behavior_last_run("deep_work") or (
+        datetime.now(UTC) - timedelta(hours=24)
+    ).isoformat()
+    signals = db.get_engagement_signals(settings.chat_id, since_iso)
+    bus.emit("deep_work_engagement_signals", {"since": since_iso, **signals})
+    engagement_block = (
+        "\n\nENGAGEMENT SIGNALS since your last session (this is how your work is "
+        "actually judged — by Filipe's response, NOT by how much you did):\n"
+        f"- Filipe replies: {signals['replies']}\n"
+        f"- positive reactions: {signals['positive_reactions']}, "
+        f"negative: {signals['negative_reactions']}\n"
+        f"- corrections (you got something wrong): {signals['corrections']}\n"
+    )
+
     prompt = (
         f"Deep work session — no active goals ({reason}). "
         f"Current time: {now_str}. Daily budget remaining: ${remaining:.2f}.\n\n"
         "Active-attention pins (these are the things Filipe said matter):\n"
         + "\n".join(pin_lines)
+        + engagement_block
         + "\n\n"
         "Select ONE pin and do real work against it. Prefer concrete artifacts "
         "(findings, fixes, prep docs) over meta-work (entity cleanup, cron "
@@ -556,9 +573,13 @@ async def _run_attention_deep_work(
         "fully; if all pins are blocked on Filipe, save an episode noting why "
         "and stop.\n\n"
         "Quality check before wrap-up:\n"
-        "- Did you produce a tangible result, or just analysis?\n"
-        "- Rate this session 1-5 and call log_deep_work_quality(\"attention-\" "
-        "+ pin-id, rating).\n"
+        "- Rate this session 1-5, anchored to the ENGAGEMENT SIGNALS above — NOT "
+        "to how much you produced. Zero replies / zero positive reactions / no use "
+        "of prior output is NOT a 4-5 no matter how much you did; corrections are a "
+        "negative signal. 1=ignored or wrong, 3=engaged but neutral, 5=clearly "
+        "valued and used.\n"
+        "- Call log_deep_work_quality(\"attention-\" + pin-id, rating) with a "
+        "one-line justification citing which signal drove it.\n"
         "- Save a summary episode of what shipped.\n\n"
         "You may send at most ONE message to the user per session — only if "
         "truly blocked.\n"
