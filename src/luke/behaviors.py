@@ -384,7 +384,10 @@ async def run_reflexion(
         "3. What should change for the next attempt? Be specific and actionable.\n"
         "4. Save a reflexion insight with 'remember' using a deterministic id like "
         f"'reflexion-{goal_id}-<unix_ts>' (type: insight, tags: ['reflexion', '{goal_id}']). "
-        "The insight should be concise and actionable.\n"
+        "The insight MUST name two things explicitly so the next session can act on "
+        "it: (a) the concrete BEHAVIOR CHANGE for next time, and (b) the VERIFICATION "
+        "SIGNAL — how a future session will know the change actually happened. "
+        "An insight without both is documentation, not improvement — don't save it.\n"
         "5. Counterfactual: what is the SMALLEST change that would have flipped this "
         "outcome? Be concrete. Save as a separate insight linked to the parent reflexion:\n"
         "     remember(\n"
@@ -602,6 +605,7 @@ async def run_deep_work(bot: Bot, sem: asyncio.Semaphore) -> None:
     goal_sections: list[str] = []
     skipped_goals: list[str] = []
     reflexion_goals: list[str] = []  # goals that triggered reflexion before proceeding
+    active_goal_ids: list[str] = []  # goals actually entering this session
     for g in goals:
         gid = g["id"]
 
@@ -625,6 +629,7 @@ async def run_deep_work(bot: Bot, sem: asyncio.Semaphore) -> None:
         body = read_memory_body(g["type"], g["id"], 1000)
         if body:
             goal_sections.append(f"[{gid}]:\n{body}")
+            active_goal_ids.append(gid)
 
     if skipped_goals:
         log.info("deep_work_goals_skipped", skipped=skipped_goals)
@@ -658,18 +663,37 @@ async def run_deep_work(bot: Bot, sem: asyncio.Semaphore) -> None:
                 f"[{g['id']}]: last {len(scores)} ratings: {scores} (avg: {avg:.1f})"
             )
 
-    # Include reflexion insights for goals in the reflexion tier
+    # Reflexion recall gate: BEFORE acting, load past lessons for EVERY active
+    # goal — not just the ones already in the reflexion tier. The open loop this
+    # closes: lessons were saved on failure but only recalled once quality had
+    # already degraded, so the same mistake repeated. Recall before, not after.
     reflexion_context: list[str] = []
-    for gid in reflexion_goals:
+    seen_insight_ids: set[str] = set()
+    recalled_per_goal: dict[str, int] = {}
+    for gid in active_goal_ids:
         insights = memory.recall(
             query=f"reflexion {gid}",
             mem_type="insight",
             limit=2,
         )
         for ins in insights or []:
+            if ins["id"] in seen_insight_ids:
+                continue
             body = read_memory_body(ins["type"], ins["id"], 300)
             if body:
+                seen_insight_ids.add(ins["id"])
                 reflexion_context.append(f"[{ins['id']}] (for {gid}): {body}")
+                recalled_per_goal[gid] = recalled_per_goal.get(gid, 0) + 1
+
+    # Telemetry: prove the gate fired (verifiable in luke.log / event table).
+    bus.emit(
+        "deep_work_reflexion_recalled",
+        {
+            "active_goals": len(active_goal_ids),
+            "insights_recalled": len(reflexion_context),
+            "per_goal": recalled_per_goal,
+        },
+    )
 
     remaining = settings.daily_deep_work_budget_usd - daily_cost
     now_str = datetime.now(UTC).isoformat(timespec="minutes")
@@ -682,7 +706,9 @@ async def run_deep_work(bot: Bot, sem: asyncio.Semaphore) -> None:
         + ("\n\nExisting work plans:\n" + "\n".join(plan_status) if plan_status else "")
         + ("\n\nQuality history:\n" + "\n".join(quality_context) if quality_context else "")
         + (
-            "\n\nREFLEXION WARNINGS (recent quality is low — apply these insights):\n"
+            "\n\nREFLEXION RECALL — your own past lessons for these goals. "
+            "READ THESE FIRST and apply them before acting. Do NOT repeat the "
+            "mistakes they describe; if a lesson names a behavior change, do it:\n"
             + "\n---\n".join(reflexion_context)
             if reflexion_context
             else ""
