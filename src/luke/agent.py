@@ -721,14 +721,22 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
         "remember",
         "Save memory. type: entity|episode|procedure|insight|goal. "
         "importance: 0.1-2.0 (default 1.0). Returns change summary on entity update.",
+        # Full JSON Schema (not a plain type-dict): the Agent SDK marks EVERY key
+        # of a plain dict as required, which rejected any remember() call omitting
+        # tags/links/importance at the MCP validation layer — before mem_save's
+        # defaults/coercion could run. Only id/type/title/content are truly required.
         {
-            "id": str,
-            "type": str,
-            "title": str,
-            "content": str,
-            "tags": list,
-            "links": list,
-            "importance": float,
+            "type": "object",
+            "properties": {
+                "id": {"type": "string"},
+                "type": {"type": "string"},
+                "title": {"type": "string"},
+                "content": {"type": "string"},
+                "tags": {"type": "array"},
+                "links": {"type": "array"},
+                "importance": {"type": "number"},
+            },
+            "required": ["id", "type", "title", "content"],
         },
     )
     async def mem_save(args: dict[str, Any]) -> dict[str, Any]:
@@ -910,7 +918,19 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
     @tool(
         "recall",
         "Search memories. Combine: query, type, after/before, related_to.",
-        {"query": str, "type": str, "after": str, "before": str, "related_to": str},
+        # All filters optional and combinable — full JSON Schema so the SDK does
+        # not mark every key required (same bug class as remember).
+        {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "type": {"type": "string"},
+                "after": {"type": "string"},
+                "before": {"type": "string"},
+                "related_to": {"type": "string"},
+            },
+            "required": [],
+        },
         annotations=_READ_ONLY,
     )
     async def mem_recall(args: dict[str, Any]) -> dict[str, Any]:
