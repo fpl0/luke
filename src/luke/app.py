@@ -292,6 +292,28 @@ def _load_conv_state() -> tuple[str, str | None]:
     return body, updated
 
 
+def _live_reaction_note(chat_id: str) -> str:
+    """Surface reactions from the last few minutes into the live turn so a fresh
+    ❤ / 👎 shapes my next response while it's warm — the 'presence' gap Filipe
+    named: capture was never the problem, noticing in the moment was. Returns ''
+    when nothing is fresh, so it self-expires and never nags."""
+    reactions = db.get_recent_reactions(chat_id, within_minutes=15)
+    if not reactions:
+        return ""
+    lines = []
+    for r in reactions[:5]:
+        target = "your message" if r.get("msg_sender") == settings.assistant_name else "their own message"
+        preview = (r.get("msg_preview") or "").replace("\n", " ").strip()
+        snippet = f' "{preview}…"' if preview else ""
+        lines.append(f"- {r['emoji']} ({r['sentiment']}) on {target}{snippet}")
+    return (
+        "[LIVE — Filipe just reacted (last 15 min). Acknowledge it naturally if it "
+        "fits; let it shape your tone. Don't over-perform it.]\n"
+        + "\n".join(lines)
+        + "\n\n"
+    )
+
+
 async def _get_conversation_state(chat_id: str) -> str:
     """Load conversation state for continuity injection.
 
@@ -299,10 +321,13 @@ async def _get_conversation_state(chat_id: str) -> str:
     Falls back to recent message synthesis if no saved state exists.
     """
     body, updated = await asyncio.to_thread(_load_conv_state)
+    live_reactions = await asyncio.to_thread(_live_reaction_note, chat_id)
     if body:
         # Add session recovery notice if applicable
         if _session_lost.pop(chat_id, False):
             body = "[Session was reset — use this context to resume seamlessly]\n" + body
+        if live_reactions:
+            body = live_reactions + body
         if updated:
             try:
                 ts = ensure_utc(datetime.fromisoformat(updated))
@@ -324,6 +349,7 @@ async def _get_conversation_state(chat_id: str) -> str:
     ctx = "\n".join(lines)
     return (
         "<conversation-state>\n"
+        f"{live_reactions}"
         "[Recent conversation context (no saved state available)]\n"
         f"{ctx}\n</conversation-state>\n"
     )

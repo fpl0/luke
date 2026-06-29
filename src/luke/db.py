@@ -849,6 +849,29 @@ def get_reactions(
     return [dict(r) for r in rows]
 
 
+def get_recent_reactions(chat_id: str, within_minutes: int = 15) -> list[dict[str, Any]]:
+    """Reactions in the last `within_minutes`, newest first, with the preview of
+    the message they landed on. Powers live, in-the-moment reaction awareness:
+    a fresh ❤ should shape the next turn while it's warm, not wait for a scan.
+    Time-windowed so it self-expires — no stale re-injection, no nagging.
+    """
+    cutoff = (datetime.now(UTC) - timedelta(minutes=within_minutes)).isoformat()
+    rows = (
+        _db()
+        .execute(
+            """SELECT r.msg_id, r.emoji, r.sentiment, r.timestamp,
+                      m.sender AS msg_sender, SUBSTR(m.content, 1, 120) AS msg_preview
+               FROM reaction_feedback r
+               LEFT JOIN messages m ON m.chat_id = r.chat_id AND m.msg_id = r.msg_id
+               WHERE r.chat_id = ? AND r.timestamp >= ?
+               ORDER BY r.timestamp DESC""",
+            (chat_id, cutoff),
+        )
+        .fetchall()
+    )
+    return [dict(r) for r in rows]
+
+
 def get_reaction_summary(chat_id: str, days: int = 7) -> dict[str, Any]:
     """Aggregate reaction stats for the given period.
 
