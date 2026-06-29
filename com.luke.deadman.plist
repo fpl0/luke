@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.luke.deadman</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/filipelm/Code/luke/deadman.sh</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/filipelm/Code/luke</string>
+    <key>StartInterval</key>
+    <integer>300</integer>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Users/filipelm/Luke/deadman.out</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/filipelm/Luke/deadman.err</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin:/Users/filipelm/.local/bin</string>
+        <key>LUKE_DIR</key>
+        <string>/Users/filipelm/Luke</string>
+    </dict>
+</dict>
+</plist>

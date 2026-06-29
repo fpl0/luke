@@ -25,6 +25,18 @@ if [[ -f "$WATCHDOG_LOG" ]] && (( $(wc -l < "$WATCHDOG_LOG") > 200 )); then
     tail -100 "$WATCHDOG_LOG" > "$WATCHDOG_LOG.tmp" && mv "$WATCHDOG_LOG.tmp" "$WATCHDOG_LOG"
 fi
 
+# ─── Watch the watcher's watcher: keep the deadman alerter loaded ───
+# The deadman (com.luke.deadman) is the only path that reaches Filipe when Luke
+# is fully dead. The deadman reloads us; we reload the deadman. Mutual watching
+# means both supervisors must fail simultaneously for a silent outage to recur.
+DEADMAN_SERVICE="gui/$(id -u)/com.luke.deadman"
+DEADMAN_PLIST="/Users/filipelm/Library/LaunchAgents/com.luke.deadman.plist"
+if [[ -f "$DEADMAN_PLIST" ]] && ! launchctl print "$DEADMAN_SERVICE" >/dev/null 2>&1; then
+    log "Deadman alerter not loaded — bootstrapping"
+    launchctl bootstrap "gui/$(id -u)" "$DEADMAN_PLIST" 2>/dev/null \
+        || launchctl kickstart "$DEADMAN_SERVICE" 2>/dev/null || true
+fi
+
 # No heartbeat file means Luke hasn't started yet — let launchd handle it
 if [[ ! -f "$HEARTBEAT_FILE" ]]; then
     exit 0
