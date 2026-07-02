@@ -51,7 +51,15 @@ _FRESHNESS_SYSTEM_PROMPT = (
     "You compare an outbound draft from Luke against the user's most "
     "recent messages. Decide if the draft is coherent with what the "
     "user just said, or if it would feel stale, contradictory, or like "
-    "a response to an earlier state of the conversation."
+    "a response to an earlier state of the conversation.\n"
+    "Pay special attention to EVENTS and COMMITMENTS: if the user is "
+    "rescheduling, cancelling, declining, or expressing doubt about an "
+    "event, meeting, call, or plan — even tentatively or while still "
+    "drafting a message about it — then a draft that nudges the user to "
+    "prepare for, attend, or act on that same event as though nothing "
+    "changed is STALE. Block it. The user should never have to hold "
+    "state that Luke should be holding; err toward blocking a nudge that "
+    "ignores a change the user just signalled."
 )
 
 

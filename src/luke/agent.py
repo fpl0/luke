@@ -1715,12 +1715,12 @@ async def run_agent(
                     and msg_text
                     and len(msg_text) >= 30
                 ):
-                    recent_rows = db.get_recent_messages(chat_id, limit=4)
+                    recent_rows = db.get_recent_messages(chat_id, limit=10)
                     user_msgs = [
                         r
                         for r in recent_rows
                         if r.get("sender_name") != settings.assistant_name
-                    ][-2:]
+                    ][-4:]
                     if user_msgs:
                         try:
                             latest_ts = str(user_msgs[-1].get("timestamp", ""))
