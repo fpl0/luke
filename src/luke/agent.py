@@ -7,6 +7,7 @@ import hashlib
 import json
 import re
 import time
+import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -339,6 +340,46 @@ _AUTO_SKILL_THRESHOLD: int = 5  # tool calls to trigger procedure extraction in 
 
 # Active client registry — enables external interruption of running agents
 _active_clients: dict[str, ClaudeSDKClient] = {}
+
+# Background job registry — tasks that survive across turns and per-chat locks
+_bg_jobs: dict[str, asyncio.Task[None]] = {}
+
+
+async def _run_bg_job(
+    job_id: str,
+    chat_id: str,
+    prompt: str,
+    trigger_msg_id: int | None,
+    bot: Bot,
+) -> None:
+    """Run an agent in the background, independent of the per-turn client and per-chat lock."""
+    log.info("bg_job_start", job_id=job_id, chat_id=chat_id)
+    reply_text = ""
+    try:
+        result = await run_agent(
+            chat_id=chat_id,
+            prompt=prompt,
+            session_id=None,
+            bot=bot,
+            autonomous=True,
+        )
+        reply_text = "\n\n".join(result.texts) if result.texts else ""
+    except Exception as exc:
+        log.exception("bg_job_failed", job_id=job_id, chat_id=chat_id)
+        reply_text = f"Background task hit an error: {exc}"
+    finally:
+        _bg_jobs.pop(job_id, None)
+        log.info("bg_job_done", job_id=job_id, chat_id=chat_id)
+
+    if not reply_text:
+        return
+    try:
+        kwargs: dict[str, Any] = {}
+        if trigger_msg_id:
+            kwargs["reply_parameters"] = ReplyParameters(message_id=trigger_msg_id)
+        await send_long_message(bot, chat_id=int(chat_id), text=reply_text, **kwargs)
+    except Exception:
+        log.exception("bg_job_reply_failed", job_id=job_id, chat_id=chat_id)
 
 
 async def interrupt_agent(chat_id: str) -> bool:
@@ -1246,6 +1287,26 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
         except Exception as exc:
             return _ok(f"Browse error: {exc}")
 
+    @tool(
+        "delegate",
+        (
+            "Spawn a self-contained agent task in the background and return immediately. "
+            "The conversation stays unblocked while the task runs. "
+            "On completion the result is sent back referencing trigger_msg_id. "
+            "prompt must be fully self-contained (no shared context from this turn). "
+            "Use for: research that takes >30s, file builds, multi-step analysis."
+        ),
+        {"prompt": str, "trigger_msg_id": int},
+        annotations=_OPEN_WORLD,
+    )
+    async def t_delegate(args: dict[str, Any]) -> dict[str, Any]:
+        job_id = uuid.uuid4().hex[:8]
+        task = asyncio.create_task(
+            _run_bg_job(job_id, chat_id, args["prompt"], args.get("trigger_msg_id"), bot)
+        )
+        _bg_jobs[job_id] = task
+        return _ok(f"job:{job_id} running in background — will reply when done.")
+
     return create_sdk_mcp_server(
         name="luke",
         version="1.0.0",
@@ -1281,6 +1342,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
             t_cost,
             t_quality,
             t_browse,
+            t_delegate,
         ],
     )
 
@@ -1441,6 +1503,7 @@ _ALL_MCP_TOOL_NAMES: list[str] = [
     "get_cost_report",
     "log_deep_work_quality",
     "browse",
+    "delegate",
 ]
 
 _MCP_TOOLS_HAIKU: frozenset[str] = frozenset(
