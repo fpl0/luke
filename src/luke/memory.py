@@ -1524,6 +1524,12 @@ def _cosine_distance(a: list[float], b: list[float]) -> float:
     return 1.0 - (dot / (norm_a * norm_b))
 
 
+# A contradictory correction *destroys* the existing content (replace in-place).
+# Only do that automatically when we're highly confident; otherwise queue it for
+# review so a low-confidence false positive can't silently eat a memory.
+DESTRUCTIVE_AUTO_CONFIDENCE = 0.9
+
+
 def apply_correction(
     mem_id: str,
     corrected_content: str,
@@ -1531,15 +1537,19 @@ def apply_correction(
     confidence: float = 0.7,
     source: str = "auto_detection",
     change_type: str = "correction",
+    allow_destructive: bool = False,
 ) -> dict[str, Any]:
     """Apply a detected correction to a memory.
 
     1. Fetch current memory content
     2. Classify relationship (extendable vs contradictory)
-    3. If extendable: merge content
-    4. If contradictory: replace with new, link with supersedes
+    3. If extendable: merge content (safe — appends, never destroys)
+    4. If contradictory: replace content in-place. This is destructive, so it
+       only runs automatically at high confidence (or when a human approved it
+       via ``allow_destructive``); otherwise it's queued for review.
     5. Re-embed and re-index
-    6. Log to memory_history with content snapshots
+    6. Log to memory_history with FULL content snapshots (so any correction is
+       reversible — no truncation).
     """
     conn = _db()
     row = conn.execute("SELECT content FROM memory_fts WHERE id = ?", (mem_id,)).fetchone()
@@ -1554,6 +1564,18 @@ def apply_correction(
         new_content = existing_content + "\n\n" + corrected_content
         change_desc = "Extended with new information"
     elif relationship == "contradictory":
+        # Guard the destructive path: a low-confidence "contradiction" that
+        # would wipe the memory gets queued for review instead of applied.
+        if not allow_destructive and confidence < DESTRUCTIVE_AUTO_CONFIDENCE:
+            flag_for_review(
+                mem_id, corrected_content, confidence=confidence, source=source
+            )
+            return {
+                "status": "flagged",
+                "mem_id": mem_id,
+                "reason": "low_confidence_contradiction",
+                "confidence": confidence,
+            }
         new_content = corrected_content
         change_desc = "Contradiction resolved — replaced content"
     else:
@@ -1597,8 +1619,8 @@ def apply_correction(
             mem_id,
             json.dumps(changes),
             now,
-            existing_content[:500],
-            new_content[:500],
+            existing_content,
+            new_content,
             change_type,
             source,
             confidence,
@@ -1680,6 +1702,7 @@ def resolve_correction(correction_id: int, status: str) -> dict[str, Any]:
             row["corrected_content"],
             confidence=row["confidence"],
             source=row["source"],
+            allow_destructive=True,  # a human approved this correction
         )
 
     return {"status": status, "correction_id": correction_id}

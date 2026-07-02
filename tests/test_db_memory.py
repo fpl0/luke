@@ -832,6 +832,93 @@ class TestMemoryHistory:
 
 
 # ---------------------------------------------------------------------------
+# Corrections — destructive-overwrite guard
+# ---------------------------------------------------------------------------
+
+
+class TestApplyCorrection:
+    def _content(self, mem_id: str) -> str:
+        return (
+            db._db()
+            .execute("SELECT content FROM memory_fts WHERE id = ?", (mem_id,))
+            .fetchone()["content"]
+        )
+
+    def test_low_confidence_contradiction_is_flagged_not_destroyed(
+        self, test_db: Any, monkeypatch: Any
+    ) -> None:
+        # Force the contradictory (destructive) classification regardless of embeddings.
+        monkeypatch.setattr(memory, "classify_relationship", lambda a, b: "contradictory")
+        memory.index_memory("e1", "entity", "Fact", "original important content")
+
+        result = memory.apply_correction("e1", "totally different claim", confidence=0.74)
+
+        assert result["status"] == "flagged"
+        assert result["reason"] == "low_confidence_contradiction"
+        # Content must be untouched — the bug was that it got wiped in-place.
+        assert self._content("e1") == "original important content"
+        # And it's queued for human review.
+        assert len(memory.get_pending_corrections("e1")) == 1
+
+    def test_high_confidence_contradiction_is_applied(
+        self, test_db: Any, monkeypatch: Any
+    ) -> None:
+        monkeypatch.setattr(memory, "classify_relationship", lambda a, b: "contradictory")
+        memory.index_memory("e1", "entity", "Fact", "original content")
+
+        result = memory.apply_correction("e1", "corrected content", confidence=0.95)
+
+        assert result["status"] == "applied"
+        assert self._content("e1") == "corrected content"
+
+    def test_allow_destructive_applies_at_low_confidence(
+        self, test_db: Any, monkeypatch: Any
+    ) -> None:
+        # Human-approved path (resolve_correction) may replace even at low confidence.
+        monkeypatch.setattr(memory, "classify_relationship", lambda a, b: "contradictory")
+        memory.index_memory("e1", "entity", "Fact", "original content")
+
+        result = memory.apply_correction(
+            "e1", "human approved replacement", confidence=0.6, allow_destructive=True
+        )
+
+        assert result["status"] == "applied"
+        assert self._content("e1") == "human approved replacement"
+
+    def test_history_snapshot_not_truncated(
+        self, test_db: Any, monkeypatch: Any
+    ) -> None:
+        # A replaced correction must be fully reversible — no 500-char truncation.
+        monkeypatch.setattr(memory, "classify_relationship", lambda a, b: "contradictory")
+        long_original = "X" * 1200
+        memory.index_memory("e1", "entity", "Fact", long_original)
+
+        memory.apply_correction("e1", "new", confidence=0.95)
+
+        row = (
+            db._db()
+            .execute(
+                "SELECT old_content FROM memory_history WHERE mem_id = ? "
+                "ORDER BY id DESC LIMIT 1",
+                ("e1",),
+            )
+            .fetchone()
+        )
+        assert row["old_content"] == long_original  # full snapshot, reversible
+
+    def test_extendable_correction_still_appends(
+        self, test_db: Any, monkeypatch: Any
+    ) -> None:
+        monkeypatch.setattr(memory, "classify_relationship", lambda a, b: "extendable")
+        memory.index_memory("e1", "entity", "Fact", "base")
+
+        result = memory.apply_correction("e1", "addendum", confidence=0.74)
+
+        assert result["status"] == "applied"
+        assert self._content("e1") == "base\n\naddendum"
+
+
+# ---------------------------------------------------------------------------
 # Temporal validity on links
 # ---------------------------------------------------------------------------
 
