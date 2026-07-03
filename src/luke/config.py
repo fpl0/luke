@@ -106,8 +106,14 @@ class Settings(BaseSettings):
     # Outbound critic (F4) — last-mile quality gate on autonomous sends
     critic_enabled: bool = True
     critic_model: str = "claude-haiku-4-5-20251001"
-    critic_max_budget_usd: float = 0.01
-    critic_timeout_s: float = 5.0
+    # NOTE: $0.01 was too low — the SDK subprocess blows past it before a
+    # single haiku turn completes, so every critic/freshness call died on
+    # budget. Measured a real freshness call at ~$0.02-0.03; 0.05 gives head-
+    # room. Paired with the timeout below (call takes ~6.4s wall, 5s clipped
+    # it). Before this fix, 0/61 critic+freshness runs ever produced a real
+    # verdict — all failed open on timeout, so both gates were dead weight.
+    critic_max_budget_usd: float = 0.05
+    critic_timeout_s: float = 15.0
 
     # Freshness gate (L1) — abort sends that have gone stale relative to
     # the user's latest inbound message. Reuses critic infrastructure.
