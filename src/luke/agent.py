@@ -372,7 +372,12 @@ async def _run_bg_job(
         log.info("bg_job_done", job_id=job_id, chat_id=chat_id)
 
     if not reply_text:
-        return
+        # Never vanish silently: a job that ran but produced no text still
+        # reports back, so a background task can only ever end by messaging you.
+        reply_text = (
+            f"Background job {job_id} finished but produced no output — "
+            "flagging it so it doesn't disappear silently."
+        )
     try:
         kwargs: dict[str, Any] = {}
         if trigger_msg_id:
