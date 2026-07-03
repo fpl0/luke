@@ -205,7 +205,7 @@ def _maintenance_intents() -> list[Intent]:
                     cost,
                     asks_attention=True,
                     attention_cost=2,
-                    attention_urgency=0.7,
+                    attention_urgency=0.5,
                 )
             )
         elif elapsed >= interval * 3:
@@ -217,7 +217,7 @@ def _maintenance_intents() -> list[Intent]:
                     cost,
                     asks_attention=True,
                     attention_cost=2,
-                    attention_urgency=0.7,
+                    attention_urgency=0.5,
                 )
             )
 
@@ -285,9 +285,6 @@ def _maintenance_intents() -> list[Intent]:
                     0.30,
                     "event",
                     settings.dream_max_budget_usd,
-                    asks_attention=True,
-                    attention_cost=1,
-                    attention_urgency=0.2,
                 )
             )
         elif elapsed >= settings.dream_interval * 6:
@@ -297,9 +294,6 @@ def _maintenance_intents() -> list[Intent]:
                     0.20,
                     "time",
                     settings.dream_max_budget_usd,
-                    asks_attention=True,
-                    attention_cost=1,
-                    attention_urgency=0.2,
                 )
             )
 
@@ -348,6 +342,12 @@ def _enforce_attention_budget(intents: list[Intent]) -> list[Intent]:
             kept.append(intent)
             remaining -= cost  # always deduct from the normal budget
         else:
+            # Budget spent: back this behavior off a full interval instead of
+            # regenerating (and re-dropping) its intent on every scheduler tick.
+            # The generation gate in _maintenance_intents reads behavior_last_run,
+            # so stamping it here stops the busy-loop that inflated the
+            # attention-pressure metric with hundreds of phantom drops/day.
+            db.set_behavior_last_run(intent.kind, datetime.now(UTC).isoformat())
             key = (intent.kind, is_urgent)
             now = time.monotonic()
             last = _last_drop_log_ts.get(key, 0.0)
