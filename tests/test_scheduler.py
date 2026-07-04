@@ -321,8 +321,12 @@ class TestRunTask:
             await _run_task(task, mock_bot)
 
         mock_db.log_task_run.assert_called_once()
-        # Check result is "error"
-        assert mock_db.log_task_run.call_args[0][3] == "error"
+        # Result captures the exception detail so failures are diagnosable
+        # from luke.db alone (not just structlog).
+        logged_result = mock_db.log_task_run.call_args[0][3]
+        assert logged_result.startswith("error:")
+        assert "RuntimeError" in logged_result
+        assert "agent failed" in logged_result
         mock_db.update_task_last_run.assert_called_once()
         mock_db.increment_task_failures.assert_called_once()
 
@@ -542,6 +546,8 @@ class TestBehaviorEventGating:
         mock_db.consume_events.return_value = 0
         # Budget gate for deep work planner
         mock_db.get_daily_deep_work_cost.return_value = 0.0
+        # Attention budget gate (_enforce_attention_budget) needs a real int
+        mock_db.get_daily_outbound_count.return_value = 0
         # Planner needs real ensure_utc for datetime calculations
         from luke.db import ensure_utc as _real_ensure_utc
 
@@ -570,6 +576,9 @@ class TestBehaviorEventGating:
         mock_settings.dream_interval = interval if due_behavior == "dream" else 999999
         mock_settings.consolidation_min_cluster = 3
         mock_settings.behavior_max_budget_usd = 1.5
+        # Attention budget gate (_enforce_attention_budget) needs real ints
+        mock_settings.daily_attention_budget = 12
+        mock_settings.attention_urgent_reserve = 2
         mock_settings.daily_deep_work_budget_usd = 120.0
         mock_settings.deep_work_max_budget_usd = 10.0
         mock_settings.dream_max_budget_usd = 2.0

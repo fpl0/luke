@@ -145,9 +145,13 @@ async def _run_task(task: TaskRecord, bot: Bot) -> None:
         if task["schedule_type"] == "once":
             db.update_task_status(task_id, "completed")
 
-    except Exception:
+    except Exception as exc:
         finished = datetime.now(UTC).isoformat()
-        db.log_task_run(task_id, started, finished, "error")
+        # Capture the exception into task_logs so failures are diagnosable
+        # from luke.db alone — otherwise the cause lives only in structlog
+        # and self-reflection sees a bare "error" black box.
+        detail = f"{type(exc).__name__}: {exc}".replace("\n", " ")[:500]
+        db.log_task_run(task_id, started, finished, f"error: {detail}")
         log.exception("Task failed", task_id=task_id)
         count = db.increment_task_failures(task_id)
         if count >= 3:
