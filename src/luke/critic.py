@@ -35,6 +35,11 @@ _CRITIC_SYSTEM_PROMPT = (
     "Luke's voice: warm, unhurried, sometimes wry. Never customer-service.\n"
     'Never "Great question!" or "Absolutely!" or "I apologize for the inconvenience".\n'
     "Substance over performance.\n"
+    "FORMAT: messages are sent to Telegram with HTML parse mode. HTML tags "
+    "(<b>, <i>, <code>, <pre>, <a>) are CORRECT and render properly. Markdown "
+    "(**bold**, *italic*, `code`) is WRONG and shows as literal characters. "
+    "Never tell Luke to use markdown or that HTML 'won't render' — the reverse "
+    "is true. Do not flag well-formed HTML tags as a formatting problem.\n"
 )
 
 
