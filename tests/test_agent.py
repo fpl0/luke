@@ -1305,6 +1305,138 @@ class TestOvernightCommitmentGate:
         assert len(emitted) == 1
 
 
+class TestOutboundQualityGate:
+    """Test the outbound quality gate slice inside _pre_tool_hook.
+
+    Regression coverage for the two-month bug (2026-05-16 → 2026-07-13) where
+    every send_document was blocked as "empty message": the gate read only the
+    'text' field, which documents/media do not carry — their payload is the
+    file, with an OPTIONAL caption. Faithfully reproduces the gate slice
+    (lines ~1671-1687 of agent.py), including the _TEXT_PRIMARY_TOOLS branch.
+    """
+
+    @staticmethod
+    def _build_hook() -> tuple[Any, list[dict[str, Any]]]:
+        from luke.agent import (
+            _SEND_TOOLS,
+            _TEXT_PRIMARY_TOOLS,
+            _check_outbound_quality,
+        )
+
+        emitted: list[dict[str, Any]] = []
+
+        async def _hook(
+            input_data: dict[str, Any],
+            tool_use_id: str | None,
+            context: Any,
+        ) -> dict[str, Any]:
+            tool_name = input_data["tool_name"]
+            if tool_name in _SEND_TOOLS:
+                tool_input = input_data.get("tool_input", {})
+                if isinstance(tool_input, dict):
+                    msg_text = tool_input.get("text", "") or tool_input.get(
+                        "caption", ""
+                    )
+                else:
+                    msg_text = ""
+                if tool_name in _TEXT_PRIMARY_TOOLS or msg_text.strip():
+                    rejection = _check_outbound_quality(msg_text)
+                else:
+                    rejection = None
+                if rejection:
+                    emitted.append({
+                        "reason": rejection,
+                        "tool": tool_name,
+                        "preview": msg_text[:100],
+                    })
+                    return {
+                        "decision": "block",
+                        "reason": f"Quality gate: {rejection}",
+                    }
+            return {}
+
+        return _hook, emitted
+
+    async def test_send_document_with_no_caption_passes(self) -> None:
+        """The regression: a file with no caption is a valid send, not empty."""
+        hook, emitted = self._build_hook()
+        result = await hook(
+            {
+                "tool_name": "mcp__luke__send_document",
+                "tool_input": {"path": "/tmp/cargurus-ramp.pdf"},
+                "tool_use_id": "tu_doc_empty",
+            },
+            "tu_doc_empty",
+            {},
+        )
+        assert result == {}
+        assert emitted == []
+
+    async def test_send_document_with_empty_caption_passes(self) -> None:
+        hook, emitted = self._build_hook()
+        result = await hook(
+            {
+                "tool_name": "mcp__luke__send_document",
+                "tool_input": {"path": "/tmp/foo.pdf", "caption": "   "},
+                "tool_use_id": "tu_doc_ws",
+            },
+            "tu_doc_ws",
+            {},
+        )
+        assert result == {}
+        assert emitted == []
+
+    async def test_send_document_with_substantive_caption_passes(self) -> None:
+        hook, emitted = self._build_hook()
+        result = await hook(
+            {
+                "tool_name": "mcp__luke__send_document",
+                "tool_input": {
+                    "path": "/tmp/foo.pdf",
+                    "caption": "Your day-1 operating guide — the founding-EM build plan.",
+                },
+                "tool_use_id": "tu_doc_ok",
+            },
+            "tu_doc_ok",
+            {},
+        )
+        assert result == {}
+        assert emitted == []
+
+    async def test_send_document_with_bad_caption_still_blocks(self) -> None:
+        """Content quality checks still apply to captions that ARE present."""
+        hook, emitted = self._build_hook()
+        result = await hook(
+            {
+                "tool_name": "mcp__luke__send_document",
+                "tool_input": {
+                    "path": "/tmp/foo.pdf",
+                    "caption": "<internal>note to self</internal>",
+                },
+                "tool_use_id": "tu_doc_bad",
+            },
+            "tu_doc_bad",
+            {},
+        )
+        assert result.get("decision") == "block"
+        assert len(emitted) == 1
+
+    async def test_send_message_empty_text_still_blocks(self) -> None:
+        """Text-primary tools must still reject an empty body."""
+        hook, emitted = self._build_hook()
+        result = await hook(
+            {
+                "tool_name": "mcp__luke__send_message",
+                "tool_input": {"text": ""},
+                "tool_use_id": "tu_msg_empty",
+            },
+            "tu_msg_empty",
+            {},
+        )
+        assert result.get("decision") == "block"
+        assert emitted[0]["reason"] == "empty message"
+
+
 class TestCriticGate:
     """Test the critic-agent gate inside _pre_tool_hook (F4).
 

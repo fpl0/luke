@@ -258,6 +258,17 @@ _SEND_TOOLS: frozenset[str] = frozenset(
     }
 )
 
+# Send tools whose PRIMARY payload is the text body itself. For these an
+# empty message is a real defect. The other _SEND_TOOLS (documents, media,
+# location, poll, buttons) carry the payload as a file/attachment with an
+# OPTIONAL caption, so an empty caption must NOT be gated as "empty message".
+_TEXT_PRIMARY_TOOLS: frozenset[str] = frozenset(
+    {
+        "mcp__luke__send_message",
+        "mcp__luke__reply",
+    }
+)
+
 
 # Patterns that suggest the draft references a past event/topic
 # Used by _references_past_events to gate autonomous sends behind a recall call.
@@ -1669,9 +1680,21 @@ async def run_agent(
                     return {"decision": "block", "reason": "Hourly message budget exceeded"}
 
                 # --- Outbound message quality gate (autonomous only) ---
+                # Read the caption as a fallback so document/media sends are
+                # evaluated on their caption, not a non-existent "text" field.
+                # Only enforce the check on text-primary tools OR when a caption
+                # is actually present — a file with no caption is a valid send,
+                # not an "empty message" (bug fixed 2026-07-13; false-positive
+                # blocked every document send since 2026-05-16).
                 tool_input = input_data.get("tool_input", {})
-                msg_text = tool_input.get("text", "") if isinstance(tool_input, dict) else ""
-                rejection = _check_outbound_quality(msg_text)
+                if isinstance(tool_input, dict):
+                    msg_text = tool_input.get("text", "") or tool_input.get("caption", "")
+                else:
+                    msg_text = ""
+                if tool_name in _TEXT_PRIMARY_TOOLS or msg_text.strip():
+                    rejection = _check_outbound_quality(msg_text)
+                else:
+                    rejection = None
                 if rejection:
                     log.warning(
                         "message_rejected",
