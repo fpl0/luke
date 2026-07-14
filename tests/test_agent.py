@@ -857,7 +857,6 @@ class TestRecallBeforeReference:
             "last time",
             "the other day",
             "previously",
-            "before",
             "when we talked",
             "you mentioned",
             "you said",
@@ -883,6 +882,22 @@ class TestRecallBeforeReference:
         from luke.agent import _references_past_events
 
         fresh = "Heads up — your 3pm meeting room just changed to Vega upstairs."
+        assert _references_past_events(fresh) is False
+
+    @pytest.mark.parametrize(
+        "fresh",
+        [
+            "One thing worth locking before Aug 10 while we're deep in prep.",
+            "Here's the part that comes before you walk in on day one.",
+            "Let's nail this down before your start date next month.",
+        ],
+    )
+    def test_references_past_events_false_for_forward_before(self, fresh: str) -> None:
+        # Regression: bare "before" used about the FUTURE must not trigger the
+        # recall gate. Two such false positives (14:01 + 00:56 on 2026-07-13)
+        # blocked legit forward-looking drafts. See reflexion 2026-07-14.
+        from luke.agent import _references_past_events
+
         assert _references_past_events(fresh) is False
 
     def test_references_past_events_false_for_empty(self) -> None:

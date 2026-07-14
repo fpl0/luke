@@ -279,7 +279,6 @@ _TEMPORAL_PHRASES: tuple[str, ...] = (
     "last time",
     "the other day",
     "previously",
-    "before",
     "when we talked",
     "you mentioned",
     "you said",
