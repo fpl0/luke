@@ -945,6 +945,18 @@ class TestRecallBeforeReference:
             tool_name = input_data["tool_name"]
             if tool_name in _RECALL_TOOLS:
                 recall_count["n"] += 1
+            # Background-work routing gate: harness Task sub-agents die on
+            # teardown and never self-report, so in a live (non-autonomous)
+            # turn they are blocked in favor of mcp__luke__delegate.
+            if tool_name == "Task" and not autonomous:
+                emitted.append({"event": "task_blocked_use_delegate"})
+                return {
+                    "decision": "block",
+                    "reason": (
+                        "Don't spawn a harness Task sub-agent in a live "
+                        "conversation — use mcp__luke__delegate instead."
+                    ),
+                }
             if tool_name in _SEND_TOOLS:
                 send_count["n"] += 1
                 if autonomous:
@@ -1038,6 +1050,40 @@ class TestRecallBeforeReference:
                 "tool_use_id": "tu_b",
             },
             "tu_b",
+            {},
+        )
+        assert result == {}
+        assert emitted == []
+
+    async def test_pre_tool_hook_blocks_task_in_live_conversation(self) -> None:
+        # Harness Task sub-agents die on teardown and never self-report — the
+        # "so?" silence Filipe flagged July 15. In a live turn they must be
+        # steered to mcp__luke__delegate.
+        hook, _send, _recall, emitted = self._build_hook(autonomous=False)
+        result = await hook(
+            {
+                "tool_name": "Task",
+                "tool_input": {"description": "research CarGurus financials"},
+                "tool_use_id": "tu_task",
+            },
+            "tu_task",
+            {},
+        )
+        assert result.get("decision") == "block"
+        assert "delegate" in result.get("reason", "").lower()
+        assert emitted and emitted[0]["event"] == "task_blocked_use_delegate"
+
+    async def test_pre_tool_hook_allows_task_when_autonomous(self) -> None:
+        # Autonomous runs (crons/deep work) have no interrupting message, so a
+        # within-turn Task is safe and must not be blocked.
+        hook, _send, _recall, emitted = self._build_hook(autonomous=True)
+        result = await hook(
+            {
+                "tool_name": "Task",
+                "tool_input": {"description": "parallel research fan-out"},
+                "tool_use_id": "tu_task2",
+            },
+            "tu_task2",
             {},
         )
         assert result == {}
@@ -1488,6 +1534,18 @@ class TestCriticGate:
             tool_name = input_data["tool_name"]
             if tool_name in _RECALL_TOOLS:
                 recall_count["n"] += 1
+            # Background-work routing gate: harness Task sub-agents die on
+            # teardown and never self-report, so in a live (non-autonomous)
+            # turn they are blocked in favor of mcp__luke__delegate.
+            if tool_name == "Task" and not autonomous:
+                emitted.append({"event": "task_blocked_use_delegate"})
+                return {
+                    "decision": "block",
+                    "reason": (
+                        "Don't spawn a harness Task sub-agent in a live "
+                        "conversation — use mcp__luke__delegate instead."
+                    ),
+                }
             if tool_name in _SEND_TOOLS:
                 send_count["n"] += 1
                 if autonomous:

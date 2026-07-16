@@ -342,6 +342,12 @@ _AGENT_SCHEDULE_TOOLS: frozenset[str] = frozenset(
     {
         "Task",
         "mcp__luke__schedule_task",
+        # delegate spawns a teardown-surviving background job that reports
+        # back on completion — it satisfies the overnight-commitment gate the
+        # same way Task does. Without this, steering background work to the
+        # correct tool (delegate) would trip the "committed but nothing
+        # scheduled" block. Added 2026-07-16.
+        "mcp__luke__delegate",
     }
 )
 
@@ -1620,6 +1626,32 @@ async def run_agent(
         # Track agent/schedule spawns for the overnight-commitment gate.
         if tool_name in _AGENT_SCHEDULE_TOOLS:
             work_scheduled_count["n"] += 1
+        # --- Background-work routing gate (interactive turns only) ---
+        # Harness `Task` sub-agents are children of the per-turn client: they
+        # die the moment Filipe sends his next message (the July 3 2026
+        # teardown bug) and never report back on their own — the repeated
+        # "so?" silence he flagged on July 15 ("run subagents and let me know
+        # when they are done!", "How will you enforce that?!"). The `delegate`
+        # MCP tool survives teardown AND always sends its result back. When
+        # Filipe is live (autonomous=False), force background work through it.
+        # Autonomous runs (crons/deep work) have no interrupting message, so a
+        # within-turn Task is safe there.
+        if tool_name == "Task" and not autonomous:
+            log.warning("task_blocked_use_delegate", chat_id=chat_id)
+            bus.emit("task_blocked_use_delegate", {"chat_id": chat_id})
+            return {
+                "decision": "block",
+                "reason": (
+                    "Don't spawn a harness Task sub-agent in a live "
+                    "conversation — it dies when Filipe sends his next message "
+                    "and never reports back, which is the 'so?' silence. Use "
+                    "mcp__luke__delegate(prompt=<self-contained>, "
+                    "trigger_msg_id=<the msg that asked>) instead: it survives "
+                    "teardown and always sends its result back. For a quick "
+                    "lookup that finishes this turn, just do it inline "
+                    "(WebSearch/WebFetch/Read) — no sub-agent needed."
+                ),
+            }
         if tool_name in _SEND_TOOLS:
             send_count["n"] += 1
             if send_count["n"] > effective_max_sends:
