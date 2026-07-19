@@ -116,9 +116,12 @@ async def _run_task(task: TaskRecord, bot: Bot) -> None:
         # never auto-forwarded to Telegram.  The agent must call send_message
         # (or another send tool) explicitly to reach the user.  A short
         # preamble tells the agent this fact so it doesn't rely on text output.
+        raw_prompt = task["prompt"]
+        if isinstance(raw_prompt, bytes):
+            raw_prompt = raw_prompt.decode("utf-8")
         prompt = (
             "[Scheduled task — text output is not delivered to the user. "
-            "Use send_message/reply to communicate.]\n\n" + task["prompt"]
+            "Use send_message/reply to communicate.]\n\n" + raw_prompt
         )
         result = await asyncio.wait_for(
             run_agent(
