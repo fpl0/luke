@@ -11,6 +11,7 @@ import pytest
 
 from luke import critic
 from luke.critic import (
+    _FRESHNESS_SYSTEM_PROMPT,
     CriticVerdict,
     _parse_verdict,
     check_freshness,
@@ -287,6 +288,43 @@ class TestCheckFreshness:
         )
         assert v.decision == "revise"
         assert "earlier" in v.reason
+
+    async def test_block_on_emotional_steamroll(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The Jul-24 miss: Filipe shares a raw last-day voice note and the
+        # queued structured Friday review lands on top of it. The freshness
+        # gate must block a structure-first draft over a live emotional share.
+        monkeypatch.setattr(
+            critic,
+            "query",
+            _make_fake_query(
+                "DECISION: block leads with structure over a raw emotional share"
+            ),
+        )
+        user_msgs = [
+            {
+                "sender_name": "Filipe",
+                "content": (
+                    "today was my last day, I dropped my laptop in the office "
+                    "already, said goodbye to everybody"
+                ),
+                "timestamp": "2026-07-24T16:21:00+00:00",
+            }
+        ]
+        v = await check_freshness(
+            "<b>Friday review</b>\nWhat you did this week / Mood + hours ...",
+            user_msgs,
+        )
+        assert v.decision == "block"
+        assert "emotional" in v.reason
+
+    def test_freshness_prompt_covers_emotional_steamroll(self) -> None:
+        # Lock the behavioral instruction in place so it can't silently regress.
+        p = _FRESHNESS_SYSTEM_PROMPT.lower()
+        assert "emotional" in p
+        assert "steamroll" in p
+        assert "structure" in p and "presence" in p
 
     async def test_network_error_fails_open(
         self, monkeypatch: pytest.MonkeyPatch

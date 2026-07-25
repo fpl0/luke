@@ -64,7 +64,19 @@ _FRESHNESS_SYSTEM_PROMPT = (
     "prepare for, attend, or act on that same event as though nothing "
     "changed is STALE. Block it. The user should never have to hold "
     "state that Luke should be holding; err toward blocking a nudge that "
-    "ignores a change the user just signalled."
+    "ignores a change the user just signalled.\n"
+    "Pay special attention to EMOTIONAL SHARES: if the user's most recent "
+    "message is a raw personal share — an ending, grief, a hard day, "
+    "nerves before something big, a vulnerable reflection, 'today was my "
+    "last day', 'I'm scared', a voice note about how they feel — then a "
+    "draft that leads with STRUCTURE (a weekly review, a digest, a "
+    "'what you did this week', a logistics summary, a scorecard, bullet "
+    "points, a plan) instead of reflecting back what they actually shared "
+    "is a STEAMROLL. Block it. The person needs presence before structure; "
+    "a template answering a feeling reads as 'no reflection on what I "
+    "said'. Reflect the human thing FIRST, then structure — never the "
+    "reverse. Err toward blocking a structured deliverable that lands on "
+    "top of a live emotional share."
 )
 
 
@@ -77,7 +89,8 @@ _FRESHNESS_USER_TEMPLATE = (
     '- "DECISION: pass" if the draft is coherent\n'
     '- "DECISION: revise <reason>" if it needs adjustment\n'
     '- "DECISION: block <reason>" if it\'s incompatible (e.g. contradicts '
-    "a retraction or answers a cancelled question)\n\n"
+    "a retraction, answers a cancelled question, or leads with structure "
+    "over a raw emotional share)\n\n"
     "The reason should be under 100 chars."
 )
 
