@@ -328,6 +328,70 @@ def _references_past_events(text: str) -> bool:
     return any(phrase in lowered for phrase in _TEMPORAL_PHRASES)
 
 
+# --- Explicit file-artifact request capture patterns ---
+# The single most-recurring autonomous failure (Jul 2026, ~5 reflexions):
+# Filipe asks for a concrete FILE deliverable ("give me a pdf", "make a doc",
+# "put together a brief") and the turn ends with only topic-adjacent chatter —
+# either the file was never built, or it was built on disk but never SENT.
+# Every prior corrective was advisory and never fired in a busy multi-thread
+# window. The structural fix (dream-explicit-request-is-the-flinchs-most-
+# dangerous-disguise, dream-completion-signal-must-measure-receipt-not-
+# production): a forced Stop-hook gate that measures the FAR end of the pipe —
+# did an artifact actually ship, or a durable handle get created — before the
+# turn is allowed to close. Deliberately targets FILE artifacts only (pdf/doc/
+# brief/etc.), NOT inline conversational drafts ("draft an email"), so it fires
+# on exactly the recurring class without tripping normal chat.
+_ARTIFACT_REQUEST_VERBS = re.compile(
+    r"(?i)\b("
+    r"give me|send me|make me|build me|write me|get me|"
+    r"i need|i want|i'?d like|can you (?:make|build|create|put|do|prepare|write|send|generate)|"
+    r"could you (?:make|build|create|put|do|prepare|write|send|generate)|"
+    r"put together|prepare|generate|create|build me|draft me"
+    r")\b"
+)
+_ARTIFACT_REQUEST_NOUNS = re.compile(
+    r"(?i)\b("
+    r"pdf|docx?|document|spreadsheet|csv|excel|"
+    r"report|brief|write-?up|deck|slides|presentation|"
+    r"one-?pager|cheat\s?sheet|file|doc"
+    r")\b"
+)
+
+
+def _requests_file_artifact(text: str) -> bool:
+    """Heuristic: does an inbound message explicitly ask for a FILE deliverable?
+
+    Requires BOTH a request verb ("give me", "put together", "can you make")
+    AND a file-artifact noun ("pdf", "doc", "brief", "report", "spreadsheet").
+    Deliberately excludes inline conversational drafts ("draft an email",
+    "write me a message") — those are satisfied by a plain send_message and
+    are NOT the failure class. Conservative like ``_commits_future_work``:
+    both anchors must be present; short texts (< 12 chars) are skipped.
+
+    Reference: reflexion-built-but-not-sent-bar-brief,
+    reflexion-dropped-explicit-request-visa-pdf, insight-artifact-requests-
+    need-immediate-tasking.
+    """
+    if not text or len(text) < 12:
+        return False
+    return bool(_ARTIFACT_REQUEST_VERBS.search(text)) and bool(
+        _ARTIFACT_REQUEST_NOUNS.search(text)
+    )
+
+
+# Send tools that deliver an actual FILE/attachment to Filipe. Distinct from a
+# plain send_message: the recurring failure is a topic-adjacent send_message
+# that discusses the artifact while the file itself never ships. Only these
+# (or a durable handle via _AGENT_SCHEDULE_TOOLS) satisfy the artifact gate.
+_ARTIFACT_SEND_TOOLS: frozenset[str] = frozenset(
+    {
+        "mcp__luke__send_document",
+        "mcp__luke__send_photo",
+        "mcp__luke__send_video",
+    }
+)
+
+
 # Tools that count as "recall" for the recall-before-reference gate
 _RECALL_TOOLS: frozenset[str] = frozenset(
     {
@@ -1373,14 +1437,63 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
 # ---------------------------------------------------------------------------
 
 
-def _build_stop_hook(tool_count: dict[str, int], autonomous: bool) -> HookCallback:
-    """Factory returning a Stop hook closure with access to the run's tool count."""
+def _build_stop_hook(
+    tool_count: dict[str, int],
+    autonomous: bool,
+    *,
+    artifact_requested: bool = False,
+    artifact_delivered_count: dict[str, int] | None = None,
+    work_scheduled_count: dict[str, int] | None = None,
+    artifact_gate_fired: dict[str, int] | None = None,
+) -> HookCallback:
+    """Factory returning a Stop hook closure with access to the run's tool count.
+
+    When ``artifact_requested`` is set (the inbound message explicitly asked for
+    a FILE deliverable), the hook enforces a forced-capture gate: the turn may
+    not close until either the artifact actually shipped
+    (``artifact_delivered_count`` > 0) or a durable handle was created
+    (``work_scheduled_count`` > 0). This measures the FAR end of the pipe —
+    receipt, not production — and fires at most ONCE per turn to avoid loops.
+    """
 
     async def _stop_hook(
         input_data: StopHookInput,
         tool_use_id: str | None,
         context: HookContext,
     ) -> SyncHookJSONOutput:
+        # --- Forced artifact-request capture gate (interactive turns only) ---
+        # The most-recurring drop: Filipe asks for a file ("give me a pdf") and
+        # the turn ends with only topic-adjacent chatter. Block the stop once,
+        # forcing delivery or a durable task. Fires at most once (artifact_gate_
+        # fired) so a still-uncompleted turn can't trap the agent in a loop.
+        if (
+            not autonomous
+            and artifact_requested
+            and artifact_gate_fired is not None
+            and artifact_gate_fired["n"] == 0
+            and (artifact_delivered_count or {}).get("n", 0) == 0
+            and (work_scheduled_count or {}).get("n", 0) == 0
+        ):
+            artifact_gate_fired["n"] = 1
+            log.warning("artifact_gate_blocked_stop", tool_calls=tool_count["n"])
+            bus.emit("artifact_gate_blocked_stop", {"tool_calls": tool_count["n"]})
+            return {
+                "decision": "block",
+                "reason": (
+                    "You asked-for-artifact check: Filipe explicitly requested a "
+                    "FILE deliverable this turn (a pdf / doc / brief / report / "
+                    "spreadsheet), but no file was sent (send_document/send_photo/"
+                    "send_video) and no durable handle was created "
+                    "(delegate / schedule_task / Task). A topic-adjacent message "
+                    "is NOT delivery — this is the built-but-not-sent / "
+                    "adjacent-helpfulness drop. Before you stop: either (a) build "
+                    "and SEND the file now via send_document, or (b) if it "
+                    "genuinely can't be finished this turn, create a durable task "
+                    "(mcp__luke__delegate or schedule_task) capturing the exact "
+                    "request so it can't evaporate. Do one of these now."
+                ),
+            }
+
         skill_prompt = ""
         if not autonomous and tool_count["n"] >= _AUTO_SKILL_THRESHOLD:
             skill_prompt = (
@@ -1603,7 +1716,14 @@ async def run_agent(
     send_count = {"n": 0}
     recall_count = {"n": 0}  # incremented when recall/recall_conversation runs
     work_scheduled_count = {"n": 0}  # incremented when Task/schedule_task runs
+    artifact_delivered_count = {"n": 0}  # incremented when a file/attachment ships
+    artifact_gate_fired = {"n": 0}  # one-shot guard for the Stop-hook artifact gate
     tool_count: dict[str, int] = {"n": 0}
+    # Detect an explicit inbound FILE-artifact request so the Stop hook can
+    # enforce delivery-or-durable-handle before the turn closes.
+    artifact_requested = not autonomous and _requests_file_artifact(
+        prompt_text_for_context
+    )
     tool_start_times: dict[str, float] = {}  # tool_use_id -> monotonic start
     subagent_start_times: dict[str, float] = {}  # agent_id -> monotonic start
     effective_max_sends = max_sends if max_sends is not None else settings.max_sends_per_run
@@ -1626,6 +1746,9 @@ async def run_agent(
         # Track agent/schedule spawns for the overnight-commitment gate.
         if tool_name in _AGENT_SCHEDULE_TOOLS:
             work_scheduled_count["n"] += 1
+        # Track actual file/attachment deliveries for the artifact-request gate.
+        if tool_name in _ARTIFACT_SEND_TOOLS:
+            artifact_delivered_count["n"] += 1
         # --- Background-work routing gate (interactive turns only) ---
         # Harness `Task` sub-agents are children of the per-turn client: they
         # die the moment Filipe sends his next message (the July 3 2026
@@ -1942,7 +2065,20 @@ async def run_agent(
         return {}
 
     hooks: dict[HookEvent, list[HookMatcher]] = {
-        "Stop": [HookMatcher(hooks=[_build_stop_hook(tool_count, autonomous)])],
+        "Stop": [
+            HookMatcher(
+                hooks=[
+                    _build_stop_hook(
+                        tool_count,
+                        autonomous,
+                        artifact_requested=artifact_requested,
+                        artifact_delivered_count=artifact_delivered_count,
+                        work_scheduled_count=work_scheduled_count,
+                        artifact_gate_fired=artifact_gate_fired,
+                    )
+                ]
+            )
+        ],
         "PreToolUse": [HookMatcher(hooks=[cast(HookCallback, _pre_tool_hook)])],
         "PostToolUse": [HookMatcher(hooks=[cast(HookCallback, _post_tool_hook)])],
         "PostToolUseFailure": [HookMatcher(hooks=[cast(HookCallback, _post_tool_failure_hook)])],

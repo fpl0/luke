@@ -18,6 +18,7 @@ from luke.agent import (
     AgentResult,
     _build_stop_hook,
     _ok,
+    _requests_file_artifact,
     send_long_message,
 )
 from luke.config import settings
@@ -169,6 +170,109 @@ class TestBuildStopHook:
     async def test_no_skill_prompt_for_autonomous_runs(self) -> None:
         result = await self._call(_AUTO_SKILL_THRESHOLD + 10, True)
         assert "Skill extraction" not in result["systemMessage"]
+
+
+# ---------------------------------------------------------------------------
+# Artifact-request capture gate
+# ---------------------------------------------------------------------------
+
+
+class TestRequestsFileArtifact:
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "Give me a pdf for the visa stuff",
+            "can you make me a doc with all the data",
+            "put together a brief on the interview rounds",
+            "build me a spreadsheet of the options",
+            "I need a one-pager on this",
+            "could you generate a csv",
+            "send me the report when it is done",
+        ],
+    )
+    def test_true_positives(self, text: str) -> None:
+        assert _requests_file_artifact(text) is True
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "draft me an email to Prerna",  # inline draft, not a file
+            "write me a message for the team",  # inline
+            "give me a second",
+            "I need a break honestly",
+            "how was your day",
+            "I read the document you sent, thanks",  # past ref, not a request
+            "thanks for the brief chat earlier",  # 'brief' adjective
+            "lets keep it brief",
+            "",
+        ],
+    )
+    def test_true_negatives(self, text: str) -> None:
+        assert _requests_file_artifact(text) is False
+
+
+class TestArtifactGate:
+    def _hook(
+        self,
+        *,
+        requested: bool,
+        delivered: int = 0,
+        scheduled: int = 0,
+        fired: int = 0,
+        autonomous: bool = False,
+    ):
+        return _build_stop_hook(
+            {"n": 3},
+            autonomous,
+            artifact_requested=requested,
+            artifact_delivered_count={"n": delivered},
+            work_scheduled_count={"n": scheduled},
+            artifact_gate_fired={"n": fired},
+        )
+
+    async def _run(self, hook) -> SyncHookJSONOutput:
+        return cast(SyncHookJSONOutput, await hook(MagicMock(), None, MagicMock()))
+
+    async def test_blocks_when_requested_and_nothing_shipped(self) -> None:
+        result = await self._run(self._hook(requested=True))
+        assert result.get("decision") == "block"
+        assert "send_document" in result["reason"]
+
+    async def test_passes_when_artifact_delivered(self) -> None:
+        result = await self._run(self._hook(requested=True, delivered=1))
+        assert result.get("decision") != "block"
+        assert "systemMessage" in result
+
+    async def test_passes_when_durable_handle_created(self) -> None:
+        result = await self._run(self._hook(requested=True, scheduled=1))
+        assert result.get("decision") != "block"
+        assert "systemMessage" in result
+
+    async def test_one_shot_does_not_refire(self) -> None:
+        # A dropped turn: block once, flip the guard, then never block again
+        # so the agent can't be trapped in a Stop loop.
+        fired = {"n": 0}
+        hook = _build_stop_hook(
+            {"n": 3},
+            False,
+            artifact_requested=True,
+            artifact_delivered_count={"n": 0},
+            work_scheduled_count={"n": 0},
+            artifact_gate_fired=fired,
+        )
+        first = await self._run(hook)
+        assert first.get("decision") == "block"
+        assert fired["n"] == 1
+        second = await self._run(hook)
+        assert second.get("decision") != "block"
+
+    async def test_does_not_fire_when_not_requested(self) -> None:
+        result = await self._run(self._hook(requested=False))
+        assert result.get("decision") != "block"
+
+    async def test_does_not_fire_for_autonomous_runs(self) -> None:
+        result = await self._run(self._hook(requested=True, autonomous=True))
+        assert result.get("decision") != "block"
 
 
 # ---------------------------------------------------------------------------
