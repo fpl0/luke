@@ -19,6 +19,7 @@ from luke.agent import (
     _build_stop_hook,
     _ok,
     _requests_file_artifact,
+    _requests_source_read,
     send_long_message,
 )
 from luke.config import settings
@@ -259,6 +260,100 @@ class TestArtifactGate:
             artifact_delivered_count={"n": 0},
             work_scheduled_count={"n": 0},
             artifact_gate_fired=fired,
+        )
+        first = await self._run(hook)
+        assert first.get("decision") == "block"
+        assert fired["n"] == 1
+        second = await self._run(hook)
+        assert second.get("decision") != "block"
+
+    async def test_does_not_fire_when_not_requested(self) -> None:
+        result = await self._run(self._hook(requested=False))
+        assert result.get("decision") != "block"
+
+    async def test_does_not_fire_for_autonomous_runs(self) -> None:
+        result = await self._run(self._hook(requested=True, autonomous=True))
+        assert result.get("decision") != "block"
+
+
+# ---------------------------------------------------------------------------
+# Primary-source read gate
+# ---------------------------------------------------------------------------
+
+
+class TestRequestsSourceRead:
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "read the email from Prerna and tell me what she means",
+            "can you check the doc I shared",
+            "what does that pdf say about the FE round",
+            "look at the thread and summarise it",
+            "go through the letter before you reply",
+            "did you even read the email?",
+            "have you seen the attachment",
+            "pull up the report and check the numbers",
+            "read /Users/filipelm/Luke/workspace/foo.pdf",
+        ],
+    )
+    def test_true_positives(self, text: str) -> None:
+        assert _requests_source_read(text) is True
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "thanks for the email, really helpful",  # past ref, no read-verb
+            "how was your day",
+            "give me a pdf of the visa stuff",  # artifact REQUEST, not a read
+            "let's chat about the interview",
+            "I already read it, all good",  # no source-noun
+            "check in with me later tonight",  # 'check' but no source-noun
+            "open to grabbing dinner?",  # 'open' but no source-noun
+            "",
+        ],
+    )
+    def test_true_negatives(self, text: str) -> None:
+        assert _requests_source_read(text) is False
+
+
+class TestSourceReadGate:
+    def _hook(
+        self,
+        *,
+        requested: bool,
+        read: int = 0,
+        fired: int = 0,
+        autonomous: bool = False,
+    ):
+        return _build_stop_hook(
+            {"n": 3},
+            autonomous,
+            source_read_requested=requested,
+            source_read_count={"n": read},
+            source_gate_fired={"n": fired},
+        )
+
+    async def _run(self, hook) -> SyncHookJSONOutput:
+        return cast(SyncHookJSONOutput, await hook(MagicMock(), None, MagicMock()))
+
+    async def test_blocks_when_requested_and_nothing_read(self) -> None:
+        result = await self._run(self._hook(requested=True))
+        assert result.get("decision") == "block"
+        assert "primary source" in result["reason"].lower()
+
+    async def test_passes_when_source_read(self) -> None:
+        result = await self._run(self._hook(requested=True, read=1))
+        assert result.get("decision") != "block"
+        assert "systemMessage" in result
+
+    async def test_one_shot_does_not_refire(self) -> None:
+        fired = {"n": 0}
+        hook = _build_stop_hook(
+            {"n": 3},
+            False,
+            source_read_requested=True,
+            source_read_count={"n": 0},
+            source_gate_fired=fired,
         )
         first = await self._run(hook)
         assert first.get("decision") == "block"

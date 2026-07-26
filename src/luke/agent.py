@@ -392,6 +392,69 @@ _ARTIFACT_SEND_TOOLS: frozenset[str] = frozenset(
 )
 
 
+# --- Primary-source read gate patterns ---
+# The second-most-recurring autonomous failure (Jul 2026, 4 reflexions incl.
+# reflexion-primary-source-regression-prerna): Filipe points me at a source he
+# KNOWS I can open — "read the email", "check the doc", "what does that pdf say"
+# — and I answer from my own prior summary of it instead of reading it. In the
+# Prerna case I got progressively wrong across 5 exchanges and had to be told
+# "read the fucking email" before I opened it. Every prior corrective was an
+# advisory insight that never fired mid-turn. The structural fix mirrors the
+# artifact gate: when the inbound message asks me to consult a readable source,
+# the turn may not close until I actually called a read/fetch tool this turn.
+# Deliberately conservative: requires BOTH a read-verb AND a source-noun (or an
+# explicit file path), so casual mentions ("thanks for the email") don't trip it.
+_SOURCE_READ_VERBS = re.compile(
+    r"(?i)(?:"
+    r"\bread\b|\bre-?read\b|\breread\b|\bcheck\b|\bopen\b|\breview\b|"
+    r"look (?:at|through|over|into)|take a look|pull up|scroll through|"
+    r"go through|go read|did you (?:even )?read|have you (?:read|seen)|"
+    r"what does .{0,40}? say|what'?s in\b|see what .{0,40}? say"
+    r")"
+)
+_SOURCE_READ_NOUNS = re.compile(
+    r"(?i)(?:"
+    r"\be-?mails?\b|\binbox\b|\bthreads?\b|\bmessages?\b|\bdms?\b|"
+    r"\bdocs?\b|\bdocuments?\b|\bpdfs?\b|\battachments?\b|\bfiles?\b|"
+    r"\bletters?\b|\bmemos?\b|\breports?\b|\bbriefs?\b|\btranscripts?\b|"
+    r"\bspreadsheets?\b|\blinks?\b|\barticles?\b|\bpages?\b|\bposts?\b|\bnotes?\b|"
+    r"/[\w./-]+\.(?:pdf|docx?|md|txt|csv|xlsx?)|\.(?:pdf|docx?|md|txt|csv|xlsx?)\b"
+    r")"
+)
+
+
+def _requests_source_read(text: str) -> bool:
+    """Heuristic: does an inbound message ask me to consult a readable SOURCE?
+
+    Requires BOTH a read-verb ("read", "check", "look at", "what does X say")
+    AND a source-noun ("email", "doc", "pdf", "thread", a file path). The
+    failure class is answering about a specific accessible document from my own
+    summary instead of opening it (reflexion-primary-source-regression-prerna,
+    reflexion-advise-on-unreadable-document-name-the-gap). Conservative like
+    ``_requests_file_artifact``: both anchors required; short texts skipped.
+    """
+    if not text or len(text) < 12:
+        return False
+    return bool(_SOURCE_READ_VERBS.search(text)) and bool(
+        _SOURCE_READ_NOUNS.search(text)
+    )
+
+
+# Tools that satisfy the primary-source gate: they actually pull CONTENT from a
+# document, file, or URL. Deliberately EXCLUDES Bash (too broad — nearly every
+# turn runs it, which would neuter the gate) and recall/recall_conversation
+# (memory is the WRONG substitute — reaching for my own summary instead of the
+# source is the exact failure this gate exists to stop).
+_SOURCE_READ_TOOLS: frozenset[str] = frozenset(
+    {
+        "Read",
+        "Grep",
+        "WebFetch",
+        "mcp__luke__browse",
+    }
+)
+
+
 # Tools that count as "recall" for the recall-before-reference gate
 _RECALL_TOOLS: frozenset[str] = frozenset(
     {
@@ -1445,6 +1508,9 @@ def _build_stop_hook(
     artifact_delivered_count: dict[str, int] | None = None,
     work_scheduled_count: dict[str, int] | None = None,
     artifact_gate_fired: dict[str, int] | None = None,
+    source_read_requested: bool = False,
+    source_read_count: dict[str, int] | None = None,
+    source_gate_fired: dict[str, int] | None = None,
 ) -> HookCallback:
     """Factory returning a Stop hook closure with access to the run's tool count.
 
@@ -1454,6 +1520,11 @@ def _build_stop_hook(
     (``artifact_delivered_count`` > 0) or a durable handle was created
     (``work_scheduled_count`` > 0). This measures the FAR end of the pipe —
     receipt, not production — and fires at most ONCE per turn to avoid loops.
+
+    When ``source_read_requested`` is set (the inbound message asked me to
+    consult a readable SOURCE — "read the email", "check the doc"), the hook
+    enforces a primary-source gate: the turn may not close until a read/fetch
+    tool actually ran this turn (``source_read_count`` > 0). Also one-shot.
     """
 
     async def _stop_hook(
@@ -1491,6 +1562,39 @@ def _build_stop_hook(
                     "genuinely can't be finished this turn, create a durable task "
                     "(mcp__luke__delegate or schedule_task) capturing the exact "
                     "request so it can't evaporate. Do one of these now."
+                ),
+            }
+
+        # --- Primary-source read gate (interactive turns only) ---
+        # Filipe pointed me at a readable source ("read the email", "check the
+        # doc") and the turn is about to close without any read/fetch tool
+        # having run — i.e. I'm answering from my own summary, the exact Prerna
+        # failure. Block once (source_gate_fired) so a genuinely-unreadable
+        # source can't trap the agent in a Stop loop.
+        if (
+            not autonomous
+            and source_read_requested
+            and source_gate_fired is not None
+            and source_gate_fired["n"] == 0
+            and (source_read_count or {}).get("n", 0) == 0
+        ):
+            source_gate_fired["n"] = 1
+            log.warning("source_read_gate_blocked_stop", tool_calls=tool_count["n"])
+            bus.emit("source_read_gate_blocked_stop", {"tool_calls": tool_count["n"]})
+            return {
+                "decision": "block",
+                "reason": (
+                    "Primary-source check: Filipe asked you to consult a specific "
+                    "readable source this turn (an email / doc / pdf / thread / "
+                    "file), but you did NOT open it — no Read / Grep / WebFetch / "
+                    "browse ran. Answering from your own prior summary instead of "
+                    "the source is the recurring Prerna failure ('read the fucking "
+                    "email'). Before you stop: actually open the source now (Read "
+                    "the file, WebFetch/browse the link, Grep the thread) and "
+                    "answer from what it says. If the source is genuinely NOT "
+                    "accessible to you, do not guess — say so plainly and name the "
+                    "access gap. Recall of your own memory does NOT satisfy this; "
+                    "go to the primary source."
                 ),
             }
 
@@ -1718,10 +1822,17 @@ async def run_agent(
     work_scheduled_count = {"n": 0}  # incremented when Task/schedule_task runs
     artifact_delivered_count = {"n": 0}  # incremented when a file/attachment ships
     artifact_gate_fired = {"n": 0}  # one-shot guard for the Stop-hook artifact gate
+    source_read_count = {"n": 0}  # incremented when a read/fetch tool runs
+    source_gate_fired = {"n": 0}  # one-shot guard for the Stop-hook source gate
     tool_count: dict[str, int] = {"n": 0}
     # Detect an explicit inbound FILE-artifact request so the Stop hook can
     # enforce delivery-or-durable-handle before the turn closes.
     artifact_requested = not autonomous and _requests_file_artifact(
+        prompt_text_for_context
+    )
+    # Detect an explicit inbound request to consult a readable SOURCE so the
+    # Stop hook can enforce an actual read before the turn closes.
+    source_read_requested = not autonomous and _requests_source_read(
         prompt_text_for_context
     )
     tool_start_times: dict[str, float] = {}  # tool_use_id -> monotonic start
@@ -1749,6 +1860,9 @@ async def run_agent(
         # Track actual file/attachment deliveries for the artifact-request gate.
         if tool_name in _ARTIFACT_SEND_TOOLS:
             artifact_delivered_count["n"] += 1
+        # Track read/fetch calls for the primary-source gate.
+        if tool_name in _SOURCE_READ_TOOLS:
+            source_read_count["n"] += 1
         # --- Background-work routing gate (interactive turns only) ---
         # Harness `Task` sub-agents are children of the per-turn client: they
         # die the moment Filipe sends his next message (the July 3 2026
@@ -2075,6 +2189,9 @@ async def run_agent(
                         artifact_delivered_count=artifact_delivered_count,
                         work_scheduled_count=work_scheduled_count,
                         artifact_gate_fired=artifact_gate_fired,
+                        source_read_requested=source_read_requested,
+                        source_read_count=source_read_count,
+                        source_gate_fired=source_gate_fired,
                     )
                 ]
             )
