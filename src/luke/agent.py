@@ -479,6 +479,99 @@ _AGENT_SCHEDULE_TOOLS: frozenset[str] = frozenset(
 )
 
 
+# --- Scheduled-task duplicate gate ---
+# The #2 recurring autonomous failure (scheduling-cron cluster, 18 advisory
+# correctives incl. proc-scheduled-task-dedup, insight-scheduled-send-state-
+# drift): an auto-staged flow schedules a reminder for an event, then a later
+# turn — having lost track of the first — schedules a SECOND task for the same
+# deliverable. Filipe then gets the same nudge twice (the Jul 25 2026 Prerna-
+# Monday-brief oversend; two live "visa interview TOMORROW" tasks firing 18:00
+# AND 20:00 the day before). Every prior corrective was an advisory note that
+# never fired at schedule time. The structural fix: before a schedule_task is
+# allowed, check the active task list for a near-duplicate — same schedule kind,
+# firing close in time (for `once`) or on the identical cadence (cron/interval),
+# with high prompt word-overlap — and block, steering to reuse/update the
+# existing task. Conservative: requires BOTH strong text overlap AND time/cadence
+# proximity, so genuinely distinct same-day reminders are not caught.
+# Reference: proc-scheduled-task-dedup, insight-scheduled-send-state-drift.
+_TASK_STOPWORDS: frozenset[str] = frozenset(
+    {
+        "the", "a", "an", "and", "or", "but", "for", "with", "his", "her", "him",
+        "that", "this", "these", "those", "then", "than", "into", "onto", "from",
+        "filipe", "before", "after", "ahead", "about", "your", "yours", "them",
+        "will", "would", "should", "could", "have", "has", "had", "not", "you",
+        "remind", "reminder", "nudge", "check", "run", "send", "ask", "note",
+        "once", "cron", "interval", "task", "schedule", "scheduled", "when",
+        "day", "morning", "evening", "afternoon", "night", "today", "tomorrow",
+    }
+)
+
+
+def _task_sig_words(text: str) -> set[str]:
+    """Significant lowercase word set of a task prompt (for overlap scoring)."""
+    words = re.findall(r"[a-z0-9]{4,}", (text or "").lower())
+    return {w for w in words if w not in _TASK_STOPWORDS}
+
+
+def _task_overlap(a: str, b: str) -> float:
+    """Containment overlap of two task prompts over significant words.
+
+    Uses the overlap (containment) coefficient |A∩B| / min(|A|,|B|) rather than
+    Jaccard: task prompts for the SAME deliverable often differ wildly in length
+    (a terse restage vs a verbose original), which sinks Jaccard well below any
+    useful threshold (real duplicate visa reminders scored 0.11 Jaccard but 0.88
+    containment). Both prompts must carry >= 4 significant words, so two short
+    unrelated reminders can't spuriously hit a high ratio.
+    """
+    sa, sb = _task_sig_words(a), _task_sig_words(b)
+    if len(sa) < 4 or len(sb) < 4:
+        return 0.0
+    return len(sa & sb) / min(len(sa), len(sb))
+
+
+def _duplicate_pending_task(
+    tool_input: dict[str, Any], existing: list[dict[str, Any]]
+) -> dict[str, Any] | None:
+    """Return an active task that the new schedule_task would duplicate, else None.
+
+    A duplicate requires the SAME schedule_type, high prompt word-overlap
+    (>= 0.7 containment on significant words), AND temporal proximity:
+      - once:            both fire within 8 hours of each other
+      - cron/interval:   identical schedule_value (same cadence)
+    """
+    new_prompt = str(tool_input.get("prompt", "") or "")
+    new_type = str(tool_input.get("schedule_type", "") or "")
+    new_value = str(tool_input.get("schedule_value", "") or "")
+    if len(new_prompt) < 12 or not new_type:
+        return None
+    new_dt: datetime | None = None
+    if new_type == "once":
+        try:
+            new_dt = datetime.fromisoformat(new_value)
+        except ValueError:
+            new_dt = None
+    for t in existing:
+        if t.get("status") not in ("active", "pending", "scheduled"):
+            continue
+        if t.get("schedule_type") != new_type:
+            continue
+        if _task_overlap(new_prompt, str(t.get("prompt", ""))) < 0.7:
+            continue
+        if new_type == "once":
+            if new_dt is None:
+                continue
+            try:
+                other_dt = datetime.fromisoformat(str(t.get("schedule_value", "")))
+            except ValueError:
+                continue
+            if abs((new_dt - other_dt).total_seconds()) <= 8 * 3600:
+                return t
+        else:
+            if new_value and new_value == str(t.get("schedule_value", "")):
+                return t
+    return None
+
+
 _AUTO_SKILL_THRESHOLD: int = 5  # tool calls to trigger procedure extraction in stop hook
 
 # Active client registry — enables external interruption of running agents
@@ -1889,6 +1982,43 @@ async def run_agent(
                     "(WebSearch/WebFetch/Read) — no sub-agent needed."
                 ),
             }
+        # --- Scheduled-task duplicate gate (all runs) ---
+        # Block a schedule_task that would double-book an existing active task
+        # for the same deliverable (see _duplicate_pending_task). Steers to
+        # reuse/update the existing task instead of stacking a second nudge.
+        if tool_name == "mcp__luke__schedule_task":
+            tool_input = input_data.get("tool_input", {})
+            if isinstance(tool_input, dict):
+                try:
+                    dup = _duplicate_pending_task(tool_input, db.list_tasks(chat_id))
+                except Exception as e:  # never let the gate crash a schedule
+                    log.warning("task_dedup_gate_error", error=str(e))
+                    dup = None
+                if dup is not None:
+                    log.warning(
+                        "duplicate_task_blocked",
+                        chat_id=chat_id,
+                        existing_id=dup.get("id"),
+                        new_preview=str(tool_input.get("prompt", ""))[:80],
+                    )
+                    bus.emit("duplicate_task_blocked", {
+                        "existing_id": dup.get("id"),
+                        "existing_value": dup.get("schedule_value"),
+                        "new_preview": str(tool_input.get("prompt", ""))[:100],
+                    })
+                    return {
+                        "decision": "block",
+                        "reason": (
+                            "Near-duplicate of an existing active task "
+                            f"(id={dup.get('id')}, fires {dup.get('schedule_value')}): "
+                            f"\"{str(dup.get('prompt',''))[:80]}\". Filipe would get "
+                            "the same nudge twice. Don't stack a second task — "
+                            "either leave the existing one, or delete_task(it) and "
+                            "reschedule once with the corrected time/content. "
+                            "(proc-scheduled-task-dedup)"
+                        ),
+                    }
+
         if tool_name in _SEND_TOOLS:
             send_count["n"] += 1
             if send_count["n"] > effective_max_sends:

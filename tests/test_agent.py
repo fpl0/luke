@@ -17,9 +17,11 @@ from luke.agent import (
     _VALID_MEMORY_TYPES,
     AgentResult,
     _build_stop_hook,
+    _duplicate_pending_task,
     _ok,
     _requests_file_artifact,
     _requests_source_read,
+    _task_overlap,
     send_long_message,
 )
 from luke.config import settings
@@ -2321,3 +2323,128 @@ class TestCleanStreamingText:
 
         text = "A <internal>done</internal> B <internal>still going"
         assert _clean_streaming_text(text) == "A  B"
+
+
+# ---------------------------------------------------------------------------
+# Scheduled-task duplicate gate
+# ---------------------------------------------------------------------------
+
+
+class TestTaskOverlap:
+    def test_same_deliverable_high_overlap(self) -> None:
+        # Realistic re-stage: same core noun phrase, minor tail divergence.
+        a = "Send Filipe the Prerna Monday negotiation call brief with talking points"
+        b = "Send Filipe the Prerna Monday negotiation brief and talking points tonight"
+        assert _task_overlap(a, b) >= 0.7
+
+    def test_length_asymmetric_duplicate_still_caught(self) -> None:
+        # Terse restage vs verbose original — containment beats Jaccard here.
+        short = "visa interview reminder tomorrow morning Ballsbridge consulate"
+        long = (
+            "Remind Filipe the US B1 visa interview is tomorrow at the "
+            "Ballsbridge consulate; bring DS-160 confirmation and passport"
+        )
+        assert _task_overlap(short, long) >= 0.7
+
+    def test_unrelated_prompts_low_overlap(self) -> None:
+        a = "Remind Filipe to book the dentist appointment next week"
+        b = "Check the CarGurus offer stock-vesting schedule details"
+        assert _task_overlap(a, b) < 0.7
+
+    def test_short_prompts_return_zero(self) -> None:
+        # Fewer than 4 significant words on either side -> not comparable.
+        assert _task_overlap("remind me tonight", "remind me later") == 0.0
+
+
+class TestDuplicatePendingTask:
+    def _existing(self, **over: Any) -> dict[str, Any]:
+        base: dict[str, Any] = {
+            "id": "abc123",
+            "chat_id": "1",
+            "prompt": "Send Filipe the Prerna Monday-call negotiation brief tonight",
+            "schedule_type": "once",
+            "schedule_value": "2026-07-26T19:00:00+00:00",
+            "status": "active",
+            "last_run": None,
+            "created_at": "2026-07-25T00:00:00+00:00",
+        }
+        base.update(over)
+        return base
+
+    def test_once_near_duplicate_within_window_blocked(self) -> None:
+        new = {
+            # Re-stage of the same brief; shares the core noun phrase.
+            "prompt": "Send Filipe the Prerna Monday negotiation call brief with talking points",
+            "schedule_type": "once",
+            "schedule_value": "2026-07-26T20:00:00+00:00",  # 1h later
+        }
+        dup = _duplicate_pending_task(new, [self._existing()])
+        assert dup is not None and dup["id"] == "abc123"
+
+    def test_once_same_deliverable_far_apart_allowed(self) -> None:
+        new = {
+            "prompt": "Deliver the Prerna call negotiation brief to Filipe for dinner",
+            "schedule_type": "once",
+            "schedule_value": "2026-07-27T09:00:00+00:00",  # ~14h later, > 8h
+        }
+        assert _duplicate_pending_task(new, [self._existing()]) is None
+
+    def test_different_schedule_type_allowed(self) -> None:
+        new = {
+            "prompt": "Send Filipe the Prerna Monday-call negotiation brief tonight",
+            "schedule_type": "cron",
+            "schedule_value": "0 19 * * *",
+        }
+        assert _duplicate_pending_task(new, [self._existing()]) is None
+
+    def test_low_text_overlap_allowed(self) -> None:
+        new = {
+            "prompt": "Remind Filipe about the dentist appointment this evening",
+            "schedule_type": "once",
+            "schedule_value": "2026-07-26T19:30:00+00:00",
+        }
+        assert _duplicate_pending_task(new, [self._existing()]) is None
+
+    def test_completed_task_ignored(self) -> None:
+        new = {
+            "prompt": "Deliver the Prerna call negotiation brief to Filipe for dinner",
+            "schedule_type": "once",
+            "schedule_value": "2026-07-26T20:00:00+00:00",
+        }
+        done = self._existing(status="completed")
+        assert _duplicate_pending_task(new, [done]) is None
+
+    def test_cron_identical_cadence_blocked(self) -> None:
+        existing = self._existing(
+            schedule_type="cron",
+            schedule_value="0 9 * * 1",
+            prompt="Weekly Monday review nudge for Filipe strategic priorities",
+        )
+        new = {
+            "prompt": "Monday weekly review nudge covering Filipe strategic priorities",
+            "schedule_type": "cron",
+            "schedule_value": "0 9 * * 1",
+        }
+        dup = _duplicate_pending_task(new, [existing])
+        assert dup is not None and dup["id"] == "abc123"
+
+    def test_cron_different_cadence_allowed(self) -> None:
+        existing = self._existing(
+            schedule_type="cron",
+            schedule_value="0 9 * * 1",
+            prompt="Weekly Monday review nudge for Filipe strategic priorities",
+        )
+        new = {
+            "prompt": "Monday weekly review nudge covering Filipe strategic priorities",
+            "schedule_type": "cron",
+            "schedule_value": "0 21 * * 5",  # different cadence
+        }
+        assert _duplicate_pending_task(new, [existing]) is None
+
+    def test_short_new_prompt_skipped(self) -> None:
+        new = {
+            "prompt": "ping me",
+            "schedule_type": "once",
+            "schedule_value": "2026-07-26T20:00:00+00:00",
+        }
+        assert _duplicate_pending_task(new, [self._existing()]) is None
