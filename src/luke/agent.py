@@ -429,8 +429,8 @@ def _requests_source_read(text: str) -> bool:
     Requires BOTH a read-verb ("read", "check", "look at", "what does X say")
     AND a source-noun ("email", "doc", "pdf", "thread", a file path). The
     failure class is answering about a specific accessible document from my own
-    summary instead of opening it (reflexion-primary-source-regression-prerna,
-    reflexion-advise-on-unreadable-document-name-the-gap). Conservative like
+    summary instead of opening it (reflexion-primary-source-regression-prerna-2026-07-21,
+    reflexion-advise-on-unreadable-document-name-the-gap-2026-07-23). Conservative like
     ``_requests_file_artifact``: both anchors required; short texts skipped.
     """
     if not text or len(text) < 12:
