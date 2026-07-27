@@ -440,6 +440,27 @@ def _requests_source_read(text: str) -> bool:
     )
 
 
+def _context_query(
+    prompt: str | list[dict[str, Any]], user_text: str | None
+) -> str:
+    """The text that should drive memory retrieval and the Stop gates.
+
+    Prefer ``user_text`` — the caller's clean, envelope-free user message captured
+    BEFORE any memory-context injection into ``prompt``. Memory context is prepended
+    to str prompts and inserted at index 0 for multimodal list prompts, so reading
+    ``prompt`` here would feed the retrieval query and the file-artifact/source-read
+    gates the injected memory blob instead of what the user actually typed — masking
+    the real message and dropping their request (the proxy-for-referent failure class:
+    dream-proxy-for-referent-is-one-disease-three-faces). Only fall back to ``prompt``
+    for autonomous/scheduled callers that pass no ``user_text``.
+    """
+    if user_text is not None:
+        return user_text
+    if isinstance(prompt, str):
+        return prompt
+    return str(prompt[0].get("text", "")) if prompt else ""
+
+
 # Tools that satisfy the primary-source gate: they actually pull CONTENT from a
 # document, file, or URL. Deliberately EXCLUDES Bash (too broad — nearly every
 # turn runs it, which would neuter the gate) and recall/recall_conversation
@@ -1883,6 +1904,7 @@ async def run_agent(
     thinking: ThinkingConfig | None = None,
     autonomous: bool = False,
     urgent: bool = False,
+    user_text: str | None = None,
 ) -> AgentResult:
     root = settings.luke_dir
     effective_model = model or settings.agent_model
@@ -1900,7 +1922,12 @@ async def run_agent(
 
     # Inject working memory — priority memories scored and selected at session start
     # Adaptive budget: low-effort messages get less context (saves tokens + noise)
-    prompt_text_for_context = prompt if isinstance(prompt, str) else str(prompt[0].get("text", ""))
+    # user_text is the caller's clean, envelope-free user message, captured BEFORE any
+    # memory-context injection into `prompt`. Prefer it so retrieval queries and the
+    # file-artifact/source-read Stop gates read what the user actually typed — not the
+    # injected memory blob (which is prepended for str prompts and inserted at index 0
+    # for multimodal list prompts, masking the real message entirely).
+    prompt_text_for_context = _context_query(prompt, user_text)
     _EFFORT_BUDGET = {"low": 3_000, "medium": 6_000, "high": 12_000, "max": 12_000}
     ctx_budget = 12_000 if autonomous else _EFFORT_BUDGET.get(effort or "high", 12_000)
     working_ctx = context.build_working_context(

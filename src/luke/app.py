@@ -531,6 +531,7 @@ async def process(chat_id: str) -> None:
                         model=model,
                         effort=effort,
                         thinking=thinking,
+                        user_text=combined_text,
                     ),
                     timeout=settings.agent_timeout,
                 )

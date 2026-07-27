@@ -17,6 +17,7 @@ from luke.agent import (
     _VALID_MEMORY_TYPES,
     AgentResult,
     _build_stop_hook,
+    _context_query,
     _duplicate_pending_task,
     _ok,
     _requests_file_artifact,
@@ -2448,3 +2449,56 @@ class TestDuplicatePendingTask:
             "schedule_value": "2026-07-26T20:00:00+00:00",
         }
         assert _duplicate_pending_task(new, [self._existing()]) is None
+
+
+class TestContextQuery:
+    """The gate/retrieval query must read the user's actual message, not the
+    injected memory blob. Regression for the 2026-07-26 bug where memory context
+    was prepended to `prompt` (str) or inserted at index 0 (multimodal list),
+    causing memory retrieval and the file-artifact/source-read Stop gates to read
+    the memory blob instead of what the user typed — dropping their request.
+    """
+
+    MEMORY_BLOB = (
+        "## Key Entities\n[entity-cargurus] Prerna is Filipe's manager...\n"
+        "## Active Insights\n[dream-...] some long injected memory context\n\n"
+    )
+
+    def test_prefers_user_text_over_str_prompt_with_memory(self):
+        # str path: memory_context prepended -> prompt carries the blob
+        user_msg = "read the Prerna email and tell me what she wants"
+        polluted = f"{self.MEMORY_BLOB}\n\n{user_msg}"
+        assert _context_query(polluted, user_text=user_msg) == user_msg
+
+    def test_prefers_user_text_over_list_prompt_with_memory(self):
+        # multimodal path: memory inserted at index 0, real msg pushed to index 1
+        user_msg = "make me a PDF of this"
+        polluted = [
+            {"type": "text", "text": f"{self.MEMORY_BLOB}\n\n"},
+            {"type": "text", "text": user_msg},
+        ]
+        assert _context_query(polluted, user_text=user_msg) == user_msg
+
+    def test_gate_fires_on_user_text_not_blob(self):
+        # The concrete failure: with the blob as query the source-read gate misses;
+        # with user_text it fires. Proves the fix restores gate correctness.
+        user_msg = "can you read the attached pdf and summarise the thread"
+        polluted = [
+            {"type": "text", "text": f"{self.MEMORY_BLOB}\n\n"},
+            {"type": "text", "text": user_msg},
+        ]
+        assert _requests_source_read(_context_query(polluted, user_text=None)) is False
+        assert _requests_source_read(_context_query(polluted, user_text=user_msg)) is True
+
+    def test_falls_back_to_str_prompt_when_no_user_text(self):
+        # Autonomous/scheduled callers pass no user_text -> use prompt as-is
+        assert _context_query("do the nightly reflection", user_text=None) == (
+            "do the nightly reflection"
+        )
+
+    def test_falls_back_to_first_block_for_list_without_user_text(self):
+        blocks = [{"type": "text", "text": "hello"}, {"type": "text", "text": "world"}]
+        assert _context_query(blocks, user_text=None) == "hello"
+
+    def test_empty_list_without_user_text_is_safe(self):
+        assert _context_query([], user_text=None) == ""
