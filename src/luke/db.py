@@ -691,9 +691,19 @@ def get_pending_messages(chat_id: str) -> list[StoredMessage]:
     cursor_row = db.execute("SELECT last_id FROM cursors WHERE chat_id = ?", (chat_id,)).fetchone()
     last_id = cursor_row["last_id"] if cursor_row else 0
 
+    # Exclude Luke's OWN outbound messages (sender='Luke'): they are stored in
+    # the same table but must never re-enter the pending queue. If they did, they
+    # get concatenated into `combined_text`/`user_text` and (1) feed Luke's prior
+    # reply back in as if it were user input — degrading answer quality — and (2)
+    # arm the file-artifact / source-read Stop gates off Luke's OWN words (e.g. a
+    # morning update mentioning "the brief" or a ".md" path), which then block the
+    # Stop and silently eat the real reply. Root cause of Filipe's Jul 27 2026
+    # "answer quality degrading / sometimes I don't even get an answer". Precedent:
+    # the reaction-feedback query already filters `sender != 'Luke'`.
     rows = db.execute(
         """SELECT id, sender, sender_id, msg_id, content, ts, reply_to
-           FROM messages WHERE chat_id = ? AND id > ? ORDER BY id""",
+           FROM messages WHERE chat_id = ? AND id > ? AND sender != 'Luke'
+           ORDER BY id""",
         (chat_id, last_id),
     ).fetchall()
 
