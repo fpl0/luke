@@ -19,6 +19,17 @@ This file is the durable handoff so the build resumes precisely without re-deriv
 4. VERIFY: count imported == count source (assert 1535). Spot-check 5 known ids incl. `person-filipe`,
    `user-preferences`, the active goal.
 
+## API contract VERIFIED against openapi_letta.json (2026-07-28 15:30, accountability loop)
+Every operation the importer + adapter need exists in the real API — model is feasible, no gap:
+- Self-editing working memory → `GET/PATCH /v1/agents/{id}/core-memory/blocks/{label}` + attach/detach.
+  This is the whole reason for the migration (native self-editing memory blocks). Present.
+- Recall over the memory bank → `GET /v1/agents/{id}/archival-memory/search` (+ `POST /v1/passages/search`).
+  Maps 1:1 to Luke's `recall`. Present.
+- Bulk migration of the 1535 rows → `POST /v1/archives/{archive_id}/passages/batch`. Present —
+  so import is a batched load, not 1535 serial POSTs.
+- Per-memory CRUD → archival-memory GET/POST/DELETE by memory_id. Present.
+CONCLUSION: foundation is genuinely ready; the swap is a build decision (Filipe's call), not a feasibility risk.
+
 ## Adapter plan (gated, reversible)
 - Env flag `LUKE_MEMORY_BACKEND` (default `sqlite` = current behavior; `letta` = new path).
 - Letta server runs locally on a NON-default port; test Luke instance points at it.
