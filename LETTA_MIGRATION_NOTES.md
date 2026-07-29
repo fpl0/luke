@@ -38,8 +38,26 @@ CONCLUSION: foundation is genuinely ready; the swap is a build decision (Filipe'
 ## Rollback: `git checkout main` (+ guardian.sh auto-revert). Backups in
 `/Users/filipelm/Luke/backups/pre-letta-20260728/`. See LETTA_ROLLBACK.md.
 
+## CORRECTION to importer plan — content reconciliation (2026-07-29)
+The step-1 assumption ("read active+archived rows joined to content from memory_fts")
+is WRONG: `memory_fts` only holds ACTIVE rows. Archiving removes the FTS entry, so
+archived text is not joinable there. Verified ground truth on the backup:
+- 1535 memory_meta rows: 763 active, 771 archived, 1 paused.
+- Content recoverable: 764 from FTS + 136 from latest `memory_history.new_content` = **900**.
+- **635 archived rows are metadata-only tombstones** — no text exists anywhere in the db.
+So "assert imported == 1535 WITH content" is impossible. `scripts/letta_import.py`
+reconciles explicitly instead: every row becomes a passage (tombstones carry a
+placeholder + full metadata), nothing is silently dropped, and the 900 content-bearing
+memories — which include the entire ACTIVE recall path — migrate intact.
+NOTE: `goal-msc-cognitive-science` is archived in the db (a stale "paused" label lingers
+in injected context); its substance survives across the active `insight-msc-*` rows. The
+one genuinely active goal is `goal-voicebox-luke-voice` (spot-checked, content present).
+
 ## Next steps when resuming
-1. Confirm `.letta-venv/bin/letta` installed OK (`tail /tmp/claude/letta_install.log`).
-2. `letta server` boot smoke test on a spare port.
-3. Write `scripts/letta_import.py` per importer plan; run against backup; assert counts.
-4. Write the gated adapter + a test-instance boot script; prove recall; THEN discuss cutover with Filipe.
+1. DONE — `.letta-venv/bin/letta` (letta 0.16.8) installed; backup verified.
+2. DONE — `scripts/letta_import.py` written; `--dry-run` reconciles all 1535 rows,
+   asserts totals, spot-checks person-filipe + user-preferences + the active goal. PASSES.
+3. TODO — `letta server` boot smoke test on a spare port (server currently DOWN on 8283,
+   pg DOWN on 5432; letta can run on its bundled sqlite for a local test instance).
+4. TODO — wire `--load` batch call against a test archive; prove recall of a known id.
+5. GATED ON FILIPE — the live hot-swap (irreversible). Everything above is reversible.
