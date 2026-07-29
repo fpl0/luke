@@ -53,6 +53,44 @@ NOTE: `goal-msc-cognitive-science` is archived in the db (a stale "paused" label
 in injected context); its substance survives across the active `insight-msc-*` rows. The
 one genuinely active goal is `goal-voicebox-luke-voice` (spot-checked, content present).
 
+## SERVER-BOOT FINDING — the local backend is Postgres, not SQLite (2026-07-29, session 3)
+Attempted the "boot on a spare port + prove recall" step. Result: the server will NOT
+boot from this install, and the reason is architecturally decision-relevant — surface it
+in the go/no-go, don't bury it.
+
+What was actually found (all verified live, sandbox-disabled):
+- `letta 0.16.8` imports clean; the earlier PermissionError was confirmed a sandbox artifact.
+- Booting `letta server` (tried ports 8284 + 8285, fresh LETTA_DIR) fails identically at
+  startup: `asyncpg ... relation "organizations" does not exist` → "Application startup
+  failed. Exiting." No health endpoint ever comes up.
+- Root cause: letta 0.16.8's effective default DB is **Postgres**, not the bundled sqlite the
+  prior note assumed. `settings.database_engine` reports SQLITE only when NO pg uri resolves,
+  but the runtime connects via the default `letta_pg_uri` (postgresql+...@localhost:5432/letta)
+  whenever a Postgres is reachable there — and one IS: a prior setup (Jul 28 15:16) init'd and
+  left running a Homebrew postgresql@16 with data dir `/Users/filipelm/Luke/letta-data/pgdata`
+  (live PID 51921). So "pg DOWN on 5432" in step 3 below is now STALE — pg is UP.
+- The `letta` database exists but is **completely empty** (`psql -U letta -d letta \dt` →
+  "Did not find any relations"). The schema was never created.
+- Why it can't self-heal: the pip **wheel does not ship alembic migrations or alembic.ini**
+  (searched the whole site-packages tree — none). Schema init happens in the official Docker
+  image via `startup.sh` which runs `alembic upgrade head` from the source tree. A bare
+  `pip install letta` + hand-rolled Postgres therefore has no way to create its schema — the
+  server boots, queries `organizations`, and dies.
+
+IMPLICATION FOR THE GO/NO-GO (this is the part Filipe needs):
+Running Letta 0.16.8 self-hosted realistically means running the **official Docker image**
+(bundled Postgres + migrations), i.e. the backend brings a **Docker + Postgres dependency**
+into Luke's stack. That sits in direct tension with the standing hard directive
+`feedback-stay-on-sqlite` (Apr 6: "Stay on SQLite; do NOT migrate to PostgreSQL"). Even though
+Letta's Postgres is a SEPARATE store from `luke.db`, adopting Letta = adopting Postgres as a
+runtime dependency. That is a real, previously-unpriced cost of the migration and should be an
+explicit part of the decision, not discovered after the swap.
+Paths forward if he still wants Letta: (a) run `letta/letta` via Docker and accept the PG
+dependency; (b) obtain the letta SOURCE tree (not the wheel) to run `alembic upgrade head`
+against the existing local PG; (c) reconsider whether a lighter self-editing-memory design on
+SQLite meets the actual need. Importer + payloads are ready for any of them — this blocker is
+purely the *runtime*, not our migration code.
+
 ## Next steps when resuming
 1. DONE — `.letta-venv/bin/letta` (letta 0.16.8) installed; backup verified.
 2. DONE — `scripts/letta_import.py` written; `--dry-run` reconciles all 1535 rows,
@@ -67,8 +105,9 @@ one genuinely active goal is `goal-voicebox-luke-voice` (spot-checked, content p
 3. PARTLY DE-RISKED (Jul 29) — the `letta_client` SDK (1.12.1) imports cleanly and the
    `letta` CLI loads its full ORM chain. The earlier "PermissionError: ~/.letta/logs/
    Letta.log" was a SANDBOX artifact, NOT a broken install — run sandbox-disabled and
-   the import chain is clean. Still TODO: actually boot `letta server` on a spare port
-   (bundled sqlite; pg DOWN on 5432) — but the feasibility blocker is cleared.
-4. TODO — wire `--load` batch call against a test archive; prove recall of a known id.
-   (Pairs naturally with Filipe's "go" — the boot + first live load are one motion.)
+   the import chain is clean. (SUPERSEDED re: DB — see "SERVER-BOOT FINDING" above:
+   the server does NOT boot on sqlite; it targets Postgres and the schema is uninit'd.)
+4. BLOCKED (not on Filipe) — wire `--load` batch call + prove recall. Blocked on getting a
+   Letta server to actually boot, which needs the Docker image or the source-tree alembic
+   migrations (see finding above). Importer/payloads are ready; the runtime is the blocker.
 5. GATED ON FILIPE — the live hot-swap (irreversible). Everything above is reversible.
