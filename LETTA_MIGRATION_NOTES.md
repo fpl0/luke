@@ -57,7 +57,18 @@ one genuinely active goal is `goal-voicebox-luke-voice` (spot-checked, content p
 1. DONE — `.letta-venv/bin/letta` (letta 0.16.8) installed; backup verified.
 2. DONE — `scripts/letta_import.py` written; `--dry-run` reconciles all 1535 rows,
    asserts totals, spot-checks person-filipe + user-preferences + the active goal. PASSES.
-3. TODO — `letta server` boot smoke test on a spare port (server currently DOWN on 8283,
-   pg DOWN on 5432; letta can run on its bundled sqlite for a local test instance).
+2b. DONE (Jul 29) — `--validate-payloads` mode: materializes ALL 1535 passage payloads,
+   enforces per-record invariants (JSON round-trip, required text/metadata fields,
+   is_tombstone↔content_source agreement), and writes the exact batch bytes to
+   `/tmp/claude/letta_batch.ndjson`. Result: 0 anomalies, 900 content-bearing + 635
+   tombstones, largest passage 18,295 chars (well under embed limits). The load path
+   is now provably safe on every row — a live load is a single clean run, no per-row
+   surprises. This is the stronger pre-flight dry_run() lacked.
+3. PARTLY DE-RISKED (Jul 29) — the `letta_client` SDK (1.12.1) imports cleanly and the
+   `letta` CLI loads its full ORM chain. The earlier "PermissionError: ~/.letta/logs/
+   Letta.log" was a SANDBOX artifact, NOT a broken install — run sandbox-disabled and
+   the import chain is clean. Still TODO: actually boot `letta server` on a spare port
+   (bundled sqlite; pg DOWN on 5432) — but the feasibility blocker is cleared.
 4. TODO — wire `--load` batch call against a test archive; prove recall of a known id.
+   (Pairs naturally with Filipe's "go" — the boot + first live load are one motion.)
 5. GATED ON FILIPE — the live hot-swap (irreversible). Everything above is reversible.

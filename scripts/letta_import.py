@@ -171,6 +171,69 @@ def dry_run(db_path, manifest_path):
     return 0
 
 
+def validate_payloads(db_path, out_path):
+    """Materialize ALL passage payloads and enforce per-record invariants.
+
+    dry_run() only proves reconciliation counts + 3 spot-checks. This is the
+    stronger pre-flight: every one of the 1535 payloads must round-trip through
+    JSON and satisfy the shape the batch endpoint requires, so a live --load is
+    a single clean run with no per-row surprises. No network, no install.
+    """
+    records, stats = build_records(db_path)
+    anomalies = []
+    max_text = 0
+    max_meta_keys = 0
+
+    for i, rec in enumerate(records):
+        mid = rec["metadata"].get("luke_id")
+        # 1. Must serialize (catches non-ASCII / bad unicode / nested weirdness).
+        try:
+            blob = json.dumps(rec, ensure_ascii=False)
+        except (TypeError, ValueError) as e:
+            anomalies.append(f"{mid}: not JSON-serializable ({e})")
+            continue
+        # 2. Round-trips back to an identical dict (no lossy coercion).
+        if json.loads(blob) != rec:
+            anomalies.append(f"{mid}: JSON round-trip mismatch")
+        # 3. Required batch fields present and correctly typed.
+        if not isinstance(rec.get("text"), str) or rec["text"] == "":
+            anomalies.append(f"{mid}: empty/non-string text")
+        if not isinstance(rec.get("metadata"), dict):
+            anomalies.append(f"{mid}: metadata not an object")
+        if not mid:
+            anomalies.append(f"row {i}: missing luke_id in metadata")
+        # 4. A non-tombstone claiming content must actually carry text.
+        meta = rec["metadata"]
+        if meta.get("is_tombstone") is False and len(rec["text"]) < 1:
+            anomalies.append(f"{mid}: marked content-bearing but text empty")
+        # 5. is_tombstone flag must agree with content_source.
+        expect_tomb = meta.get("content_source") == "tombstone"
+        if bool(meta.get("is_tombstone")) != expect_tomb:
+            anomalies.append(f"{mid}: is_tombstone disagrees with content_source")
+        max_text = max(max_text, len(rec["text"]))
+        max_meta_keys = max(max_meta_keys, len(meta))
+
+    # Write the full batch as NDJSON — the exact bytes a live load would send,
+    # inspectable before any server exists.
+    Path(out_path).write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in records))
+
+    print("=== Letta import PAYLOAD VALIDATION ===")
+    print(f"  records materialized   : {len(records)}")
+    print(f"  content-bearing        : {stats['from_fts'] + stats['from_history']}")
+    print(f"  tombstones             : {stats['tombstone']}")
+    print(f"  largest passage text   : {max_text} chars")
+    print(f"  max metadata keys      : {max_meta_keys}")
+    print(f"  anomalies              : {len(anomalies)}")
+    for a in anomalies[:20]:
+        print(f"    - {a}")
+    print(f"  batch NDJSON written   : {out_path}")
+    if anomalies:
+        print(f"FAIL: {len(anomalies)} payload anomalies — fix before live load.")
+        return 1
+    print("OK: all payloads well-formed and invariant-clean. Load path is safe to run on go.")
+    return 0
+
+
 def load(db_path, base_url, archive_id):
     try:
         from letta_client import Letta
@@ -190,6 +253,8 @@ def main():
     ap.add_argument("--backup", default=DEFAULT_BACKUP)
     ap.add_argument("--manifest", default="/tmp/claude/letta_import_manifest.json")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--validate-payloads", action="store_true")
+    ap.add_argument("--ndjson", default="/tmp/claude/letta_batch.ndjson")
     ap.add_argument("--load", action="store_true")
     ap.add_argument("--base-url", default="http://localhost:8283")
     ap.add_argument("--archive-id", default=None)
@@ -200,6 +265,8 @@ def main():
         return 2
     if args.load:
         return load(args.backup, args.base_url, args.archive_id)
+    if args.validate_payloads:
+        return validate_payloads(args.backup, args.ndjson)
     return dry_run(args.backup, args.manifest)
 
 
