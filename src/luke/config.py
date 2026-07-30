@@ -41,6 +41,13 @@ class Settings(BaseSettings):
     # Scoring internals
     recency_decay_days: float = 30.0  # half-life for recency scoring
     rrf_k: int = 60  # Reciprocal Rank Fusion constant
+
+    # Memory backend for semantic recall. "sqlite" = in-process sqlite-vec (bge-base).
+    # "letta" = source semantic candidates from a running Letta server (fails safe back
+    # to sqlite on any error). Flip this flag to switch; it is fully reversible.
+    memory_backend: str = "sqlite"
+    letta_base_url: str = "http://localhost:8283"
+    letta_archive_id: str = "archive-2918733f-58bc-4558-8bc2-4c20652f34f0"  # bge-base parity embeddings
     max_consolidation_clusters: int = 3  # max clusters per consolidation run
     utility_floor: float = 0.7  # minimum fraction of access_score at 0% utility
     utility_weight: float = 0.3  # how much utility_rate can boost above floor

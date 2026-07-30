@@ -749,14 +749,25 @@ def recall(
     sem_ranked: list[str] = []
     query_embedding: list[float] | None = None
     if query:
-        query_embedding = _embed_query(query)
-        if query_embedding is not None:
-            sem_results = _semantic_search(
-                query_embedding,
-                mem_type=mem_type,
-                limit=limit,
-                include_private=include_private,
+        sem_results: list[dict[str, Any]] | None = None
+        # Letta backend (reversible via settings.memory_backend): source semantic
+        # candidates from the Letta vector store, falling back to sqlite-vec on any miss.
+        if settings.memory_backend == "letta":
+            from .letta_adapter import letta_semantic_search
+
+            sem_results = letta_semantic_search(
+                query, mem_type=mem_type, limit=limit, include_private=include_private
             )
+        if sem_results is None:
+            query_embedding = _embed_query(query)
+            if query_embedding is not None:
+                sem_results = _semantic_search(
+                    query_embedding,
+                    mem_type=mem_type,
+                    limit=limit,
+                    include_private=include_private,
+                )
+        if sem_results is not None:
             # Filter by cluster if provided
             if cluster_ids:
                 cluster_id_set = set(cluster_ids)
