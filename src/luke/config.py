@@ -53,6 +53,14 @@ class Settings(BaseSettings):
     # waiting on the daily delta-sync. Best-effort + fail-safe: a write-through failure never
     # breaks the sqlite write. Off unless on the letta backend; fully reversible.
     letta_write_through: bool = True
+    # Phase 4.1: agent-loop backend. "sdk" = the current Claude Agent SDK turn, with the
+    # working-memory blob injected into the system prompt (build_working_context). "letta" =
+    # source the always-in-context persona/human/world-model from the luke-agent-claude core
+    # blocks (packed in 2.2a) instead of re-injecting the blob every turn — the whole point of
+    # the migration. Defaults to "sdk"; the "letta" path is gated off until the live end-to-end
+    # turn is proven in a low-contention window. Fully reversible (flip back to "sdk").
+    agent_backend: str = "sdk"
+    letta_agent_id: str = "agent-36671c0b-a133-4bfb-a367-f23f7135071a"  # luke-agent-claude (Claude bridge, 7 core blocks)
     max_consolidation_clusters: int = 3  # max clusters per consolidation run
     utility_floor: float = 0.7  # minimum fraction of access_score at 0% utility
     utility_weight: float = 0.3  # how much utility_rate can boost above floor

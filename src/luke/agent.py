@@ -57,6 +57,7 @@ from claude_agent_sdk.types import (
 from structlog.stdlib import BoundLogger
 
 from . import context, db, memory
+from . import letta_agent as _letta_agent
 from .bus import bus
 from .config import settings
 from .memory import MEMORY_DIRS, read_frontmatter, read_memory_body, sanitize_memory_id
@@ -1930,9 +1931,17 @@ async def run_agent(
     prompt_text_for_context = _context_query(prompt, user_text)
     _EFFORT_BUDGET = {"low": 3_000, "medium": 6_000, "high": 12_000, "max": 12_000}
     ctx_budget = 12_000 if autonomous else _EFFORT_BUDGET.get(effort or "high", 12_000)
-    working_ctx = context.build_working_context(
-        query=prompt_text_for_context, budget_tokens=ctx_budget
-    )
+    # Phase 4.1: when agent_backend="letta", source the always-in-context world model from the
+    # luke-agent-claude core blocks (self-editing, packed in 2.2a) instead of re-injecting the
+    # sqlite working-memory blob. Fail-safe: a None assembly falls through to the sqlite blob,
+    # so a down/empty Letta agent degrades to current SDK behavior. Defaults off (backend="sdk").
+    working_ctx: str | None = None
+    if settings.agent_backend == "letta":
+        working_ctx = _letta_agent.build_letta_context()
+    if working_ctx is None:
+        working_ctx = context.build_working_context(
+            query=prompt_text_for_context, budget_tokens=ctx_budget
+        )
     if working_ctx:
         persona += "\n\n" + working_ctx
 
