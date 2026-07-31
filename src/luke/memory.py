@@ -661,6 +661,17 @@ def index_memory(
         except Exception:
             pass  # best-effort — don't fail index_memory over event
 
+    # Phase 2.2c: mirror this committed write into the Letta archive when backend=letta,
+    # so the shadow-run stays live instead of drifting between daily delta-syncs. Fully
+    # fail-safe (no-op off the letta backend; never raises). Reversible: delete this call
+    # + src/luke/letta_writer.py to revert.
+    try:
+        from .letta_writer import letta_write_through
+
+        letta_write_through(mem_id)
+    except Exception:
+        log.warning("letta_write_through_hook_failed", mem_id=mem_id)
+
     return embedding
 
 

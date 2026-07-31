@@ -48,6 +48,11 @@ class Settings(BaseSettings):
     memory_backend: str = "sqlite"
     letta_base_url: str = "http://localhost:8283"
     letta_archive_id: str = "archive-7654f6f5-542a-47b6-bdb9-3542f1cb9eca"  # bge-base title+content parity (12/12 top-1 vs sqlite-vec; supersedes content-only archive-2918733f @ 8/12) — Phase 2.3
+    # Phase 2.2c: when backend=letta, mirror remember()/index_memory writes into the Letta
+    # archive live (idempotent upsert by luke_id) so the shadow-run stays current without
+    # waiting on the daily delta-sync. Best-effort + fail-safe: a write-through failure never
+    # breaks the sqlite write. Off unless on the letta backend; fully reversible.
+    letta_write_through: bool = True
     max_consolidation_clusters: int = 3  # max clusters per consolidation run
     utility_floor: float = 0.7  # minimum fraction of access_score at 0% utility
     utility_weight: float = 0.3  # how much utility_rate can boost above floor
