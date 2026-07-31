@@ -47,7 +47,7 @@ class Settings(BaseSettings):
     # to sqlite on any error). Flip this flag to switch; it is fully reversible.
     memory_backend: str = "sqlite"
     letta_base_url: str = "http://localhost:8283"
-    letta_archive_id: str = "archive-2918733f-58bc-4558-8bc2-4c20652f34f0"  # bge-base parity embeddings
+    letta_archive_id: str = "archive-7654f6f5-542a-47b6-bdb9-3542f1cb9eca"  # bge-base title+content parity (12/12 top-1 vs sqlite-vec; supersedes content-only archive-2918733f @ 8/12) — Phase 2.3
     max_consolidation_clusters: int = 3  # max clusters per consolidation run
     utility_floor: float = 0.7  # minimum fraction of access_score at 0% utility
     utility_weight: float = 0.3  # how much utility_rate can boost above floor
