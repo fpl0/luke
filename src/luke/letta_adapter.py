@@ -71,7 +71,9 @@ def letta_semantic_search(
     """
     from .memory import _db  # local import avoids a circular dependency
 
-    passages = _search_passages(query, limit * (4 if mem_type else 2))
+    # Over-fetch: ~40% of the archive is tombstone placeholders (Phase 2.4) that get
+    # skipped below, so widen the window to keep enough real candidates after attrition.
+    passages = _search_passages(query, limit * (5 if mem_type else 3))
     if not passages:
         return None
 
@@ -82,6 +84,13 @@ def letta_semantic_search(
     for p in passages:
         obj = p.get("passage", p) if isinstance(p, dict) else {}
         meta = obj.get("metadata") or {}
+        # Tombstones are metadata-only placeholders loaded for store completeness /
+        # id-resolution (Phase 2.4). Their placeholder text embeds the id slug, which
+        # can outrank real content on some queries — never let them into recall. The
+        # sqlite active-status join below is a second backstop, but skipping here keeps
+        # tombstones from consuming candidate slots and shifting real ranks.
+        if meta.get("is_tombstone"):
+            continue
         luke_id = meta.get("luke_id")
         if luke_id and luke_id not in seen:
             seen.add(luke_id)
