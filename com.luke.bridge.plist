@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.luke.bridge</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/Resources/Python.app/Contents/MacOS/Python</string>
+        <string>/Users/filipelm/Code/luke/scripts/claude_letta_bridge.py</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/filipelm/Code/luke</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Users/filipelm/Code/luke/bridge.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/filipelm/Code/luke/bridge.err</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+    </dict>
+</dict>
+</plist>

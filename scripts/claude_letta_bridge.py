@@ -136,7 +136,10 @@ def _as_text(content):
 
 
 def _map_model(model):
-    if model and "claude" in model:
+    # Only pass through a FULL Claude model id (e.g. claude-opus-4-8, claude-sonnet-4-6).
+    # A bare "claude" or any non-claude/unknown label falls back to DEFAULT_MODEL —
+    # Anthropic 404s on "claude" alone, and Letta may hand us a short label.
+    if model and model.startswith("claude-") and len(model) > len("claude-"):
         return model
     return DEFAULT_MODEL
 
