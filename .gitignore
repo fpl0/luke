@@ -20,3 +20,7 @@ wheels/
 # OS
 .DS_Store
 .letta-venv/
+.letta_health_state
+lettahealth.out
+lettahealth.err
+letta_stack_health.log
