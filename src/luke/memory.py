@@ -1220,6 +1220,21 @@ def archive_memory(mem_id: str) -> None:
         (mem_id,),
     )
     _commit(conn)
+    # Phase 2.2b: mirror the forget into the Letta ledger. At this point the FTS row is
+    # still present (cleanup_archived_fts is a separate lazy pass), so the write-through
+    # re-mirrors the passage carrying status='archived'; the adapter skips archived
+    # passages and the sqlite active-join drops them, so recall stays correct. Fail-safe.
+    _letta_status_write_through(mem_id)
+
+
+def _letta_status_write_through(mem_id: str) -> None:
+    """Fire the Letta write-through for a status/link change. Never raises."""
+    try:
+        from .letta_writer import letta_write_through
+
+        letta_write_through(mem_id)
+    except Exception:
+        log.warning("letta_write_through_hook_failed", mem_id=mem_id)
 
 
 def restore_memory(mem_id: str) -> bool:
@@ -1255,6 +1270,8 @@ def restore_memory(mem_id: str) -> bool:
                     ),
                 )
     _commit(conn)
+    # Phase 2.2b: mirror the restore (status back to 'active') into the Letta ledger.
+    _letta_status_write_through(mem_id)
     return True
 
 
@@ -1289,6 +1306,11 @@ def link_memories(from_id: str, to_id: str, relationship: str) -> bool:
         (from_id, to_id, relationship, now),
     )
     _commit(conn)
+    if cur.rowcount > 0:
+        # Phase 2.2b: a new edge was committed — re-mirror the from_id passage so its
+        # Letta `links` metadata reflects the live graph (the write-through reads
+        # memory_links, not links_json). Fail-safe; only on a genuinely new edge.
+        _letta_status_write_through(from_id)
     return cur.rowcount > 0
 
 

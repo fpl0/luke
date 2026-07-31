@@ -144,8 +144,20 @@ def _write_through_impl(mem_id: str) -> None:
         tags = json.loads(row["tags_json"]) if row["tags_json"] else []
     except Exception:
         tags = []
+
+    # Links: mirror the LIVE graph (memory_links), not links_json. links_json is only the
+    # creation-time snapshot passed to remember(); the authoritative, growing graph — the
+    # explicit connect() edges plus the A-MEM auto-evolution edges — lives in memory_links.
+    # Reading it here is what makes the connect() write-through faithful (Phase 2.2b): after
+    # link_memories() commits a new edge, re-mirroring from_id picks the edge up here.
+    # Only valid (non-invalidated) outgoing edges, matching _get_neighbors_batch semantics.
     try:
-        links = json.loads(row["links_json"]) if row["links_json"] else []
+        link_rows = db.execute(
+            "SELECT to_id FROM memory_links "
+            "WHERE from_id = ? AND (valid_until IS NULL OR valid_until = '')",
+            (mem_id,),
+        ).fetchall()
+        links = [r["to_id"] for r in link_rows]
     except Exception:
         links = []
 

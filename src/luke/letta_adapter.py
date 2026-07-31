@@ -91,6 +91,12 @@ def letta_semantic_search(
         # tombstones from consuming candidate slots and shifting real ranks.
         if meta.get("is_tombstone"):
             continue
+        # Archived passages (Phase 2.2b forget write-through) carry status='archived'.
+        # The sqlite active-status join below already drops them, but — exactly like
+        # tombstones — their content still embeds close to on-topic queries and can crowd
+        # real active answers out of the candidate window. Skip them here too.
+        if meta.get("status") == "archived":
+            continue
         luke_id = meta.get("luke_id")
         if luke_id and luke_id not in seen:
             seen.add(luke_id)
