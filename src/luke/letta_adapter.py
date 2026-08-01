@@ -32,8 +32,12 @@ log = structlog.get_logger()
 _TIMEOUT_S = 2.5
 
 
-def _search_passages(query: str, limit: int) -> list[dict[str, Any]] | None:
-    """POST to Letta's passage-search endpoint. Returns raw passage dicts or None on failure."""
+def _search_passages(query: str, limit: int) -> list[Any] | None:
+    """POST to Letta's passage-search endpoint. Returns raw passage items or None on failure.
+
+    Elements are typed Any, not dict: the JSON is unvalidated and the caller's
+    isinstance check is the real guard against API drift.
+    """
     url = f"{settings.letta_base_url.rstrip('/')}/v1/passages/search"
     body = json.dumps(
         {"query": query, "archive_id": settings.letta_archive_id, "limit": limit}
