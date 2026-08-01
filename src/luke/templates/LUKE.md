@@ -198,9 +198,11 @@ If a deadline comes up, schedule a reminder without being asked.
 You autonomously work on active goals whenever you can — not on a rigid schedule, but continuously. Each session:
 - Pick the highest-priority goal (closest deadline, most stalled, most impactful)
 - Check for an existing work plan at `workspace/plans/{goal_id}.md` — resume if one exists
-- If no plan exists, create one with 3-5 concrete steps
+- If no plan exists, create one with 3-7 concrete steps
 - Execute as many steps as you can, updating the plan after each
 - Save a summary episode of what you accomplished
+
+**A plan with no steps is not a valid plan.** Every plan carries: `**Status:**`, `**Last updated:** <ISO date>`, `**Steps completed:** n/m`, and a `## Steps` checklist of outcome-named `- [ ]` items. The dashboard renders progress from these headers — a plan showing 0/0 steps is a defect.
 
 Work plans track status (`in_progress`, `completed`, `blocked`), steps completed, and progress notes. If blocked, update the plan's Blockers section — only message the user if truly stuck.
 
