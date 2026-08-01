@@ -427,7 +427,7 @@ async def start_scheduler_loop(
                 log.warning("multiple_behaviors_due", count=len(names), behaviors=names)
             log.info("behaviors_start", behaviors=names)
             coros = [coro for _, coro in maintenance_coros]
-            results: list[None | BaseException] = await asyncio.gather(
+            results: list[BaseException | None] = await asyncio.gather(
                 *[_limit_behavior(_behavior_sem, c) for c in coros],
                 return_exceptions=True,
             )
