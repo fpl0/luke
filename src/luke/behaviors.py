@@ -596,14 +596,18 @@ async def _run_attention_deep_work(bot: Bot, sem: asyncio.Semaphore, *, reason: 
     bus.emit("deep_work_attention_fallback", {"reason": reason, "pins": len(pins)})
     log.info("deep_work_attention_fallback", reason=reason, pins=len(pins))
 
+    # Fallback sessions run on the cheap tier with the standard behavior budget:
+    # with no goal to anchor them, opus sessions free-ran to the $10 cap producing
+    # nothing (23 sessions / $50 / 4 responses, Jul 27-Aug 1). Pin-driven upkeep
+    # doesn't need opus; real goals still get deep_work_model + the full budget.
     await _run_behavior(
         "deep_work",
         prompt,
         bot,
         sem,
-        model=settings.deep_work_model,
+        model=settings.consolidation_model,
         max_turns=settings.deep_work_max_turns,
-        max_budget_usd=settings.deep_work_max_budget_usd,
+        max_budget_usd=settings.behavior_max_budget_usd,
         max_sends=1,
         attention_pins=len(pins),
         fallback_reason=reason,

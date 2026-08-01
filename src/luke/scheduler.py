@@ -138,6 +138,19 @@ async def _run_task(task: TaskRecord, bot: Bot) -> None:
         finished = datetime.now(UTC).isoformat()
         db.log_task_run(task_id, started, finished, "ok")
         db.reset_task_failures(task_id)
+        # Scheduled tasks are the largest spend category — without this line they
+        # were invisible to cost_log (~70% of real spend untracked, found 2026-08-01).
+        db.log_cost(
+            task["chat_id"],
+            result.cost_usd,
+            result.num_turns,
+            result.duration_api_ms,
+            f"task:{task_id}",
+            input_tokens=result.input_tokens,
+            output_tokens=result.output_tokens,
+            cache_create_tokens=result.cache_create_tokens,
+            cache_read_tokens=result.cache_read_tokens,
+        )
         log.info(
             "task_done",
             task_id=task_id,
@@ -461,8 +474,14 @@ async def start_scheduler_loop(
                 async def _verify_continuation() -> None:
                     """Wait briefly then check if deep_work_oriented was emitted."""
                     await asyncio.sleep(5)
-                    # Check for deep_work_oriented events in the last 30 seconds
-                    since = (datetime.now(UTC) - timedelta(seconds=30)).isoformat()
+                    # Check for deep_work_oriented events in the last 30 seconds.
+                    # events.created is written by sqlite datetime('now') — space
+                    # separator, no offset — so the comparison string must match
+                    # that format ('T' > ' ' made isoformat() always compare false,
+                    # turning every check into a spurious continuation_failure).
+                    since = (datetime.now(UTC) - timedelta(seconds=30)).strftime(
+                        "%Y-%m-%d %H:%M:%S"
+                    )
                     oriented = db.count_unconsumed_events("deep_work_oriented", since=since)
                     if oriented > 0:
                         bus.emit("continuation_success")

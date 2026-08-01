@@ -633,3 +633,44 @@ class TestRunDeepWork:
             await run_deep_work(AsyncMock(), _SEM)
 
         mock_agent.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Attention-fallback deep work runs on the cheap tier
+# ---------------------------------------------------------------------------
+
+
+class TestAttentionFallbackTier:
+    async def test_fallback_uses_cheap_model_and_behavior_budget(self, monkeypatch: Any) -> None:
+        """Goalless sessions free-ran opus to the $10 cap producing nothing
+        (23 sessions / $50 / 4 responses, Jul 27-Aug 1). The fallback path must
+        run on the consolidation tier with the standard behavior budget."""
+        from luke.behaviors import _run_attention_deep_work
+        from luke.config import settings
+
+        monkeypatch.setattr(settings, "chat_id", "12345")
+
+        pins = [{"id": 1, "origin": "filipe", "content": "a pinned thing"}]
+        signals = {
+            "replies": 0,
+            "positive_reactions": 0,
+            "negative_reactions": 0,
+            "corrections": 0,
+        }
+        with (
+            patch("luke.behaviors.attention") as mock_attention,
+            patch("luke.behaviors.db") as mock_db,
+            patch("luke.behaviors.bus"),
+            patch("luke.behaviors._run_behavior", new=AsyncMock()) as mock_run,
+        ):
+            mock_attention.list_attention.return_value = pins
+            mock_db.get_daily_deep_work_cost.return_value = 0.0
+            mock_db.get_behavior_last_run.return_value = None
+            mock_db.get_engagement_signals.return_value = signals
+
+            ran = await _run_attention_deep_work(AsyncMock(), _SEM, reason="no_goals")
+
+        assert ran is True
+        kwargs = mock_run.call_args.kwargs
+        assert kwargs["model"] == settings.consolidation_model
+        assert kwargs["max_budget_usd"] == settings.behavior_max_budget_usd

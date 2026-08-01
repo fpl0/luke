@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime, timedelta
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from luke.db import TaskRecord
@@ -298,6 +299,35 @@ class TestRunTask:
         mock_agent.assert_called_once()
         mock_db.log_task_run.assert_called_once()
         mock_db.update_task_last_run.assert_called_once()
+
+    async def test_successful_run_logs_cost(self) -> None:
+        """Scheduled-task spend must hit cost_log — it was ~70% of real spend
+        and completely invisible until 2026-08-01."""
+        mock_bot = AsyncMock()
+        mock_result = MagicMock()
+        mock_result.texts = []
+        mock_result.sent_messages = 0
+        mock_result.cost_usd = 1.23
+        mock_result.num_turns = 4
+        mock_result.duration_api_ms = 5678
+        mock_result.input_tokens = 10
+        mock_result.output_tokens = 20
+        mock_result.cache_create_tokens = 30
+        mock_result.cache_read_tokens = 40
+
+        task = _task(schedule_type="cron")
+
+        with (
+            patch("luke.scheduler.run_agent", return_value=mock_result),
+            patch("luke.scheduler.db") as mock_db,
+        ):
+            await _run_task(task, mock_bot)
+
+        mock_db.log_cost.assert_called_once()
+        args, kwargs = mock_db.log_cost.call_args
+        assert args[1] == 1.23
+        assert args[4] == "task:test-id"
+        assert kwargs["output_tokens"] == 20
 
     async def test_once_task_marked_completed(self) -> None:
         mock_bot = AsyncMock()
@@ -933,3 +963,30 @@ class TestBehaviorEventGating:
                 tg.create_task(set_shutdown())
 
         mock_fn.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# count_unconsumed_events since-format contract
+# ---------------------------------------------------------------------------
+
+
+class TestContinuationSinceFormat:
+    """events.created is written by sqlite datetime('now') — space separator.
+    A since string in isoformat ('T' separator) compares greater than every
+    same-day row, so the continuation check silently counted zero forever."""
+
+    def test_space_format_since_matches_fresh_event(self, test_db: Any) -> None:
+        from luke import db
+
+        db.emit_event("deep_work_oriented", "{}")
+        since_space = (datetime.now(UTC) - timedelta(seconds=30)).strftime("%Y-%m-%d %H:%M:%S")
+        assert db.count_unconsumed_events("deep_work_oriented", since=since_space) == 1
+
+    def test_isoformat_since_is_the_bug(self, test_db: Any) -> None:
+        from luke import db
+
+        db.emit_event("deep_work_oriented", "{}")
+        since_iso = (datetime.now(UTC) - timedelta(seconds=30)).isoformat()
+        # Documents the defect the scheduler fix avoids: 'T' > ' ' in the string
+        # compare hides every same-day event.
+        assert db.count_unconsumed_events("deep_work_oriented", since=since_iso) == 0

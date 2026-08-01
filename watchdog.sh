@@ -116,7 +116,7 @@ print(count)
 
     if (( recent_starts >= LOOP_THRESHOLD )); then
         pending=$(sqlite3 "$LUKE_DB" \
-            "SELECT COUNT(*) FROM messages m JOIN cursors c ON m.chat_id = c.chat_id WHERE m.id > c.last_id;" \
+            "SELECT COUNT(*) FROM messages m JOIN cursors c ON m.chat_id = c.chat_id WHERE m.id > c.last_id AND m.sender != 'Luke';" \
             2>/dev/null || echo 0)
         if (( pending > 0 )); then
             log "REPLAY LOOP: $recent_starts starts in ${LOOP_WINDOW}s with $pending pending message(s) — skipping batch"
