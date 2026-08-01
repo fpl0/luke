@@ -192,35 +192,6 @@ async def run_consolidation(bot: Bot, sem: asyncio.Semaphore) -> None:
     if contradictions_found > 0:
         log.info("consolidation_contradiction_scan", found=contradictions_found)
 
-    # --- Contradiction scan: detect and resolve conflicting memories ---
-    contradiction_candidates = memory.get_factual_duplicate_candidates(similarity_threshold=0.65)
-    contradictions_found = 0
-    for cluster in (contradiction_candidates or [])[: settings.max_consolidation_clusters]:
-        for i, m in enumerate(cluster):
-            for other in cluster[i + 1 :]:
-                body_a = read_memory_body(m["type"], m["id"], 500)
-                body_b = read_memory_body(other["type"], other["id"], 500)
-                if body_a and body_b:
-                    relationship = memory.classify_relationship(body_a, body_b)
-                    if relationship == "contradictory":
-                        contradictions_found += 1
-                        log.info(
-                            "contradiction_detected",
-                            mem_a=m["id"],
-                            mem_b=other["id"],
-                            similarity=m.get("similarity", other.get("similarity", 0)),
-                        )
-                        pending = memory.flag_for_review(
-                            m["id"],
-                            f"Potential contradiction with {other['id']}: {body_b[:200]}",
-                            confidence=0.55,
-                            source="consolidation_scan",
-                        )
-                        log.info("contradiction_flagged", result=pending)
-
-    if contradictions_found > 0:
-        log.info("consolidation_contradiction_scan", found=contradictions_found)
-
 
 async def run_reflection(bot: Bot, sem: asyncio.Semaphore) -> None:
     """Weekly self-reflection: review recent memories and generate meta-cognitive insights."""

@@ -1714,9 +1714,30 @@ def flag_for_review(
     confidence: float = 0.6,
     source: str = "auto_detection",
 ) -> dict[str, Any]:
-    """Flag a potential correction for agent review."""
+    """Flag a potential correction for agent review.
+
+    One pending row per (mem_id, source): the daily consolidation scan re-detects
+    the same contradictions every run, and unconditional inserts grew the queue
+    unboundedly (3,000+ rows, the same memory flagged 150+ times). Re-flagging an
+    already-pending memory refreshes the existing row instead of adding another.
+    """
     conn = _db()
     now = datetime.now(UTC).isoformat()
+    existing = conn.execute(
+        """SELECT id FROM pending_corrections
+           WHERE mem_id = ? AND source = ? AND status = 'pending'
+           ORDER BY created_at DESC LIMIT 1""",
+        (mem_id, source),
+    ).fetchone()
+    if existing:
+        conn.execute(
+            """UPDATE pending_corrections
+               SET corrected_content = ?, confidence = ?, created_at = ?
+               WHERE id = ?""",
+            (corrected_content, confidence, now, existing["id"]),
+        )
+        _commit(conn)
+        return {"status": "refreshed", "mem_id": mem_id, "confidence": confidence}
     conn.execute(
         """INSERT INTO pending_corrections
            (mem_id, corrected_content, confidence,
@@ -1726,6 +1747,24 @@ def flag_for_review(
     )
     _commit(conn)
     return {"status": "flagged", "mem_id": mem_id, "confidence": confidence}
+
+
+def prune_pending_corrections(retention_days: int = 30) -> int:
+    """Expire pending corrections nobody acted on within *retention_days*.
+
+    A pending correction is a prompt for review, not an archive: if it sat
+    unreviewed for a month it is stale (the scan will re-flag anything still
+    contradictory). Returns the number of rows expired.
+    """
+    conn = _db()
+    cutoff = (datetime.now(UTC) - timedelta(days=retention_days)).isoformat()
+    cur = conn.execute(
+        """UPDATE pending_corrections SET status = 'expired', resolved_at = ?
+           WHERE status = 'pending' AND created_at < ?""",
+        (datetime.now(UTC).isoformat(), cutoff),
+    )
+    _commit(conn)
+    return cur.rowcount
 
 
 def get_pending_corrections(
