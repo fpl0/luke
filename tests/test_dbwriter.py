@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import sqlite3
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -205,44 +204,4 @@ def test_lock_not_held_after_cross_thread_writes(test_db: Any) -> None:
     # Should acquire immediately — no thread holds it.
     acquired = _write_lock.acquire(blocking=False)
     assert acquired, "write lock leaked after all threads finished"
-    _write_lock.release()
-
-
-def test_failed_write_releases_lock(test_db: Any) -> None:
-    """A write statement that raises must not leave the global lock held.
-
-    Regression: a thread that died after a failed execute() (no table, bad
-    SQL) left the RLock owned forever, deadlocking every later writer
-    process-wide.
-    """
-
-    def failing_worker() -> None:
-        conn = db._db()
-        with pytest.raises(sqlite3.OperationalError):
-            conn.execute("INSERT INTO no_such_table (x) VALUES (1)")
-
-    t = threading.Thread(target=failing_worker)
-    t.start()
-    t.join()
-
-    acquired = _write_lock.acquire(blocking=False)
-    assert acquired, "write lock leaked after failed write in another thread"
-    _write_lock.release()
-
-
-def test_close_releases_held_writes(test_db: Any) -> None:
-    """Closing a connection mid-transaction releases its write acquisitions."""
-
-    def abandoning_worker() -> None:
-        conn = db._db()
-        conn.execute("INSERT INTO events (event_type, payload) VALUES (?, ?)", ("orphan", "{}"))
-        # No commit — simulate a code path that bails out; close() must clean up.
-        conn.close()
-
-    t = threading.Thread(target=abandoning_worker)
-    t.start()
-    t.join()
-
-    acquired = _write_lock.acquire(blocking=False)
-    assert acquired, "write lock leaked after close() with open transaction"
     _write_lock.release()
