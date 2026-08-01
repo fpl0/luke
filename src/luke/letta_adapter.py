@@ -71,6 +71,9 @@ def letta_semantic_search(
     """
     from .memory import _db  # local import avoids a circular dependency
 
+    if not settings.letta_archive_id:
+        return None  # no archive provisioned for this deployment — sqlite path
+
     # Over-fetch: ~40% of the archive is tombstone placeholders (Phase 2.4) that get
     # skipped below, so widen the window to keep enough real candidates after attrition.
     passages = _search_passages(query, limit * (5 if mem_type else 3))

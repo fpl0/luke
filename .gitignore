@@ -31,6 +31,8 @@ bridge.log
 bridge.err
 lettasync.log
 lettasync.err
+bgeembed.log
+bgeembed.err
 openapi_letta.json
 
 # Data belongs in $LUKE_DIR, never the repo

@@ -1354,6 +1354,12 @@ def invalidate_link(from_id: str, to_id: str, relationship: str) -> bool:
         (now, from_id, to_id, to_id, from_id, relationship),
     )
     _commit(conn)
+    if cur.rowcount > 0:
+        # Phase 2.2b: re-mirror both endpoints so their Letta `links` metadata drops the
+        # expired edge — link_memories() mirrors on edge creation, this is the removal
+        # half. Fail-safe, no-op off the letta backend.
+        _letta_status_write_through(from_id)
+        _letta_status_write_through(to_id)
     return cur.rowcount > 0
 
 
