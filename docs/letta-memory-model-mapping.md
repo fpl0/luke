@@ -1,7 +1,7 @@
 # Phase 2.1 — Luke memory model → Letta mapping
 
 **Branch:** `letta-integration` · **Status:** design doc (Phase 2.1 of `goal-letta-full-power`)
-**Written:** 2026-07-31, from ground truth (`src/luke/memory.py`, `LETTA_MIGRATION_NOTES.md`,
+**Written:** 2026-07-31, from ground truth (`src/luke/memory.py`, `docs/letta-migration-notes.md`,
 `scripts/letta_import.py`, `openapi_letta.json`). No narration — every field below is a real
 column or a real Letta primitive.
 

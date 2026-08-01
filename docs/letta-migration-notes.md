@@ -36,7 +36,7 @@ CONCLUSION: foundation is genuinely ready; the swap is a build decision (Filipe'
 - Do NOT hot-swap the live process until the test instance answers + recalls a known memory.
 
 ## Rollback: `git checkout main` (+ guardian.sh auto-revert). Backups in
-`/Users/filipelm/Luke/backups/pre-letta-20260728/`. See LETTA_ROLLBACK.md.
+`/Users/filipelm/Luke/backups/pre-letta-20260728/`. See docs/letta-rollback.md.
 
 ## CORRECTION to importer plan — content reconciliation (2026-07-29)
 The step-1 assumption ("read active+archived rows joined to content from memory_fts")
