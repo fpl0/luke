@@ -115,7 +115,9 @@ class Settings(BaseSettings):
     attention_urgent_reserve: int = 2  # extra hourly slots reserved for urgent behaviors only
     daily_attention_budget: int = 12  # daily outbound message budget (planner-level gate)
 
-    # Model routing per effort level
+    # Model routing per effort level. These are tier aliases — routing keys,
+    # not model IDs. agent._MODEL_IDS pins each tier to an explicit model
+    # (haiku 4.5 / sonnet 5 / opus 5) at the SDK boundary.
     model_low: str = "haiku"  # trivial messages (acks, short replies)
     model_medium: str = "sonnet"  # casual conversation, simple questions
     model_high: str = "opus"  # deep reasoning, research, multi-step

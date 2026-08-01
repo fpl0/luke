@@ -1943,6 +1943,21 @@ def _allowed_tools_for_model(model: str) -> list[str]:
     return _ALLOWED_OPUS
 
 
+# Tier aliases ("haiku"/"sonnet"/"opus") are routing keys throughout luke; the
+# SDK gets explicit model IDs so a model generation change is a deliberate edit
+# here — not a side effect of whichever CLI version happens to be installed.
+_MODEL_IDS: dict[str, str] = {
+    "haiku": "claude-haiku-4-5-20251001",
+    "sonnet": "claude-sonnet-5",
+    "opus": "claude-opus-5",
+}
+
+
+def _resolve_model_id(model: str) -> str:
+    """Map a tier alias to its pinned model ID; pass explicit IDs through."""
+    return _MODEL_IDS.get(model, model)
+
+
 # ---------------------------------------------------------------------------
 # Run agent
 # ---------------------------------------------------------------------------
@@ -2444,8 +2459,8 @@ async def run_agent(
     options = ClaudeAgentOptions(
         cwd=str(root),
         resume=session_id,
-        model=effective_model,
-        fallback_model=fallback,
+        model=_resolve_model_id(effective_model),
+        fallback_model=_resolve_model_id(fallback) if fallback else None,
         system_prompt={"type": "preset", "preset": "claude_code", "append": persona},
         allowed_tools=allowed,
         permission_mode="bypassPermissions",
@@ -2471,7 +2486,7 @@ async def run_agent(
                     "structured findings with sources cited."
                 ),
                 tools=["WebSearch", "WebFetch", "Read", "Grep"],
-                model="opus",
+                model=_MODEL_IDS["opus"],
             ),
             "coder": AgentDefinition(
                 description=(
@@ -2486,7 +2501,7 @@ async def run_agent(
                     "Work in the luke/workspace/ directory."
                 ),
                 tools=["Bash", "Read", "Write", "Edit", "Glob", "Grep"],
-                model="opus",
+                model=_MODEL_IDS["opus"],
             ),
             "memory_curator": AgentDefinition(
                 description=("Memory organizer — consolidate, retag, link, and clean up memories"),
@@ -2506,7 +2521,7 @@ async def run_agent(
                     "mcp__luke__restore",
                     "mcp__luke__bulk_memory",
                 ],
-                model="haiku",
+                model=_MODEL_IDS["haiku"],
             ),
         },
     )

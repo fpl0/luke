@@ -46,6 +46,12 @@ Four hooks customize agent behavior at lifecycle points:
 
 Runs *before* memory injection so injected context doesn't skew the heuristic.
 
+Tier names are routing keys, not model IDs. `agent._MODEL_IDS` pins each tier
+to an explicit model (haiku → `claude-haiku-4-5-20251001`, sonnet →
+`claude-sonnet-5`, opus → `claude-opus-5`) at the SDK boundary, so a model
+generation change is a one-line deliberate edit — never a side effect of a
+CLI upgrade.
+
 **Post-classification boosts:**
 - **Memory-aware boost** — if recalled memories include goals or procedures, model is bumped to at least sonnet
 - **Session ratchet** — once a conversation escalates to a higher model, it stays there for the session (resets on session timeout or error)
