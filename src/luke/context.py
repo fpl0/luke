@@ -8,6 +8,7 @@ Provides runtime context management for the agent:
 
 from __future__ import annotations
 
+import json
 import math
 import struct
 from datetime import UTC, datetime
@@ -176,6 +177,15 @@ def _cosine_similarity(a: list[float], b_blob: bytes) -> float:
     return dot / (norm_a * norm_b)
 
 
+def _parse_tags(tags_json: str) -> list[str]:
+    """Parse a tags_json blob to a list, tolerating malformed data."""
+    try:
+        tags = json.loads(tags_json or "[]")
+        return tags if isinstance(tags, list) else []
+    except (json.JSONDecodeError, TypeError):
+        return []
+
+
 def _load_priority_memories(query: str = "") -> list[dict[str, Any]]:
     """Load active memories scored for context injection priority.
 
@@ -189,12 +199,20 @@ def _load_priority_memories(query: str = "") -> list[dict[str, Any]]:
     rows = db.execute(
         """SELECT m.id, m.type, f.title, f.content,
                   COALESCE(m.importance, 1.0) AS importance,
-                  m.updated, COALESCE(m.access_count, 0) AS access_count
+                  m.updated, COALESCE(m.access_count, 0) AS access_count,
+                  COALESCE(m.tags_json, '[]') AS tags_json
            FROM memory_meta m
            JOIN memory_fts f ON m.id = f.id
            WHERE m.status = 'active'
            ORDER BY m.importance DESC, m.updated DESC"""
     ).fetchall()
+
+    # Lifecycle gate: a memory can be active (recallable) yet excluded from
+    # *proactive* injection. Closed / stale / do-not-surface threads carry a
+    # 'no-inject' tag. Without this, a high-importance closed entity keeps
+    # winning a context seat because the ranker scores importance/recency/
+    # access but never reads the lifecycle note buried in the content body.
+    rows = [r for r in rows if "no-inject" not in _parse_tags(r["tags_json"])]
 
     # --- Query-aware scoring: embed query and load memory vectors ---
     query_vec: list[float] | None = None
