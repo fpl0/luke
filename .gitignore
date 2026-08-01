@@ -40,3 +40,4 @@ letta_server.err
 # Data belongs in $LUKE_DIR, never the repo
 luke.db
 workspace/
+logs/

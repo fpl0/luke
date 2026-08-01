@@ -38,6 +38,18 @@ BASE_URL = "http://localhost:8283"
 # Curated hard directives for the read-only operating-rules block. Guardrails, not world-model —
 # the agent should read but never self-edit these (native read_only enforces it). Missing ids are
 # skipped gracefully (some hard rules live in the MEMORY.md file layer, not the sqlite store).
+# World-model anchors — always in the core blocks if active, regardless of the imp>=1.5 cut.
+# These are the load-bearing entities the 2.2a pack established; importance *decay* must never
+# silently evict them (e.g. person-christopher naturally drifted to 1.4999 — decay noise, not a
+# signal Filipe's partner stopped mattering). Decay governs recall ranking, not core-block
+# membership. Only included when status='active', so a real archive still removes them.
+ANCHOR_IDS = [
+    "person-filipe",
+    "person-christopher",
+    "project-jun27-life-update",
+    "project-theo",
+]
+
 GUARDRAIL_IDS = [
     "feedback-stay-on-sqlite",
     "feedback-no-internal-text-leak",
@@ -79,7 +91,8 @@ def build_blocks(db):
     """Return list of (label, value, read_only, description) from ground-truth sqlite."""
     blocks = []
 
-    # key-people / key-projects / preferences — entities imp>=1.5, routed by id prefix.
+    # key-people / key-projects / preferences — entities imp>=1.5 UNION the world-model anchors
+    # (so decay can't evict a load-bearing entity), routed by id prefix. Deduped by id.
     ents = _rows(
         db,
         """SELECT m.id, m.importance, f.title, f.content
@@ -87,6 +100,15 @@ def build_blocks(db):
            WHERE m.type='entity' AND m.status='active' AND m.importance>=1.5
            ORDER BY m.importance DESC""",
     )
+    seen = {r["id"] for r in ents}
+    ents = list(ents)
+    for aid in ANCHOR_IDS:
+        if aid in seen:
+            continue
+        r = _fetch(db, aid)  # active-only; a real archive keeps it out
+        if r is not None:
+            ents.append(r)
+            seen.add(aid)
     people, projects, prefs = [], [], []
     for r in ents:
         sec = _section(r["id"], r["importance"], r["title"], r["content"])
