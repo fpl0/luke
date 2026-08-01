@@ -507,6 +507,19 @@ _MIGRATIONS: list[tuple[int, str, list[str]]] = [
             "ON active_attention(chat_id, created_at DESC)",
         ],
     ),
+    (
+        14,
+        "add human_last_accessed (injection relevance signal) and suppression to memory_meta",
+        [
+            "ALTER TABLE memory_meta ADD COLUMN human_last_accessed TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE memory_meta ADD COLUMN suppression REAL NOT NULL DEFAULT 0.0",
+            # Seed the human signal from last_accessed so injection ranking does
+            # not collapse on first boot; it converges to a clean human-only
+            # signal as only conversational turns bump it going forward.
+            "UPDATE memory_meta SET human_last_accessed = last_accessed "
+            "WHERE human_last_accessed = ''",
+        ],
+    ),
 ]
 
 
