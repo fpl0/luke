@@ -8,14 +8,16 @@ import sqlite3
 import time
 from collections.abc import Coroutine
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import structlog
 from aiogram import Bot
+from aiogram.types import ReplyParameters
 from croniter import croniter
 from structlog.stdlib import BoundLogger
 
 from . import db, memory
-from .agent import run_agent
+from .agent import AgentResult, parse_delegation, run_agent, send_long_message
 from .behaviors import (
     enforce_plan_momentum,
     run_consolidation,
@@ -164,18 +166,30 @@ async def _run_task(task: TaskRecord, bot: Bot) -> None:
         type=task["schedule_type"],
     )
 
+    raw_prompt = task["prompt"]
+    if isinstance(raw_prompt, bytes):
+        raw_prompt = raw_prompt.decode("utf-8", errors="replace")
+    # Delegated jobs (created by the delegate tool) invert the delivery rule:
+    # their final text output IS the report, relayed to Filipe by code below —
+    # the loop closes deterministically, never by trusting the model to send.
+    delegation = parse_delegation(raw_prompt)
+
     try:
-        # Scheduled tasks use the same pattern as behaviors: text output is
-        # never auto-forwarded to Telegram.  The agent must call send_message
-        # (or another send tool) explicitly to reach the user.  A short
-        # preamble tells the agent this fact so it doesn't rely on text output.
-        raw_prompt = task["prompt"]
-        if isinstance(raw_prompt, bytes):
-            raw_prompt = raw_prompt.decode("utf-8")
-        prompt = (
-            "[Scheduled task — text output is not delivered to the user. "
-            "Use send_message/reply to communicate.]\n\n" + raw_prompt
-        )
+        if delegation is not None:
+            prompt = (
+                "[Delegated background job — do the work now. Your final text "
+                "output is relayed to Filipe automatically as the job's report; "
+                "make it concise and outcome-focused.]\n\n" + delegation[0]
+            )
+        else:
+            # Scheduled tasks use the same pattern as behaviors: text output is
+            # never auto-forwarded to Telegram.  The agent must call send_message
+            # (or another send tool) explicitly to reach the user.  A short
+            # preamble tells the agent this fact so it doesn't rely on text output.
+            prompt = (
+                "[Scheduled task — text output is not delivered to the user. "
+                "Use send_message/reply to communicate.]\n\n" + raw_prompt
+            )
         result = await asyncio.wait_for(
             run_agent(
                 chat_id=task["chat_id"],
@@ -208,7 +222,11 @@ async def _run_task(task: TaskRecord, bot: Bot) -> None:
             task_id=task_id,
             sent=result.sent_messages,
             dropped_texts=len(result.texts),
+            delegated=delegation is not None,
         )
+
+        if delegation is not None:
+            await _deliver_delegation_report(task, result, delegation[1], bot)
 
         # One-time tasks complete after running
         if task["schedule_type"] == "once":
@@ -231,12 +249,53 @@ async def _run_task(task: TaskRecord, bot: Bot) -> None:
                 )
             except Exception:
                 log.exception("Failed to send task failure alert")
+        # A delegated job is a promise to Filipe — its death must speak.
+        # Once-tasks don't retry, so this is the only notice he'll ever get.
+        if delegation is not None:
+            try:
+                await send_long_message(
+                    bot,
+                    chat_id=int(task["chat_id"]),
+                    text=(
+                        f"⚠️ Background job {task_id} died: {detail}\n"
+                        "It won't retry on its own — re-delegate if still needed."
+                    ),
+                )
+            except Exception:
+                log.exception("delegation_death_report_failed", task_id=task_id)
         # Mark failed once-tasks as completed to prevent retry storms
         if task["schedule_type"] == "once":
             db.update_task_status(task_id, "completed")
     finally:
         # Always update last_run to prevent immediate re-firing on next tick
         db.update_task_last_run(task_id, started)
+
+
+async def _deliver_delegation_report(
+    task: TaskRecord,
+    result: AgentResult,
+    trigger_msg_id: int | None,
+    bot: Bot,
+) -> None:
+    """Relay a delegated job's outcome to Filipe. The loop ALWAYS closes:
+    real output is forwarded verbatim, a job that already reported through
+    send tools is left alone, and an empty result is flagged — a background
+    job can only ever end by messaging (or having messaged) the chat."""
+    reply = "\n\n".join(result.texts).strip()
+    if not reply:
+        if result.sent_messages > 0:
+            return  # the job already delivered its report via send tools
+        reply = (
+            f"Background job {task['id']} finished but produced no output — "
+            "flagging it so it doesn't disappear silently."
+        )
+    kwargs: dict[str, Any] = {}
+    if trigger_msg_id:
+        kwargs["reply_parameters"] = ReplyParameters(message_id=trigger_msg_id)
+    try:
+        await send_long_message(bot, chat_id=int(task["chat_id"]), text=reply, **kwargs)
+    except Exception:
+        log.exception("delegation_report_failed", task_id=task["id"])
 
 
 _running_tasks: dict[str, asyncio.Task[None]] = {}

@@ -70,6 +70,30 @@ Three specialized agents for parallel work:
 
 Each sub-agent has a restricted tool set.
 
+Sub-agents are children of the per-turn SDK client: they die when the turn
+ends. In live conversations the `Task` tool is therefore blocked (PreToolUse
+hook) and background work is steered to `delegate`. In autonomous runs
+(crons, deep work) there is no interrupting message, so within-turn
+sub-agents are safe — but a turn that ends with sub-agents still running
+logs `subagents_orphaned` so a killed agent is never mistaken for a
+finished one.
+
+## Delegation
+
+`delegate(prompt, trigger_msg_id)` runs background work that outlives the
+turn. It persists the job as a `once` task in the tasks table (wrapped in a
+`[delegation:v1]` envelope) and wakes the scheduler instantly via the bus —
+durable by construction: an in-flight job survives restarts because boot
+replays past-due once-tasks. The feedback loop closes deterministically in
+`_run_task`, never by trusting the model to remember to send:
+
+- the job's final text output is relayed to Filipe verbatim (as a reply to
+  `trigger_msg_id` when given)
+- a job that already reported through send tools is left alone
+- a job with no output at all is flagged explicitly
+- a crash or timeout sends "job died: <reason>" — once-jobs don't retry, so
+  death is never silent
+
 ## Sessions
 
 Session IDs are stored in the database and passed as `resume` to the SDK. Multi-turn conversations persist across `process()` calls. Stale sessions are cleaned hourly (default: 1 hour timeout). On retry exhaustion, the session is cleared.

@@ -7,7 +7,6 @@ import hashlib
 import json
 import re
 import time
-import uuid
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -644,50 +643,33 @@ _AUTO_SKILL_THRESHOLD: int = 5  # tool calls to trigger procedure extraction in 
 # Active client registry — enables external interruption of running agents
 _active_clients: dict[str, ClaudeSDKClient] = {}
 
-# Background job registry — tasks that survive across turns and per-chat locks
-_bg_jobs: dict[str, asyncio.Task[None]] = {}
+# Delegation envelope — delegate-created once-tasks carry this header so the
+# scheduler can tell "relay the result to Filipe" jobs apart from ordinary
+# scheduled tasks. Delegations are DB-backed (tasks table) rather than bare
+# asyncio tasks precisely so they survive restarts: the pre-2026-08-01 in-
+# process registry lost every in-flight job on deploy/crash, silently.
+_DELEGATION_HEADER = "[delegation:v1]"
 
 
-async def _run_bg_job(
-    job_id: str,
-    chat_id: str,
-    prompt: str,
-    trigger_msg_id: int | None,
-    bot: Bot,
-) -> None:
-    """Run an agent in the background, independent of the per-turn client and per-chat lock."""
-    log.info("bg_job_start", job_id=job_id, chat_id=chat_id)
-    reply_text = ""
-    try:
-        result = await run_agent(
-            chat_id=chat_id,
-            prompt=prompt,
-            session_id=None,
-            bot=bot,
-            autonomous=True,
-        )
-        reply_text = "\n\n".join(result.texts) if result.texts else ""
-    except Exception as exc:
-        log.exception("bg_job_failed", job_id=job_id, chat_id=chat_id)
-        reply_text = f"Background task hit an error: {exc}"
-    finally:
-        _bg_jobs.pop(job_id, None)
-        log.info("bg_job_done", job_id=job_id, chat_id=chat_id)
+def format_delegation_prompt(prompt: str, trigger_msg_id: int | None) -> str:
+    """Wrap a delegated job's prompt in the durable v1 envelope."""
+    return f"{_DELEGATION_HEADER}\ntrigger_msg_id: {trigger_msg_id or ''}\n\n{prompt}"
 
-    if not reply_text:
-        # Never vanish silently: a job that ran but produced no text still
-        # reports back, so a background task can only ever end by messaging you.
-        reply_text = (
-            f"Background job {job_id} finished but produced no output — "
-            "flagging it so it doesn't disappear silently."
-        )
-    try:
-        kwargs: dict[str, Any] = {}
-        if trigger_msg_id:
-            kwargs["reply_parameters"] = ReplyParameters(message_id=trigger_msg_id)
-        await send_long_message(bot, chat_id=int(chat_id), text=reply_text, **kwargs)
-    except Exception:
-        log.exception("bg_job_reply_failed", job_id=job_id, chat_id=chat_id)
+
+def parse_delegation(stored: str) -> tuple[str, int | None] | None:
+    """Return (body, trigger_msg_id) if `stored` is a delegation envelope, else None."""
+    if not stored.startswith(_DELEGATION_HEADER):
+        return None
+    header, _, body = stored.partition("\n\n")
+    trigger: int | None = None
+    for line in header.splitlines()[1:]:
+        if line.startswith("trigger_msg_id:"):
+            value = line.split(":", 1)[1].strip()
+            try:
+                trigger = int(value) if value else None
+            except ValueError:
+                trigger = None
+    return body, trigger
 
 
 async def interrupt_agent(chat_id: str) -> bool:
@@ -1604,9 +1586,12 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
     @tool(
         "delegate",
         (
-            "Spawn a self-contained agent task in the background and return immediately. "
-            "The conversation stays unblocked while the task runs. "
-            "On completion the result is sent back referencing trigger_msg_id. "
+            "Spawn a self-contained agent job in the background and return "
+            "immediately — the conversation stays unblocked while it runs. "
+            "The job is durable: it survives restarts, is bounded by the agent "
+            "timeout, and ALWAYS closes the loop — its final text output is "
+            "relayed to Filipe automatically (as a reply to trigger_msg_id), "
+            "and a crash sends an explicit failure notice instead of silence. "
             "prompt must be fully self-contained (no shared context from this turn). "
             "Use for: research that takes >30s, file builds, multi-step analysis."
         ),
@@ -1614,12 +1599,21 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
         annotations=_OPEN_WORLD,
     )
     async def t_delegate(args: dict[str, Any]) -> dict[str, Any]:
-        job_id = uuid.uuid4().hex[:8]
-        task = asyncio.create_task(
-            _run_bg_job(job_id, chat_id, args["prompt"], args.get("trigger_msg_id"), bot)
+        job_id = db.create_task(
+            chat_id,
+            format_delegation_prompt(args["prompt"], args.get("trigger_msg_id")),
+            "once",
+            datetime.now(UTC).isoformat(),
         )
-        _bg_jobs[job_id] = task
-        return _ok(f"job:{job_id} running in background — will reply when done.")
+        bus.emit(
+            "cron_created",
+            {
+                "task_id": job_id,
+                "schedule_type": "once",
+                "prompt_preview": args["prompt"][:200],
+            },
+        )
+        return _ok(f"job:{job_id} queued — runs in background and reports back when done.")
 
     return create_sdk_mcp_server(
         name="luke",
@@ -2623,4 +2617,14 @@ async def run_agent(
 
     result.sent_messages = send_count["n"]
     result.tool_uses = tool_count["n"]
+    # Subagents that started but never stopped were killed by the turn ending
+    # (timeout/interrupt/teardown). Surface it — a dead subagent must never be
+    # indistinguishable from a finished one.
+    if subagent_start_times:
+        log.warning(
+            "subagents_orphaned",
+            chat_id=chat_id,
+            count=len(subagent_start_times),
+            agent_ids=list(subagent_start_times),
+        )
     return result
