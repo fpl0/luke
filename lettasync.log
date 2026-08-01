@@ -1,0 +1,3 @@
+[2026-08-01T03:30:00.080786+00:00] watermark=2026-07-31T08:08:32.624640+00:00  candidate ids=19
+DELTA SYNC ok=19 fail=0
+watermark advanced -> 2026-08-01T03:30:00.080786+00:00

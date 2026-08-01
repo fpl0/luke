@@ -104,7 +104,18 @@ def _openai_to_anthropic(body):
     out = {
         "model": _map_model(body.get("model")),
         "max_tokens": int(body.get("max_tokens") or DEFAULT_MAX_TOKENS),
-        "system": "\n\n".join(p for p in system_parts if p),
+        # System as TWO blocks: the blessed identity line ALONE (block 1), then the
+        # custom bulk in a SEPARATE cached block (block 2). CRITICAL — verified 2026-08-01:
+        #   • plain-string 26k system                        -> 429 (rate_limit_error)
+        #   • identity+bulk COMBINED in one cached block      -> 429  (identity unrecognized)
+        #   • identity block ALONE + bulk in a cached block   -> 200  (cache_creation/read)
+        # The OAuth path matches the FIRST system block against the known Claude Code
+        # identity; gluing custom content onto it defeats that match and the whole (large,
+        # uncached-equivalent) system trips the subscription rate window. Splitting keeps
+        # the identity recognized AND turns the heavy custom bulk into cheap cache tokens
+        # the limiter treats leniently. Letta ships ~26k chars of core blocks every turn,
+        # so without this a single Letta ReAct turn 429s (the whole Phase-1.4 blocker).
+        "system": _build_system_blocks(system_parts),
         "messages": messages,
     }
     if body.get("temperature") is not None:
@@ -120,9 +131,25 @@ def _openai_to_anthropic(body):
                 "description": fn.get("description", ""),
                 "input_schema": fn.get("parameters") or {"type": "object", "properties": {}},
             })
+        # Cache the (stable, per-turn-identical) tool block too — same rate-limit rationale.
+        if out["tools"]:
+            out["tools"][-1]["cache_control"] = {"type": "ephemeral"}
         tc = body.get("tool_choice")
         out["tool_choice"] = _map_tool_choice(tc)
     return out
+
+
+def _build_system_blocks(system_parts):
+    """Identity line as its own block (so the OAuth path recognizes it), the rest cached.
+    See the rate-limit rationale at the call site."""
+    parts = [p for p in system_parts if p]
+    if not parts:
+        return [{"type": "text", "text": CLAUDE_CODE_IDENTITY}]
+    blocks = [{"type": "text", "text": parts[0]}]  # identity — standalone, uncached
+    rest = "\n\n".join(parts[1:])
+    if rest:
+        blocks.append({"type": "text", "text": rest, "cache_control": {"type": "ephemeral"}})
+    return blocks
 
 
 def _as_text(content):
@@ -207,6 +234,11 @@ def _call_anthropic(payload, max_retries=4):
     one rate-limit pool with the live SDK-Luke session, so transient 429s are expected
     under contention and must be retried, not surfaced as hard failures to Letta."""
     data = json.dumps(payload).encode()
+    _dbg = os.environ.get("BRIDGE_DEBUG")
+    if _dbg:
+        print(f"[dbg] req bytes={len(data)} sys_chars={len(payload.get('system','') or '')} "
+              f"tools={len(payload.get('tools',[]) or [])} msgs={len(payload.get('messages',[]) or [])} "
+              f"max_tokens={payload.get('max_tokens')}", flush=True)
     delay = 2.0
     last_err = None
     for attempt in range(max_retries + 1):
@@ -219,6 +251,13 @@ def _call_anthropic(payload, max_retries=4):
             with urllib.request.urlopen(req, timeout=120) as r:
                 return json.loads(r.read())
         except urllib.error.HTTPError as e:
+            if _dbg:
+                _b = ""
+                try:
+                    _b = e.read().decode(errors="replace")[:400]
+                except Exception:
+                    pass
+                print(f"[dbg] HTTP {e.code} attempt={attempt} retry-after={e.headers.get('retry-after')} body={_b}", flush=True)
             if e.code in (429, 529) or 500 <= e.code < 600:
                 last_err = e
                 if attempt < max_retries:
