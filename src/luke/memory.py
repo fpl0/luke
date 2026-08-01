@@ -10,6 +10,7 @@ import math
 import re
 import sqlite3
 import struct
+from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, NotRequired, TypedDict, cast
@@ -652,6 +653,10 @@ def index_memory(
                 )
             _commit(_db())
         except Exception:
+            # Roll back so the write lock acquired by a partial insert is
+            # released — swallowing without rollback leaks it process-wide.
+            with suppress(Exception):
+                _db().rollback()
             log.warning("memory_evolution_failed", mem_id=mem_id)
 
     # Emit event for procedure updates (drives cron-memory sync)
