@@ -34,6 +34,8 @@ lettasync.err
 bgeembed.log
 bgeembed.err
 openapi_letta.json
+letta_server.out
+letta_server.err
 
 # Data belongs in $LUKE_DIR, never the repo
 luke.db
