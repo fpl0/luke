@@ -84,6 +84,8 @@ def build_letta_context(agent_id: str | None = None) -> str | None:
     on any error so the caller keeps the sqlite blob (fail-safe, reversible).
     """
     agent_id = agent_id or settings.letta_agent_id
+    if not agent_id:
+        return None  # no agent provisioned for this deployment — sqlite blob path
     blocks = _get_core_blocks(agent_id)
     if not blocks:
         return None
@@ -248,13 +250,11 @@ def drive_letta_turn(
     on core blocks alone. ``error`` is a short string on a transport/turn failure, else None.
     """
     agent_id = agent_id or settings.letta_agent_id
-    injected = False
-    msg = user_msg
-    if inject_recall:
-        inj = build_recall_injection(user_msg)
-        if inj:
-            msg = f"{inj}\n\n[Answer using the retrieved facts above where relevant.]\n{user_msg}"
-            injected = True
+    if not agent_id:
+        return {"seconds": 0.0, "reply": "", "tools": [], "injected": False,
+                "error": "no letta_agent_id configured"}
+    msg = compose_letta_turn_input(user_msg) if inject_recall else user_msg
+    injected = msg is not user_msg
 
     url = f"{settings.letta_base_url}/v1/agents/{agent_id}/messages"
     data = json.dumps({"messages": [{"role": "user", "content": msg}]}).encode()

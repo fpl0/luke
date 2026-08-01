@@ -4,6 +4,7 @@ import os
 import sys
 from functools import cached_property
 from pathlib import Path
+from typing import Literal
 
 from pydantic import SecretStr, ValidationError, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -42,25 +43,26 @@ class Settings(BaseSettings):
     recency_decay_days: float = 30.0  # half-life for recency scoring
     rrf_k: int = 60  # Reciprocal Rank Fusion constant
 
-    # Memory backend for semantic recall. "sqlite" = in-process sqlite-vec (bge-base).
-    # "letta" = source semantic candidates from a running Letta server (fails safe back
-    # to sqlite on any error). Flip this flag to switch; it is fully reversible.
-    memory_backend: str = "sqlite"
+    # Letta backend seams (both reversible; see docs/letta-migration-notes.md).
+    # memory_backend: where recall() sources semantic candidates — "sqlite" is the
+    # in-process sqlite-vec index, "letta" a running Letta server's vector store,
+    # failing safe back to sqlite on any error. agent_backend: where a turn's
+    # always-in-context world model comes from — "sdk" is the build_working_context
+    # blob, "letta" the agent's self-editing core memory blocks, failing safe back
+    # to the blob.
+    memory_backend: Literal["sqlite", "letta"] = "sqlite"
+    agent_backend: Literal["sdk", "letta"] = "sdk"
     letta_base_url: str = "http://localhost:8283"
-    letta_archive_id: str = "archive-7654f6f5-542a-47b6-bdb9-3542f1cb9eca"  # bge-base title+content parity (12/12 top-1 vs sqlite-vec; supersedes content-only archive-2918733f @ 8/12) — Phase 2.3
-    # Phase 2.2c: when backend=letta, mirror remember()/index_memory writes into the Letta
-    # archive live (idempotent upsert by luke_id) so the shadow-run stays current without
-    # waiting on the daily delta-sync. Best-effort + fail-safe: a write-through failure never
-    # breaks the sqlite write. Off unless on the letta backend; fully reversible.
+    # Deployment-specific server ids — set in .env, produced by the provisioning
+    # scripts (letta_load_bge_titled.py → archive id, letta_luke_on_claude.py →
+    # agent id). Empty disables the corresponding letta path even when the
+    # backend flag says "letta".
+    letta_archive_id: str = ""
+    letta_agent_id: str = ""
+    # Mirror remember/connect/forget/restore into the Letta archive live (idempotent
+    # upsert by luke_id). Only active on the letta backend; a failure never breaks
+    # the sqlite write — the daily delta-sync remains the backstop.
     letta_write_through: bool = True
-    # Phase 4.1: agent-loop backend. "sdk" = the current Claude Agent SDK turn, with the
-    # working-memory blob injected into the system prompt (build_working_context). "letta" =
-    # source the always-in-context persona/human/world-model from the luke-agent-claude core
-    # blocks (packed in 2.2a) instead of re-injecting the blob every turn — the whole point of
-    # the migration. Defaults to "sdk"; the "letta" path is gated off until the live end-to-end
-    # turn is proven in a low-contention window. Fully reversible (flip back to "sdk").
-    agent_backend: str = "sdk"
-    letta_agent_id: str = "agent-36671c0b-a133-4bfb-a367-f23f7135071a"  # luke-agent-claude (Claude bridge, 7 core blocks)
     max_consolidation_clusters: int = 3  # max clusters per consolidation run
     utility_floor: float = 0.7  # minimum fraction of access_score at 0% utility
     utility_weight: float = 0.3  # how much utility_rate can boost above floor

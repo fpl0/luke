@@ -111,7 +111,11 @@ def letta_write_through(mem_id: str) -> None:
     exact mirror of what was committed. No-op unless on the letta backend with write-through
     enabled. Never raises — the sqlite write already succeeded.
     """
-    if settings.memory_backend != "letta" or not settings.letta_write_through:
+    if (
+        settings.memory_backend != "letta"
+        or not settings.letta_write_through
+        or not settings.letta_archive_id
+    ):
         return
     try:
         _write_through_impl(mem_id)

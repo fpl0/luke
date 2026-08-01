@@ -1238,7 +1238,10 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
         annotations=_READ_ONLY,
     )
     async def mem_recall(args: dict[str, Any]) -> dict[str, Any]:
-        results = memory.recall(
+        # Off-loop: recall embeds the query and, on the letta backend, makes a
+        # blocking HTTP call — neither may stall the event loop mid-turn.
+        results = await asyncio.to_thread(
+            memory.recall,
             query=args.get("query", ""),
             mem_type=args.get("type"),
             after=args.get("after"),
