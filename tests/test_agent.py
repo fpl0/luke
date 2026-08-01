@@ -425,6 +425,43 @@ class TestResolveModelId:
 
 
 # ---------------------------------------------------------------------------
+# _compose_system_append
+# ---------------------------------------------------------------------------
+
+
+class TestComposeSystemAppend:
+    """Persona must close the system prompt — voice wins recency over memory."""
+
+    def test_persona_comes_after_working_memory(self) -> None:
+        from luke.agent import _compose_system_append
+
+        out = _compose_system_append("You are Luke.", "proc-deploy: run the script")
+        assert out.index("proc-deploy") < out.index("You are Luke.")
+        assert out.rstrip().endswith("You are Luke.")
+
+    def test_working_memory_is_framed_as_knowledge_not_voice(self) -> None:
+        from luke.agent import _compose_system_append
+
+        out = _compose_system_append("persona", "some memories")
+        assert out.startswith("<working_memory>")
+        assert "never how you sound" in out
+        assert "</working_memory>" in out
+
+    def test_no_working_memory_returns_bare_persona(self) -> None:
+        from luke.agent import _compose_system_append
+
+        assert _compose_system_append("You are Luke.", None) == "You are Luke."
+        assert _compose_system_append("You are Luke.", "") == "You are Luke."
+
+    def test_no_persona_returns_framed_memory(self) -> None:
+        from luke.agent import _compose_system_append
+
+        out = _compose_system_append("", "memories")
+        assert out.startswith("<working_memory>")
+        assert out.endswith("</working_memory>")
+
+
+# ---------------------------------------------------------------------------
 # _INTERNAL_RE
 # ---------------------------------------------------------------------------
 

@@ -1322,3 +1322,31 @@ class TestExtractPendingActions:
 
         actions = _extract_pending_actions(["Just a plain statement with no action."])
         assert actions == []
+
+
+class TestEnsureDirsSeedsVoice:
+    """Fresh installs must get the output style — it carries Luke's register."""
+
+    def test_seeds_output_style_and_settings(self, tmp_settings: Any) -> None:
+        from luke.app import _ensure_dirs
+
+        _ensure_dirs()
+
+        style = settings.luke_dir / ".claude" / "output-styles" / "luke.md"
+        assert style.exists()
+        assert "never a customer-service rep" in style.read_text()
+
+        cfg = settings.luke_dir / ".claude" / "settings.json"
+        assert cfg.exists()
+        assert '"outputStyle": "luke"' in cfg.read_text()
+
+    def test_does_not_clobber_existing_settings(self, tmp_settings: Any) -> None:
+        from luke.app import _ensure_dirs
+
+        cfg = settings.luke_dir / ".claude" / "settings.json"
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        cfg.write_text('{"outputStyle": "custom"}')
+
+        _ensure_dirs()
+
+        assert cfg.read_text() == '{"outputStyle": "custom"}'

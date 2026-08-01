@@ -100,10 +100,20 @@ Session IDs are stored in the database and passed as `resume` to the SDK. Multi-
 
 ## System Prompt
 
-Two layers:
+Three layers:
 
 1. **`claude_code` preset** — tool competence (Bash, files, web, sub-agents)
-2. **LUKE.md persona** — personality, behavioral guidelines, memory instructions
+2. **Output style** (`$LUKE_DIR/.claude/output-styles/luke.md`) — Luke's
+   register. This *replaces* the preset's own style instructions (terse,
+   technical, CLI-shaped) rather than fighting them; an appended persona
+   alone can't do that. Selected via `outputStyle` in
+   `$LUKE_DIR/.claude/settings.json`, seeded from the repo template on boot.
+3. **Append** — assembled by `_compose_system_append()`: working memory
+   first (framed as knowledge, "never how you sound"), LUKE.md persona +
+   constitutional layer LAST. The model's register tracks the most recent
+   instructions it read; with the persona first, up to 12k tokens of
+   clinical memory prose landed after it and Luke answered like a status
+   report (found 2026-08-01).
 
 See [persona](persona.md).
 

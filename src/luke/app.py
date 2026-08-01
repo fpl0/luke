@@ -1455,6 +1455,21 @@ def _ensure_dirs() -> None:
         template = Path(__file__).parent / "templates" / "LUKE.md"
         if template.exists():
             shutil.copy2(template, persona_dest)
+    # Seed the output style — replaces the claude_code preset's CLI register
+    # (terse, technical) with Luke's voice. Appending the persona alone can't
+    # do this: it fights the preset's own style instructions instead of
+    # substituting them. The CLI resolves outputStyle from project settings
+    # (setting_sources includes "project"; cwd is luke_dir).
+    style_dest = settings.luke_dir / ".claude" / "output-styles" / "luke.md"
+    if not style_dest.exists():
+        style_template = Path(__file__).parent / "templates" / "output-styles" / "luke.md"
+        if style_template.exists():
+            style_dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(style_template, style_dest)
+    settings_dest = settings.luke_dir / ".claude" / "settings.json"
+    if not settings_dest.exists():
+        settings_dest.parent.mkdir(parents=True, exist_ok=True)
+        settings_dest.write_text('{\n  "outputStyle": "luke"\n}\n')
 
 
 def _startup_self_test() -> None:

@@ -672,6 +672,28 @@ def parse_delegation(stored: str) -> tuple[str, int | None] | None:
     return body, trigger
 
 
+def _compose_system_append(persona: str, working_ctx: str | None) -> str:
+    """Assemble the system-prompt append: working memory FIRST, persona LAST.
+
+    The model's register tracks the most recent instructions it read. With
+    the persona first, up to 12k tokens of clinical memory prose landed after
+    it and Luke answered like a status report (Filipe, 2026-08-01: "not
+    really following his personality"). Working memory is framed as knowledge
+    — not voice — and the persona closes the prompt so it wins recency.
+    """
+    if not working_ctx:
+        return persona
+    framed = (
+        "<working_memory>\n"
+        "Background knowledge. It informs what you know — never how you sound.\n"
+        + working_ctx
+        + "\n</working_memory>"
+    )
+    if not persona:
+        return framed
+    return framed + "\n\n" + persona
+
+
 async def interrupt_agent(chat_id: str) -> bool:
     """Interrupt a running agent for the given chat. Returns True if interrupted."""
     client = _active_clients.get(chat_id)
@@ -2011,8 +2033,7 @@ async def run_agent(
         working_ctx = context.build_working_context(
             query=prompt_text_for_context, budget_tokens=ctx_budget
         )
-    if working_ctx:
-        persona += "\n\n" + working_ctx
+    system_append = _compose_system_append(persona, working_ctx)
 
     # Per-run counters and timing state (closed over by hooks)
     send_count = {"n": 0}
@@ -2455,7 +2476,7 @@ async def run_agent(
         resume=session_id,
         model=_resolve_model_id(effective_model),
         fallback_model=_resolve_model_id(fallback) if fallback else None,
-        system_prompt={"type": "preset", "preset": "claude_code", "append": persona},
+        system_prompt={"type": "preset", "preset": "claude_code", "append": system_append},
         allowed_tools=allowed,
         permission_mode="bypassPermissions",
         setting_sources=["project", "user"],
