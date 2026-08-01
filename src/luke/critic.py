@@ -127,7 +127,6 @@ async def _collect_text(prompt: str, system_prompt: str = _CRITIC_SYSTEM_PROMPT)
         model=settings.critic_model,
         system_prompt=system_prompt,
         max_turns=1,
-        max_budget_usd=settings.critic_max_budget_usd,
         permission_mode="bypassPermissions",
         allowed_tools=[],
     )

@@ -1467,20 +1467,6 @@ def get_rolling_avg_cost(days: int = 7) -> float:
     return float(row["avg_per_run"]) if row else 0.0
 
 
-def get_daily_deep_work_cost() -> float:
-    """Sum of deep work behavior costs today."""
-    row = (
-        _db()
-        .execute(
-            "SELECT COALESCE(SUM(cost_usd), 0) AS total "
-            "FROM cost_log WHERE source LIKE 'behavior:deep_work%' "
-            "AND timestamp >= date('now')",
-        )
-        .fetchone()
-    )
-    return float(row["total"]) if row else 0.0
-
-
 # ---------------------------------------------------------------------------
 # Deep Work Quality Tracking
 # ---------------------------------------------------------------------------

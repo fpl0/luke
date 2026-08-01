@@ -1,4 +1,4 @@
-"""Unit tests for luke.planner — intent generation, priority, backoff, budget gating."""
+"""Unit tests for luke.planner — intent generation, priority, backoff, attention gating."""
 
 from __future__ import annotations
 
@@ -31,7 +31,6 @@ def _mock_db(
     elapsed: dict[str, float] | None = None,
     unconsumed: dict[str, int] | None = None,
     no_ops: dict[str, int] | None = None,
-    daily_cost: float = 0.0,
 ) -> MagicMock:
     """Build a mock db with configurable per-behavior elapsed times and events."""
     elapsed = elapsed or {}
@@ -54,7 +53,6 @@ def _mock_db(
     m.get_behavior_last_run.side_effect = _get_last_run
     m.get_behavior_no_ops.side_effect = _get_no_ops
     m.count_unconsumed_events.side_effect = _count_events
-    m.get_daily_deep_work_cost.return_value = daily_cost
     m.ensure_utc = _real_ensure_utc
     return m
 
@@ -71,11 +69,7 @@ def _mock_settings(**overrides: float) -> MagicMock:
         "lifecycle_review_interval": 2592000.0,
         "skill_extraction_interval": 21600.0,
         "dream_interval": 21600.0,
-        "dream_max_budget_usd": 2.0,
         "deep_work_interval": 7200.0,
-        "deep_work_max_budget_usd": 10.0,
-        "daily_deep_work_budget_usd": 120.0,
-        "behavior_max_budget_usd": 1.5,
     }
     defaults.update(overrides)
     m = MagicMock()
@@ -91,18 +85,18 @@ def _mock_settings(**overrides: float) -> MagicMock:
 
 class TestIntent:
     def test_frozen(self) -> None:
-        intent = Intent("deep_work", 0.85, "goal", 10.0)
+        intent = Intent("deep_work", 0.85, "goal")
         with pytest.raises(AttributeError):
             intent.priority = 0.5  # type: ignore[misc]
 
     def test_default_context(self) -> None:
-        intent = Intent("consolidation", 0.5, "event", 1.5)
+        intent = Intent("consolidation", 0.5, "event")
         assert intent.context == {}
 
     def test_context_preserved(self) -> None:
-        ctx = {"daily_remaining_usd": 50.0}
-        intent = Intent("deep_work", 0.85, "goal", 10.0, context=ctx)
-        assert intent.context["daily_remaining_usd"] == 50.0
+        ctx = {"goal_id": "g1"}
+        intent = Intent("deep_work", 0.85, "goal", context=ctx)
+        assert intent.context["goal_id"] == "g1"
 
 
 # ---------------------------------------------------------------------------
@@ -190,30 +184,6 @@ class TestDeepWorkIntents:
         with patch("luke.planner.db", new=db), patch("luke.planner.settings", new=s):
             assert _deep_work_intents() == []
 
-    def test_budget_exhausted(self) -> None:
-        """Daily budget spent → no intent even if overdue."""
-        db = _mock_db(
-            elapsed={"deep_work": 100000.0},
-            unconsumed={"goal_updated": 5},
-            daily_cost=120.0,
-        )
-        s = _mock_settings()
-        with patch("luke.planner.db", new=db), patch("luke.planner.settings", new=s):
-            assert _deep_work_intents() == []
-
-    def test_budget_caps_intent_cost(self) -> None:
-        """Intent budget_usd is min(max_budget, remaining)."""
-        db = _mock_db(
-            elapsed={"deep_work": 100000.0},
-            unconsumed={"goal_updated": 1},
-            daily_cost=115.0,  # only $5 remaining
-        )
-        s = _mock_settings()
-        with patch("luke.planner.db", new=db), patch("luke.planner.settings", new=s):
-            intents = _deep_work_intents()
-            assert len(intents) == 1
-            assert intents[0].budget_usd == 5.0  # min(10.0, 5.0)
-
     def test_never_ran_triggers_intent(self) -> None:
         """If deep_work never ran (elapsed=inf), intent fires."""
         db = _mock_db(elapsed={}, unconsumed={"goal_updated": 1})  # no entry → inf
@@ -293,18 +263,19 @@ class TestMaintenanceIntents:
             assert len(scan) == 1
             assert scan[0].source == "time"
 
-    def test_dream_uses_dream_budget(self) -> None:
-        """Dream intent uses dream_max_budget_usd, not behavior_max_budget_usd."""
+    def test_dream_event_driven(self) -> None:
+        """Dream fires at event priority when fresh material exists."""
         db = _mock_db(
             elapsed={"dream": 25000.0},
             unconsumed={"new_insight": 1},
         )
-        s = _mock_settings(dream_max_budget_usd=2.0, behavior_max_budget_usd=1.5)
+        s = _mock_settings()
         with patch("luke.planner.db", new=db), patch("luke.planner.settings", new=s):
             intents = _maintenance_intents()
             dream = [i for i in intents if i.kind == "dream"]
             assert len(dream) == 1
-            assert dream[0].budget_usd == 2.0
+            assert dream[0].priority == 0.30
+            assert dream[0].source == "event"
 
     def test_nothing_due(self) -> None:
         """Nothing is due → empty list."""
@@ -363,9 +334,9 @@ class TestGenerateAndPlan:
     def test_plan_partitions_correctly(self) -> None:
         """plan() separates maintenance from deep_work."""
         intents = [
-            Intent("consolidation", 0.50, "event", 1.5),
-            Intent("proactive_scan", 0.55, "event", 1.5),
-            Intent("deep_work", 0.85, "goal", 10.0),
+            Intent("consolidation", 0.50, "event"),
+            Intent("proactive_scan", 0.55, "event"),
+            Intent("deep_work", 0.85, "goal"),
         ]
         maint, dw = plan(intents)
         assert len(maint) == 2
@@ -375,7 +346,7 @@ class TestGenerateAndPlan:
     def test_plan_no_deep_work(self) -> None:
         """plan() returns None for deep_work when none present."""
         intents = [
-            Intent("consolidation", 0.50, "event", 1.5),
+            Intent("consolidation", 0.50, "event"),
         ]
         maint, dw = plan(intents)
         assert len(maint) == 1
@@ -384,9 +355,9 @@ class TestGenerateAndPlan:
     def test_plan_maintenance_sorted_by_priority(self) -> None:
         """Maintenance intents come out highest-priority first."""
         intents = [
-            Intent("dream", 0.20, "time", 2.0),
-            Intent("proactive_scan", 0.55, "event", 1.5),
-            Intent("consolidation", 0.35, "time", 1.5),
+            Intent("dream", 0.20, "time"),
+            Intent("proactive_scan", 0.55, "event"),
+            Intent("consolidation", 0.35, "time"),
         ]
         maint, _ = plan(intents)
         priorities = [i.priority for i in maint]
@@ -464,7 +435,6 @@ class TestEnforceAttentionBudget:
                     "dream",
                     0.30,
                     "event",
-                    2.0,
                     asks_attention=True,
                     attention_cost=1,
                     attention_urgency=0.2,
@@ -488,7 +458,6 @@ class TestEnforceAttentionBudget:
                 "proactive_scan",
                 0.55,
                 "event",
-                1.5,
                 asks_attention=True,
                 attention_cost=2,
                 attention_urgency=0.7,
@@ -508,7 +477,7 @@ class TestEnforceAttentionBudget:
             patch("luke.planner.settings", new=s),
             patch("luke.bus.bus", new=bus),
         ):
-            silent = Intent("consolidation", 0.50, "event", 1.5)  # asks_attention=False default
+            silent = Intent("consolidation", 0.50, "event")  # asks_attention=False default
             kept = _enforce_attention_budget([silent])
             assert kept == [silent]
 
@@ -526,7 +495,6 @@ class TestEnforceAttentionBudget:
                 "dream",
                 0.30,
                 "event",
-                2.0,
                 asks_attention=True,
                 attention_cost=1,
                 attention_urgency=0.2,
@@ -551,7 +519,6 @@ class TestEnforceAttentionBudget:
                 "dream",
                 0.30,
                 "event",
-                2.0,
                 asks_attention=True,
                 attention_cost=1,
                 attention_urgency=0.2,
@@ -580,7 +547,6 @@ class TestEnforceAttentionBudget:
                 "dream",
                 0.30,
                 "event",
-                2.0,
                 asks_attention=True,
                 attention_cost=1,
                 attention_urgency=0.2,
@@ -589,7 +555,6 @@ class TestEnforceAttentionBudget:
                 "dream",
                 0.30,
                 "event",
-                2.0,
                 asks_attention=True,
                 attention_cost=2,  # 1 left after first → would need reserve, not urgent
                 attention_urgency=0.2,
@@ -619,7 +584,6 @@ class TestEnforceAttentionBudget:
                 "dream",
                 0.30,
                 "event",
-                2.0,
                 asks_attention=True,
                 attention_cost=1,
                 attention_urgency=0.2,

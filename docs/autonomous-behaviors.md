@@ -1,6 +1,6 @@
 # Autonomous Behaviors
 
-Four agent invocations run on timers, independent of user messages. Each has a specific prompt, budget limit, and purpose. Models are routed per behavior via config settings.
+Four agent invocations run on timers, independent of user messages. Each has a specific prompt, turn limit, and purpose. Models are routed per behavior via config settings.
 
 ## Scheduler
 
@@ -20,7 +20,7 @@ tick
   │     └── Reflection (weekly) + FTS pruning
   │
   ├── Launch deep work as background task (asyncio.create_task, non-blocking)
-  │     └── Deep work (every 8h, budget-limited) — autonomous goal execution
+  │     └── Deep work — autonomous goal execution with lifecycle notifications
   │
   └── Check user-created tasks (cron / interval / once)
 ```
@@ -60,21 +60,21 @@ Autonomous multi-step goal execution with plan-before-execute pattern:
 3. **Wrap up** — saves summary episode, marks plan completed/blocked
 
 Key differences from the old goal execution:
-- **Multi-step** — executes as many steps as budget allows, not just one
+- **Multi-step** — executes as many steps as it can, not just one
 - **Plan persistence** — plans survive crashes; next session resumes from saved plan
-- **Budget-limited** — per-session cap (`deep_work_max_budget_usd`) + daily cap (`daily_deep_work_budget_usd`)
+- **Big-lift decomposition** — goals needing more than ~2 sessions are decomposed into outcome-named sessions, and the next session is self-scheduled via `schedule_task` instead of waiting for the deep-work tick
+- **Lifecycle notifications** — session start and outcome (plan status transitions + the session's summary episode) are sent to the user deterministically, code-side; project completion gets its own line
 - **Background task** — runs via `asyncio.create_task()`, doesn't block the scheduler loop
-- **Rate-limited** — max 1 outbound message per session (prefer updating plan's Blockers section)
+- **Rate-limited** — max 1 additional agent-initiated message per session (prefer updating plan's Blockers section)
 
-## Budget
+## Limits
 
-All behaviors run through `_run_behavior()`, which acquires the behavior semaphore (max 2 concurrent) and the global semaphore, enforcing limits:
+There are deliberately **no dollar-budget caps** — cost is logged (`cost_log`) but never gates work. Limits are structural: turn caps, send caps, timeouts, and concurrency semaphores. All behaviors run through `_run_behavior()`, which acquires the behavior semaphore (max 2 concurrent) and the global semaphore:
 
 | | User Messages | Maintenance Behaviors | Deep Work |
 |---|---|---|---|
-| Max turns | 200 | 75 | 300 |
-| Max budget | $5.00 | $1.00 | $3.00/session, $60/day |
-| Max sends | 20 | 20 | 1 |
+| Max turns | 200 | 100 | 500 |
+| Max sends | 20 | 0-2 (per behavior) | 1 + lifecycle notifications |
 | Timeout | 30 min | 30 min | 30 min |
 
 Maintenance behaviors run via `asyncio.gather()` (awaited). Deep work runs as a background task (non-blocking). Only successful behaviors have their timestamps updated — failures retry on the next tick.

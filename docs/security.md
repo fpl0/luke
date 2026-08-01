@@ -44,13 +44,14 @@ PreToolUse hook counts outbound Telegram sends per agent run. Blocks after `max_
 - **Cost anomaly detection** — logs warning when a single run exceeds 3x the 7-day per-run average (and >$2)
 - **Session loss detection** — logs warning when session ID changes unexpectedly between runs
 
-## Budget Limits
+## Runtime Limits
+
+No dollar-budget caps by design — cost is logged, never a gate. Limits are structural:
 
 | | User Messages | Maintenance Behaviors | Deep Work |
 |---|---|---|---|
-| Max turns | 200 | 75 | 300 |
-| Max budget | $5.00 | $1.00 | $3.00/session, $60/day |
-| Max sends | 20 | 20 | 1 |
+| Max turns | 200 | 100 | 500 |
+| Max sends | 20 | 0-2 (per behavior) | 1 + lifecycle notifications |
 | Timeout | 30 min | 30 min | 30 min |
 
 `asyncio.wait_for()` hard-kills the agent on timeout.

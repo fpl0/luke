@@ -582,8 +582,6 @@ class TestBehaviorEventGating:
         mock_db.get_behavior_no_ops.return_value = 0
         # Prevent TypeError in post-run event consumption
         mock_db.consume_events.return_value = 0
-        # Budget gate for deep work planner
-        mock_db.get_daily_deep_work_cost.return_value = 0.0
         # Attention budget gate (_enforce_attention_budget) needs a real int
         mock_db.get_daily_outbound_count.return_value = 0
         # Planner needs real ensure_utc for datetime calculations
@@ -613,13 +611,9 @@ class TestBehaviorEventGating:
         )
         mock_settings.dream_interval = interval if due_behavior == "dream" else 999999
         mock_settings.consolidation_min_cluster = 3
-        mock_settings.behavior_max_budget_usd = 1.5
         # Attention budget gate (_enforce_attention_budget) needs real ints
         mock_settings.daily_attention_budget = 12
         mock_settings.attention_urgent_reserve = 2
-        mock_settings.daily_deep_work_budget_usd = 120.0
-        mock_settings.deep_work_max_budget_usd = 10.0
-        mock_settings.dream_max_budget_usd = 2.0
         return mock_settings
 
     async def _run_one_tick(

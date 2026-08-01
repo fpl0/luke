@@ -93,7 +93,6 @@ class Settings(BaseSettings):
     proactive_scan_interval: float = 10800.0  # every 3h (seconds)
     # Dream (autonomous thinking periods)
     dream_interval: float = 21600.0  # 6h between sessions
-    dream_max_budget_usd: float = 2.0  # per-session cap
     dream_quiet_hours: float = 2.0  # only dream if user inactive this long
 
     # Skill extraction
@@ -102,17 +101,13 @@ class Settings(BaseSettings):
     # Autonomous goal loop (replaces goal_execution)
     deep_work_interval: float = 7200.0  # 2h between sessions
     deep_work_max_turns: int = 500
-    deep_work_max_budget_usd: float = 10.0  # per-session cap
-    daily_deep_work_budget_usd: float = 120.0  # daily autonomous spend cap
     deep_work_model: str = "opus"
 
     # Agent processing
     agent_timeout: float = 1800.0  # max seconds per agent run (30 min)
     max_retries: int = 3  # max agent failures before skipping messages
     agent_max_turns: int = 200  # safety net: 3-5x a complex task
-    agent_max_budget_usd: float = 5.0  # cost ceiling per invocation
     behavior_max_turns: int = 100  # behaviors are focused single-purpose tasks
-    behavior_max_budget_usd: float = 1.5
     agent_model: str = "opus"
     agent_fallback_model: str = "sonnet"
     max_sends_per_run: int = 20  # rate-limit outbound Telegram messages per agent run
@@ -125,16 +120,10 @@ class Settings(BaseSettings):
     model_medium: str = "sonnet"  # casual conversation, simple questions
     model_high: str = "opus"  # deep reasoning, research, multi-step
 
-    # Outbound critic (F4) — last-mile quality gate on autonomous sends
+    # Outbound critic (F4) — last-mile quality gate on autonomous sends.
+    # The timeout is the only bound: the call takes ~6.4s wall, 5s clipped it.
     critic_enabled: bool = True
     critic_model: str = "claude-haiku-4-5-20251001"
-    # NOTE: $0.01 was too low — the SDK subprocess blows past it before a
-    # single haiku turn completes, so every critic/freshness call died on
-    # budget. Measured a real freshness call at ~$0.02-0.03; 0.05 gives head-
-    # room. Paired with the timeout below (call takes ~6.4s wall, 5s clipped
-    # it). Before this fix, 0/61 critic+freshness runs ever produced a real
-    # verdict — all failed open on timeout, so both gates were dead weight.
-    critic_max_budget_usd: float = 0.05
     critic_timeout_s: float = 15.0
 
     # Freshness gate (L1) — abort sends that have gone stale relative to

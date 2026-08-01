@@ -28,6 +28,6 @@ A scheduler loop runs alongside, ticking every 60 seconds — hourly maintenance
 
 - **[Concurrency](concurrency.md)** — Per-chat locks, global semaphore, process lock. Thread-local SQLite with atomic batches. Retry with backoff. Graceful shutdown.
 
-- **[Security](security.md)** — Path traversal prevention, FTS injection protection, rate limiting, budget caps, Docker sandbox.
+- **[Security](security.md)** — Path traversal prevention, FTS injection protection, rate limiting, turn caps, Docker sandbox.
 
 - **[Persona](persona.md)** — Two-layer system prompt separating tool competence from personality. Autonomy boundaries. Memory hygiene. Goal-driven action.

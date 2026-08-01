@@ -1956,7 +1956,6 @@ async def run_agent(
     bot: Bot,
     model: str | None = None,
     max_turns: int | None = None,
-    max_budget_usd: float | None = None,
     max_sends: int | None = None,
     effort: Literal["low", "medium", "high", "max"] | None = None,
     thinking: ThinkingConfig | None = None,
@@ -2457,9 +2456,6 @@ async def run_agent(
         thinking=thinking if thinking is not None else ThinkingConfigAdaptive(type="adaptive"),
         effort=effort if effort is not None else "high",
         max_turns=max_turns if max_turns is not None else settings.agent_max_turns,
-        max_budget_usd=(
-            max_budget_usd if max_budget_usd is not None else settings.agent_max_budget_usd
-        ),
         include_partial_messages=settings.streaming_enabled,
         enable_file_checkpointing=True,
         sandbox={"enabled": True, "autoAllowBashIfSandboxed": True},

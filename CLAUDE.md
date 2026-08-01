@@ -130,7 +130,7 @@ Allowed types: `feat`, `fix`, `docs`, `test`, `refactor`, `chore`, `perf`, `buil
 - **No polling** — aiogram event-driven dispatch via long-polling
 - **No abstractions** — module-level handlers, direct bot calls
 - **Concurrency** — `asyncio.Lock` per chat + `asyncio.Semaphore` global limit (default: 8); `_behavior_sem` (max: 3) caps concurrent behaviors, guaranteeing ≥5 slots for user messages; deep work runs as a background `asyncio.Task` (non-blocking)
-- **Memory** — Hybrid FTS5 + semantic (fastembed) search, relationship graph with multi-hop traversal, composite scoring (relevance × importance × recency × access), adaptive forgetting, auto-injection, and periodic consolidation
+- **Memory** — Hybrid FTS5 + semantic (bge embed server) search, relationship graph with multi-hop traversal, composite scoring (relevance × importance × recency × access), adaptive forgetting, auto-injection, and periodic consolidation
 - **Cursor model** — messages accumulate, agent processes all pending as one batch
 - **Startup replay** — on restart, pending messages from before crash are dispatched immediately
 - **At-least-once delivery** — cursor advances only after successful agent run; on error, messages stay pending for retry (up to `max_retries` attempts, then skipped with user notification)
@@ -195,7 +195,7 @@ Memories are markdown files with YAML frontmatter in `$LUKE_DIR/memory/`. Indexe
 - **goals/** — active objectives with deadlines and progress tracking (updated on progress)
 
 Key behaviors:
-- **Hybrid retrieval** — FTS5 (lexical, OR semantics) + fastembed (semantic) search, merged via Reciprocal Rank Fusion
+- **Hybrid retrieval** — FTS5 (lexical, OR semantics) + semantic search (bge embed server + sqlite-vec), merged via Reciprocal Rank Fusion
 - **Composite scoring** — relevance gates context quality (importance × recency × access × utility); non-query results dampened; importance clamped to [0,1] in scoring
 - **Utility tracking** — distinguishes intentional access (agent tools) from speculative (auto-injection); utility rate modulates access score to penalize frequently-surfaced-but-unused memories
 - **Multi-hop graph** — BFS up to depth 2 with exponential weight decay per hop; Hebbian co-access strengthening evolves link weights over time
@@ -205,7 +205,7 @@ Key behaviors:
 - **Consolidation** — daily scheduler task clusters related episodes (≥2 shared tags) and synthesizes insights via agent
 - **Self-healing** — `sync_memory_index()` on startup detects unindexed files and indexes them (with embeddings)
 - **Recall limit** — configurable via `RECALL_CONTENT_LIMIT` env var (default: 2000 chars)
-- **Embeddings** — `fastembed` + `sqlite-vec` (both required); hybrid FTS + semantic search always active
+- **Embeddings** — single canonical model copy in the launchd-supervised bge embed server (:17595, `scripts/bge_embed_server.py`); memory.py embeds via localhost HTTP into `sqlite-vec`. Server down → recall degrades to FTS-only; hourly `backfill_missing_embeddings()` heals missed vectors
 - **Letta backend** — `MEMORY_BACKEND=letta` sources recall's semantic candidates from a Letta server and mirrors writes into its archive; `AGENT_BACKEND=letta` sources the turn's world model from self-editing core blocks. Both seams fail back to sqlite on any error. See `docs/letta.md`
 - **Voice transcription** — `mlx-whisper` (required); configurable model via `WHISPER_MODEL` env var (default: `mlx-community/whisper-large-v3-turbo`). Transcripts saved as `.txt` alongside `.ogg` files
 
@@ -220,7 +220,7 @@ The scheduler loop runs every 60 seconds (configurable via `SCHEDULER_INTERVAL`)
 2. Collects due maintenance behaviors and runs them **in parallel** via `asyncio.gather()`:
    - Daily: consolidation (episodes → insights) + proactive scan (can take lightweight goal actions)
    - Weekly: reflection + FTS pruning
-3. Launches deep work as a **background task** (non-blocking, budget-limited to `daily_deep_work_budget_usd`):
+3. Launches deep work as a **background task** (non-blocking, no dollar caps — cost is logged, never a gate):
    - Every 8h: autonomous multi-step goal execution with plan-before-execute pattern
    - Plans stored in `$LUKE_DIR/workspace/plans/{goal_id}.md` with status tracking
    - Rate-limited to 1 outbound message per session

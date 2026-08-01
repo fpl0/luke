@@ -94,7 +94,7 @@ Each conversation starts with auto-injected context for continuity:
 
 ## Key Configuration
 
-The `ClaudeAgentOptions` passed to the SDK include: model (selected per-message via routing), fallback model, tier-scoped `allowed_tools` list, `bypassPermissions` mode, project + user setting sources, dynamic thinking config, turn and budget limits, file checkpointing, and Docker sandbox.
+The `ClaudeAgentOptions` passed to the SDK include: model (selected per-message via routing), fallback model, tier-scoped `allowed_tools` list, `bypassPermissions` mode, project + user setting sources, dynamic thinking config, turn limits, file checkpointing, and Docker sandbox.
 
 ## Message Chunking
 

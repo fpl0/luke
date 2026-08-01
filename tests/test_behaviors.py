@@ -517,35 +517,17 @@ class TestRunDeepWork:
             mock_settings.chat_id = ""
             await run_deep_work(AsyncMock(), _SEM)
 
-    async def test_budget_exhausted(self) -> None:
-        from luke.behaviors import run_deep_work
-
-        with (
-            patch("luke.behaviors.db") as mock_db,
-            patch("luke.behaviors.bus"),
-            patch("luke.behaviors.settings") as mock_settings,
-            patch("luke.behaviors.run_agent", new_callable=AsyncMock) as mock_agent,
-        ):
-            mock_settings.chat_id = "12345"
-            mock_settings.daily_deep_work_budget_usd = 10.0
-            mock_db.get_daily_deep_work_cost.return_value = 15.0
-            await run_deep_work(AsyncMock(), _SEM)
-
-        mock_agent.assert_not_called()
-
     async def test_no_goals(self) -> None:
         from luke.behaviors import run_deep_work
 
         with (
-            patch("luke.behaviors.db") as mock_db,
+            patch("luke.behaviors.db"),
             patch("luke.behaviors.bus"),
             patch("luke.behaviors.memory") as mock_memory,
             patch("luke.behaviors.attention") as mock_attention,
             patch("luke.behaviors.settings") as mock_settings,
         ):
             mock_settings.chat_id = "12345"
-            mock_settings.daily_deep_work_budget_usd = 60.0
-            mock_db.get_daily_deep_work_cost.return_value = 0.0
             mock_memory.recall.return_value = []
             mock_attention.list_attention.return_value = []
             await run_deep_work(AsyncMock(), _SEM)
@@ -565,8 +547,8 @@ class TestRunDeepWork:
             patch("luke.behaviors.bus"),
             patch("luke.behaviors.memory") as mock_memory,
             patch("luke.behaviors.run_agent", new_callable=AsyncMock) as mock_agent,
+            patch("luke.behaviors.send_long_message", new_callable=AsyncMock),
         ):
-            mock_db.get_daily_deep_work_cost.return_value = 0.0
             mock_db.get_quality_blocked_goals.return_value = []
             mock_db.get_recent_quality_scores.return_value = []
             mock_memory.recall.return_value = goals
@@ -574,7 +556,6 @@ class TestRunDeepWork:
             await run_deep_work(AsyncMock(), _SEM)
 
         mock_agent.assert_called_once()
-        # Verify budget overrides (model routing disabled — no model param)
         call_kwargs = mock_agent.call_args.kwargs
         assert call_kwargs["max_turns"] == tmp_settings.deep_work_max_turns
         assert call_kwargs["max_sends"] == 1
@@ -591,15 +572,13 @@ class TestRunDeepWork:
             patch("luke.behaviors.run_agent", side_effect=RuntimeError("err")),
             patch("luke.behaviors.read_memory_body", return_value="content"),
             patch("luke.behaviors.settings") as mock_settings,
+            patch("luke.behaviors.send_long_message", new_callable=AsyncMock),
         ):
             mock_settings.chat_id = "12345"
             mock_settings.agent_timeout = 10
-            mock_settings.daily_deep_work_budget_usd = 60.0
             mock_settings.deep_work_model = "opus"
             mock_settings.deep_work_max_turns = 300
-            mock_settings.deep_work_max_budget_usd = 3.0
             mock_settings.workspace_dir = Path("/tmp/test_workspace")
-            mock_db.get_daily_deep_work_cost.return_value = 0.0
             mock_db.get_quality_blocked_goals.return_value = []
             mock_db.get_recent_quality_scores.return_value = []
             mock_memory.recall.return_value = [
@@ -621,9 +600,7 @@ class TestRunDeepWork:
         ):
             mock_settings.chat_id = "12345"
             mock_settings.agent_timeout = 10
-            mock_settings.daily_deep_work_budget_usd = 60.0
             mock_settings.workspace_dir = Path("/tmp/test_workspace")
-            mock_db.get_daily_deep_work_cost.return_value = 0.0
             mock_db.get_quality_blocked_goals.return_value = []
             mock_db.get_recent_quality_scores.return_value = []
             mock_memory.recall.return_value = [
@@ -636,15 +613,83 @@ class TestRunDeepWork:
 
 
 # ---------------------------------------------------------------------------
+# Deep work lifecycle notifications (start / outcome / completion)
+# ---------------------------------------------------------------------------
+
+
+class TestDeepWorkLifecycleNotifications:
+    def _goal_fixture(self, tmp_settings: Any) -> list[dict[str, Any]]:
+        (tmp_settings.memory_dir / "goals").mkdir(parents=True, exist_ok=True)
+        (tmp_settings.memory_dir / "goals" / "g1.md").write_text(
+            "---\nid: g1\ntype: goal\n---\n\n# Goal 1\n\nShip the thing"
+        )
+        return [{"id": "g1", "type": "goal", "title": "Goal 1", "score": 1.0}]
+
+    async def test_start_and_outcome_sent(self, tmp_settings: Any) -> None:
+        """Filipe is informed of session start and outcome deterministically —
+        never dependent on the agent choosing to speak."""
+        from luke.behaviors import run_deep_work
+
+        goals = self._goal_fixture(tmp_settings)
+        with (
+            patch("luke.behaviors.db") as mock_db,
+            patch("luke.behaviors.bus"),
+            patch("luke.behaviors.memory") as mock_memory,
+            patch("luke.behaviors.run_agent", new_callable=AsyncMock) as mock_agent,
+            patch("luke.behaviors.send_long_message", new_callable=AsyncMock) as mock_send,
+        ):
+            mock_db.get_quality_blocked_goals.return_value = []
+            mock_db.get_recent_quality_scores.return_value = []
+            mock_memory.recall.return_value = goals
+            mock_agent.return_value = MagicMock(texts=[])
+            await run_deep_work(AsyncMock(), _SEM)
+
+        texts = [c.args[2] for c in mock_send.call_args_list]
+        assert any("Deep work session starting" in t and "g1" in t for t in texts)
+        assert any("Deep work session done" in t for t in texts)
+
+    async def test_failed_session_notifies(self, tmp_settings: Any) -> None:
+        """A dead session is announced, not silently swallowed."""
+        from luke.behaviors import run_deep_work
+
+        goals = self._goal_fixture(tmp_settings)
+        with (
+            patch("luke.behaviors.db") as mock_db,
+            patch("luke.behaviors.bus"),
+            patch("luke.behaviors.memory") as mock_memory,
+            patch("luke.behaviors.run_agent", side_effect=RuntimeError("boom")),
+            patch("luke.behaviors.send_long_message", new_callable=AsyncMock) as mock_send,
+        ):
+            mock_db.get_quality_blocked_goals.return_value = []
+            mock_db.get_recent_quality_scores.return_value = []
+            mock_memory.recall.return_value = goals
+            await run_deep_work(AsyncMock(), _SEM)
+
+        texts = [c.args[2] for c in mock_send.call_args_list]
+        assert any("session failed" in t for t in texts)
+
+    async def test_notify_failure_never_raises(self, tmp_settings: Any) -> None:
+        """A notification must not kill the session it narrates."""
+        from luke.behaviors import _notify
+
+        with patch(
+            "luke.behaviors.send_long_message",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("telegram down"),
+        ):
+            await _notify(AsyncMock(), "hello")  # must not raise
+
+
+# ---------------------------------------------------------------------------
 # Attention-fallback deep work runs on the cheap tier
 # ---------------------------------------------------------------------------
 
 
 class TestAttentionFallbackTier:
-    async def test_fallback_uses_cheap_model_and_behavior_budget(self, monkeypatch: Any) -> None:
-        """Goalless sessions free-ran opus to the $10 cap producing nothing
-        (23 sessions / $50 / 4 responses, Jul 27-Aug 1). The fallback path must
-        run on the consolidation tier with the standard behavior budget."""
+    async def test_fallback_uses_cheap_model(self, monkeypatch: Any) -> None:
+        """Goalless sessions free-ran opus producing nothing (23 sessions /
+        4 responses, Jul 27-Aug 1). The fallback path must run on the
+        consolidation tier."""
         from luke.behaviors import _run_attention_deep_work
         from luke.config import settings
 
@@ -664,7 +709,6 @@ class TestAttentionFallbackTier:
             patch("luke.behaviors._run_behavior", new=AsyncMock()) as mock_run,
         ):
             mock_attention.list_attention.return_value = pins
-            mock_db.get_daily_deep_work_cost.return_value = 0.0
             mock_db.get_behavior_last_run.return_value = None
             mock_db.get_engagement_signals.return_value = signals
 
@@ -673,4 +717,3 @@ class TestAttentionFallbackTier:
         assert ran is True
         kwargs = mock_run.call_args.kwargs
         assert kwargs["model"] == settings.consolidation_model
-        assert kwargs["max_budget_usd"] == settings.behavior_max_budget_usd

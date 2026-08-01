@@ -12,7 +12,7 @@ from aiogram import Bot
 from structlog.stdlib import BoundLogger
 
 from . import attention, db, memory
-from .agent import AgentResult, run_agent
+from .agent import AgentResult, run_agent, send_long_message
 from .bus import bus
 from .config import settings
 from .memory import read_memory_body, sanitize_memory_id
@@ -20,6 +20,22 @@ from .memory import read_memory_body, sanitize_memory_id
 log: BoundLogger = structlog.get_logger()
 
 _LOG_PREVIEW = 200
+
+
+async def _notify(bot: Bot, text: str) -> None:
+    """Deterministic lifecycle message to Filipe.
+
+    Sent code-side so start/progress/completion never depend on the agent
+    choosing to speak (Filipe: "I want to be informed of: start, progress,
+    completion!"). Failures are logged, never raised — a notification must
+    not kill the session it narrates.
+    """
+    if not settings.chat_id:
+        return
+    try:
+        await send_long_message(bot, int(settings.chat_id), text)
+    except Exception:
+        log.warning("lifecycle_notify_failed")
 
 
 async def _run_behavior(
@@ -30,7 +46,6 @@ async def _run_behavior(
     *,
     model: str | None = None,
     max_turns: int | None = None,
-    max_budget_usd: float | None = None,
     max_sends: int | None = None,
     urgent: bool = False,
     **log_fields: Any,
@@ -50,11 +65,6 @@ async def _run_behavior(
                     bot=bot,
                     model=model,
                     max_turns=max_turns if max_turns is not None else settings.behavior_max_turns,
-                    max_budget_usd=(
-                        max_budget_usd
-                        if max_budget_usd is not None
-                        else settings.behavior_max_budget_usd
-                    ),
                     max_sends=max_sends,
                     effort="high",
                     autonomous=True,
@@ -517,6 +527,25 @@ async def run_proactive_scan(bot: Bot, sem: asyncio.Semaphore) -> None:
     )
 
 
+def _latest_deep_work_summary(since_iso: str) -> str | None:
+    """First 300 chars of the session's own deep-work-log episode, if it saved one."""
+    try:
+        episodes = memory.recall(
+            mem_type="episode",
+            after=since_iso,
+            before=datetime.now(UTC).isoformat(),
+            limit=5,
+        )
+        for ep in episodes or []:
+            if "deep-work" in ep["id"]:
+                body = read_memory_body("episode", ep["id"], 300)
+                if body:
+                    return body.strip()
+    except Exception:
+        log.warning("deep_work_summary_lookup_failed")
+    return None
+
+
 def _parse_plan_status(goal_id: str) -> str | None:
     """Read a plan file and return its status (in_progress, blocked, paused, completed)."""
     plan_path = settings.workspace_dir / "plans" / f"{sanitize_memory_id(goal_id)}.md"
@@ -546,8 +575,6 @@ async def _run_attention_deep_work(bot: Bot, sem: asyncio.Semaphore, *, reason: 
     if not pins:
         return False
 
-    daily_cost = db.get_daily_deep_work_cost()
-    remaining = settings.daily_deep_work_budget_usd - daily_cost
     now_str = datetime.now(UTC).isoformat(timespec="minutes")
     pin_lines = [f"[#{p['id']}, {p.get('origin', 'luke')}] {p['content']}" for p in pins]
 
@@ -570,7 +597,7 @@ async def _run_attention_deep_work(bot: Bot, sem: asyncio.Semaphore, *, reason: 
 
     prompt = (
         f"Deep work session — no active goals ({reason}). "
-        f"Current time: {now_str}. Daily budget remaining: ${remaining:.2f}.\n\n"
+        f"Current time: {now_str}.\n\n"
         "Active-attention pins (these are the things Filipe said matter):\n"
         + "\n".join(pin_lines)
         + engagement_block
@@ -596,10 +623,11 @@ async def _run_attention_deep_work(bot: Bot, sem: asyncio.Semaphore, *, reason: 
     bus.emit("deep_work_attention_fallback", {"reason": reason, "pins": len(pins)})
     log.info("deep_work_attention_fallback", reason=reason, pins=len(pins))
 
-    # Fallback sessions run on the cheap tier with the standard behavior budget:
-    # with no goal to anchor them, opus sessions free-ran to the $10 cap producing
-    # nothing (23 sessions / $50 / 4 responses, Jul 27-Aug 1). Pin-driven upkeep
-    # doesn't need opus; real goals still get deep_work_model + the full budget.
+    # Fallback sessions run on the cheap tier: with no goal to anchor them,
+    # opus sessions free-ran producing nothing (23 sessions / 4 responses,
+    # Jul 27-Aug 1). Pin-driven upkeep doesn't need opus; real goals still
+    # get deep_work_model. No lifecycle notifications here either — upkeep
+    # chores aren't project sessions and shouldn't page Filipe.
     await _run_behavior(
         "deep_work",
         prompt,
@@ -607,7 +635,6 @@ async def _run_attention_deep_work(bot: Bot, sem: asyncio.Semaphore, *, reason: 
         sem,
         model=settings.consolidation_model,
         max_turns=settings.deep_work_max_turns,
-        max_budget_usd=settings.behavior_max_budget_usd,
         max_sends=1,
         attention_pins=len(pins),
         fallback_reason=reason,
@@ -618,13 +645,6 @@ async def _run_attention_deep_work(bot: Bot, sem: asyncio.Semaphore, *, reason: 
 async def run_deep_work(bot: Bot, sem: asyncio.Semaphore) -> None:
     """Autonomous goal loop: sustained multi-step work on active goals."""
     if not settings.chat_id:
-        return
-
-    # Budget gate: skip if daily autonomous spend is exhausted
-    daily_cost = db.get_daily_deep_work_cost()
-    if daily_cost >= settings.daily_deep_work_budget_usd:
-        log.info("deep_work_budget_exhausted", daily_cost=daily_cost)
-        bus.emit("deep_work_skipped", {"reason": "budget_exhausted"})
         return
 
     goals = memory.recall(mem_type="goal", limit=10)
@@ -746,12 +766,10 @@ async def run_deep_work(bot: Bot, sem: asyncio.Semaphore) -> None:
         f"- corrections (you got something wrong): {signals['corrections']}\n"
     )
 
-    remaining = settings.daily_deep_work_budget_usd - daily_cost
     now_str = datetime.now(UTC).isoformat(timespec="minutes")
 
     prompt = (
-        f"Deep work session. Current time: {now_str}. "
-        f"Daily budget remaining: ${remaining:.2f}.\n\n"
+        f"Deep work session. Current time: {now_str}.\n\n"
         "Active goals (priority order):\n"
         + "\n\n".join(goal_sections)
         + ("\n\nExisting work plans:\n" + "\n".join(plan_status) if plan_status else "")
@@ -770,8 +788,17 @@ async def run_deep_work(bot: Bot, sem: asyncio.Semaphore) -> None:
         "1. Pick the highest-priority goal\n"
         "2. Check if a work plan exists at workspace/plans/{goal_id}.md\n"
         "3. If no plan exists, create one: 3-5 concrete steps, status: in_progress\n"
-        "4. If a plan exists and status is in_progress, pick up where you left off\n"
-        "5. If a plan exists and status is blocked, check if the blocker is resolved\n\n"
+        "4. BIG LIFTS: if the goal needs more than ~2 sessions of work, the plan "
+        "MUST decompose it into work sessions, each named by its OUTCOME "
+        "('Session 3: benchmark harness runs green'), not its topic. Then "
+        "schedule the next session yourself with schedule_task (type='once', a "
+        "concrete time within the next 24h) — its prompt must state the session "
+        "outcome, point at the plan file, and end by sending Filipe a 2-3 line "
+        "progress report. Big lifts never sit waiting for the next deep-work "
+        "tick, and never end at 'this will be a big lift' — recognizing that "
+        "something is big IS the trigger to decompose and schedule it.\n"
+        "5. If a plan exists and status is in_progress, pick up where you left off; "
+        "if blocked, check whether the blocker is resolved\n\n"
         "Phase 2 — EXECUTE:\n"
         "6. Work through unchecked steps in order\n"
         "7. After each step, self-check: 'Am I making progress or going in circles?'\n"
@@ -800,25 +827,56 @@ async def run_deep_work(bot: Bot, sem: asyncio.Semaphore) -> None:
         "10. If the goal is complete: update plan status to completed, update goal memory\n"
         "11. If blocked: update plan status to blocked, note what you need\n"
         "12. Save a summary episode (deep-work-log) of what was accomplished\n\n"
-        "You may send at most ONE message to the user per session — only if truly blocked.\n"
-        "Prefer updating the plan's Blockers section over messaging.\n"
+        "Session start and outcome are announced to Filipe automatically — do not "
+        "duplicate them. You may send at most ONE additional message per session, "
+        "only if truly blocked; prefer updating the plan's Blockers section.\n"
         "You have full tool access: web search, code, files, memory.\n"
     )
 
     # Track that orient phase completed (all gates passed, goals reviewed)
     bus.emit("deep_work_oriented", {"goals_reviewed": len(goals)})
 
-    await _run_behavior(
+    # Lifecycle notifications: deterministic, code-side, so Filipe is informed
+    # of start / progress / completion regardless of what the agent chooses to
+    # say (historically ~10/12 autonomous sessions sent nothing).
+    statuses_before = {gid: _parse_plan_status(gid) for gid in active_goal_ids}
+    started_iso = datetime.now(UTC).isoformat()
+    started_mono = time.monotonic()
+    await _notify(
+        bot,
+        "🔨 Deep work session starting — goals on deck: " + ", ".join(active_goal_ids),
+    )
+
+    result = await _run_behavior(
         "deep_work",
         prompt,
         bot,
         sem,
         model=settings.deep_work_model,  # always opus for coding/building
         max_turns=settings.deep_work_max_turns,
-        max_budget_usd=settings.deep_work_max_budget_usd,
         max_sends=1,
         goals_reviewed=len(goals),
     )
+
+    mins = max(1, int((time.monotonic() - started_mono) / 60))
+    if result is None:
+        await _notify(
+            bot,
+            f"⚠️ Deep work session failed after {mins}m — it will retry next cycle.",
+        )
+        return
+
+    lines = [f"✅ Deep work session done ({mins}m)."]
+    for gid in active_goal_ids:
+        before, after = statuses_before.get(gid), _parse_plan_status(gid)
+        if after == "completed" and before != "completed":
+            lines.append(f"🎉 {gid} is COMPLETE.")
+        elif after != before:
+            lines.append(f"{gid}: plan {before or 'none'} → {after or 'none'}")
+    summary = _latest_deep_work_summary(started_iso)
+    if summary:
+        lines.append(summary)
+    await _notify(bot, "\n".join(lines))
 
 
 async def run_feedback_consolidation(bot: Bot, sem: asyncio.Semaphore) -> None:
@@ -1160,6 +1218,5 @@ async def run_dream(bot: Bot, sem: asyncio.Semaphore) -> None:
         bot,
         sem,
         max_sends=0,
-        max_budget_usd=settings.dream_max_budget_usd,
         sections_loaded=len(sections),
     )
