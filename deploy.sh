@@ -15,6 +15,12 @@
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Resolve LUKE_DIR the way the service does: environment, then .env, then
+# default. Watching the wrong log here makes the health check fail on a good
+# deploy and roll it back (happened 2026-08-01).
+if [[ -z "${LUKE_DIR:-}" ]] && [[ -f "$REPO_DIR/.env" ]]; then
+    LUKE_DIR="$(grep -E '^LUKE_DIR=' "$REPO_DIR/.env" | tail -1 | cut -d= -f2- | tr -d '"' | tr -d "'")"
+fi
 LUKE_DIR="${LUKE_DIR:-$HOME/.luke}"
 LUKE_LOG="$LUKE_DIR/luke.log"
 LAUNCHD_LABEL="com.luke"
@@ -68,6 +74,7 @@ cd "$REPO_DIR"
 command -v uv        >/dev/null 2>&1 || die "uv not found"
 command -v git       >/dev/null 2>&1 || die "git not found"
 command -v launchctl >/dev/null 2>&1 || die "launchctl not found (macOS only)"
+[[ -f "$LUKE_LOG" ]] || die "Luke log not found at $LUKE_LOG — wrong LUKE_DIR? Health check would always fail."
 
 # ─── Step 1: PRE-DEPLOY — full test suite ────────────────────────────────────
 info "Step 1/5 — Running test suite…"
