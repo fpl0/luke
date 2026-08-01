@@ -150,11 +150,7 @@ def _passage_body(mem_id: str, cap: int) -> str | None:
     from .db import _db
 
     try:
-        row = (
-            _db()
-            .execute("SELECT content FROM memory_fts WHERE id = ?", (mem_id,))
-            .fetchone()
-        )
+        row = _db().execute("SELECT content FROM memory_fts WHERE id = ?", (mem_id,)).fetchone()
     except Exception as e:
         log.warning("letta_recall_body_failed", mem_id=mem_id, error=str(e))
         return None

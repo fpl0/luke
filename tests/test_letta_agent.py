@@ -24,20 +24,28 @@ def test_context_none_without_agent_id(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_context_none_on_fetch_failure(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "letta_agent_id", "agent-test")
-    monkeypatch.setattr(letta_agent, "_get_core_blocks", lambda a, timeout=10.0: None)
+
+    def fake_blocks(a: str, timeout: float = 10.0) -> list[dict[str, Any]] | None:
+        return None
+
+    monkeypatch.setattr(letta_agent, "_get_core_blocks", fake_blocks)
     assert letta_agent.build_letta_context() is None
 
 
 def test_context_block_order_and_unknown_blocks(monkeypatch: pytest.MonkeyPatch) -> None:
     """persona leads, operating-rules trails the known set, unknown blocks are
     appended rather than dropped, and read_only renders as an attribute."""
-    blocks = [
+    blocks: list[dict[str, Any]] = [
         {"label": "operating-rules", "value": "rules", "read_only": True},
         {"label": "custom-extra", "value": "extra"},
         {"label": "persona", "value": "I am Luke"},
     ]
     monkeypatch.setattr(settings, "letta_agent_id", "agent-test")
-    monkeypatch.setattr(letta_agent, "_get_core_blocks", lambda a, timeout=10.0: blocks)
+
+    def fake_blocks(a: str, timeout: float = 10.0) -> list[dict[str, Any]] | None:
+        return blocks
+
+    monkeypatch.setattr(letta_agent, "_get_core_blocks", fake_blocks)
 
     ctx = letta_agent.build_letta_context()
     assert ctx is not None
@@ -71,7 +79,11 @@ def test_injection_empty_query_is_none(test_db: Any) -> None:
 
 def test_injection_renders_bodies(test_db: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     _seed("a", "Alpha", "Alpha body content")
-    monkeypatch.setattr(memory, "recall", lambda **kw: [_hit("a")])
+
+    def fake_recall(**kw: Any) -> list[dict[str, Any]]:
+        return [_hit("a")]
+
+    monkeypatch.setattr(memory, "recall", fake_recall)
     inj = letta_agent.build_recall_injection("alpha")
     assert inj is not None
     assert "<retrieved-memories>" in inj
@@ -83,7 +95,11 @@ def test_injection_respects_total_budget(test_db: Any, monkeypatch: pytest.Monke
     """Highest-ranked passages that fit are kept; the budget is never blown."""
     for i in range(4):
         _seed(f"m{i}", f"Title {i}", "x" * 600)
-    monkeypatch.setattr(memory, "recall", lambda **kw: [_hit(f"m{i}") for i in range(4)])
+
+    def fake_recall(**kw: Any) -> list[dict[str, Any]]:
+        return [_hit(f"m{i}") for i in range(4)]
+
+    monkeypatch.setattr(memory, "recall", fake_recall)
     inj = letta_agent.build_recall_injection(
         "query", k=4, per_passage_cap=700, total_char_budget=1500
     )
@@ -102,14 +118,21 @@ def test_injection_recall_error_is_none(test_db: Any, monkeypatch: pytest.Monkey
 
 
 def test_compose_passthrough_when_no_hits(test_db: Any, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(memory, "recall", lambda **kw: [])
+    def fake_recall(**kw: Any) -> list[dict[str, Any]]:
+        return []
+
+    monkeypatch.setattr(memory, "recall", fake_recall)
     msg = "what's the plan?"
     assert letta_agent.compose_letta_turn_input(msg) is msg
 
 
 def test_compose_prepends_injection(test_db: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     _seed("a", "Alpha", "Alpha body content")
-    monkeypatch.setattr(memory, "recall", lambda **kw: [_hit("a")])
+
+    def fake_recall(**kw: Any) -> list[dict[str, Any]]:
+        return [_hit("a")]
+
+    monkeypatch.setattr(memory, "recall", fake_recall)
     out = letta_agent.compose_letta_turn_input("what's alpha?")
     assert out.startswith("<retrieved-memories>")
     assert out.endswith("what's alpha?")
@@ -132,7 +155,11 @@ def test_drive_errors_without_agent_id(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_drive_transport_error_returns_dict(test_db: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "letta_agent_id", "agent-test")
-    monkeypatch.setattr(memory, "recall", lambda **kw: [])
+
+    def fake_recall(**kw: Any) -> list[dict[str, Any]]:
+        return []
+
+    monkeypatch.setattr(memory, "recall", fake_recall)
 
     def boom(*args: Any, **kwargs: Any) -> Any:
         raise OSError("connection refused")

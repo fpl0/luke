@@ -56,7 +56,11 @@ def test_join_filters_and_ranking(test_db: Any, monkeypatch: pytest.MonkeyPatch)
         _passage("unknown-id"),  # rank 1, but not in memory_meta — dropped by join
         _passage("beta"),  # rank 2
     ]
-    monkeypatch.setattr(letta_adapter, "_search_passages", lambda q, n: passages)
+
+    def fake_search(q: str, n: int) -> list[dict[str, Any]]:
+        return passages
+
+    monkeypatch.setattr(letta_adapter, "_search_passages", fake_search)
 
     results = letta_adapter.letta_semantic_search("alpha")
     assert results is not None
@@ -69,7 +73,11 @@ def test_join_filters_and_ranking(test_db: Any, monkeypatch: pytest.MonkeyPatch)
 def test_all_tombstones_falls_back(test_db: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "letta_archive_id", "archive-test")
     passages = [_passage("x", is_tombstone=True), _passage("y", is_tombstone=True)]
-    monkeypatch.setattr(letta_adapter, "_search_passages", lambda q, n: passages)
+
+    def fake_search(q: str, n: int) -> list[dict[str, Any]]:
+        return passages
+
+    monkeypatch.setattr(letta_adapter, "_search_passages", fake_search)
     assert letta_adapter.letta_semantic_search("anything") is None
 
 
@@ -78,7 +86,11 @@ def test_mem_type_filter(test_db: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     _seed("ep1", "An episode", "Episode body", mem_type="episode")
     _seed("en1", "An entity", "Entity body", mem_type="entity")
     passages = [_passage("ep1"), _passage("en1")]
-    monkeypatch.setattr(letta_adapter, "_search_passages", lambda q, n: passages)
+
+    def fake_search(q: str, n: int) -> list[dict[str, Any]]:
+        return passages
+
+    monkeypatch.setattr(letta_adapter, "_search_passages", fake_search)
 
     results = letta_adapter.letta_semantic_search("body", mem_type="episode")
     assert results is not None
@@ -92,6 +104,9 @@ def test_recall_uses_letta_candidates(test_db: Any, monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr(settings, "letta_write_through", False)
     _seed("gamma", "Gamma fact", "A distinctive gamma fact body")
 
-    monkeypatch.setattr(letta_adapter, "_search_passages", lambda q, n: [_passage("gamma")])
+    def fake_search(q: str, n: int) -> list[dict[str, Any]]:
+        return [_passage("gamma")]
+
+    monkeypatch.setattr(letta_adapter, "_search_passages", fake_search)
     results = memory.recall(query="distinctive gamma fact")
     assert any(r["id"] == "gamma" for r in results)

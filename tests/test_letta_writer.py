@@ -122,7 +122,11 @@ def test_invalidate_link_re_mirrors_both_endpoints(
 def test_never_raises_on_create_failure(test_db: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     _seed("m1")
     _letta_on(monkeypatch)
-    monkeypatch.setattr(letta_writer, "_find_passage_ids", lambda s, i: [])
+
+    def fake_find(surface: str, luke_id: str) -> list[str]:
+        return []
+
+    monkeypatch.setattr(letta_writer, "_find_passage_ids", fake_find)
 
     def boom(text: str, metadata: dict[str, Any]) -> None:
         raise OSError("letta down")

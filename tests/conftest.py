@@ -25,7 +25,7 @@ def _clear_cached_properties() -> None:
 
 
 @pytest.fixture(autouse=True)
-def _sqlite_backends(monkeypatch: pytest.MonkeyPatch) -> None:
+def sqlite_backends_guard(monkeypatch: pytest.MonkeyPatch) -> None:
     """Force the sqlite/sdk backends for every test, whatever .env says.
 
     On the live machine .env sets MEMORY_BACKEND=letta — without this, any test
