@@ -36,6 +36,46 @@ class TestStripFrontmatter:
 
 
 # ---------------------------------------------------------------------------
+# Embedding seam: server outage degradation + hourly backfill heal
+# ---------------------------------------------------------------------------
+
+
+class TestEmbeddingBackfill:
+    def test_index_survives_embed_outage_and_backfill_heals(
+        self, test_db: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Embed server down → memory indexes without a vector (FTS still
+        works); backfill_missing_embeddings() heals the gap once it's back."""
+        monkeypatch.setattr(memory, "_embed_via_server", lambda texts: None)
+        memory.index_memory("outage-mem", "insight", "Outage", "Indexed while down", [], [])
+
+        conn = db._db()
+        row = conn.execute(
+            "SELECT COUNT(*) AS n FROM memory_vec WHERE memory_id = 'outage-mem'"
+        ).fetchone()
+        assert row["n"] == 0
+        # Lexical recall unaffected
+        assert any(r["id"] == "outage-mem" for r in memory.recall(query="Outage"))
+
+        # Server "back up" — swap in a working fake (never the live daemon)
+        monkeypatch.setattr(
+            memory,
+            "_embed_via_server",
+            lambda texts: [[0.1] * 768 for _ in texts],
+        )
+        healed = memory.backfill_missing_embeddings()
+        assert healed == 1
+        row = conn.execute(
+            "SELECT COUNT(*) AS n FROM memory_vec WHERE memory_id = 'outage-mem'"
+        ).fetchone()
+        assert row["n"] == 1
+
+    def test_backfill_noop_when_nothing_missing(self, test_db: Any) -> None:
+        memory.index_memory("full-mem", "insight", "Full", "Indexed with vector", [], [])
+        assert memory.backfill_missing_embeddings() == 0
+
+
+# ---------------------------------------------------------------------------
 # Index & Recall (FTS-only path, no embeddings)
 # ---------------------------------------------------------------------------
 

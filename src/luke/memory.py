@@ -10,6 +10,7 @@ import math
 import re
 import sqlite3
 import struct
+import urllib.request
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -170,43 +171,53 @@ def read_frontmatter(path: Path) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Embeddings (fastembed + sqlite-vec)
+# Embeddings (bge embed server + sqlite-vec)
 # ---------------------------------------------------------------------------
+# The model (BAAI/bge-base-en-v1.5 via fastembed) is loaded ONCE, in the
+# launchd-supervised embed server (scripts/bge_embed_server.py, :17595) that
+# also serves the Letta stack. Embedding in-process duplicated ~450MB of
+# identical weights per process; this HTTP seam keeps a single canonical copy.
+# fastembed's query_embed/passage_embed are both plain embed() for bge models,
+# so the server's /v1/embeddings returns bit-identical vectors to the old
+# in-process path — stored memory_vec rows remain valid.
+#
+# Failure semantics: the server is required infrastructure (supervised by
+# com.luke.bgeembed, probed by letta_stack_health.sh), but an unreachable
+# server at call time is a runtime error → return None. Recall degrades to
+# FTS-only and indexing proceeds without a vector; backfill_missing_embeddings
+# (hourly maintenance) heals the gap once the server is back.
 
 _EMBEDDING_MODEL = "BAAI/bge-base-en-v1.5"
-_embedder: Any = None
+_EMBED_SERVER_URL = "http://127.0.0.1:17595/v1/embeddings"
+_EMBED_TIMEOUT_S = 30.0
 
 
-def _get_embedder() -> Any:
-    """Lazy-init fastembed TextEmbedding. Lazy because model load is heavy (~1s)."""
-    global _embedder
-    if _embedder is not None:
-        return _embedder
-    from fastembed import TextEmbedding
-
-    _embedder = TextEmbedding(model_name=_EMBEDDING_MODEL)
-    log.info("embedder_loaded")
-    return _embedder
+def _embed_via_server(texts: list[str]) -> list[list[float]] | None:
+    """Embed texts via the local bge embed server. None on any runtime failure."""
+    payload = json.dumps({"input": texts}).encode()
+    req = urllib.request.Request(
+        _EMBED_SERVER_URL, data=payload, headers={"Content-Type": "application/json"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=_EMBED_TIMEOUT_S) as resp:
+            body = json.loads(resp.read())
+        data = sorted(body["data"], key=lambda d: int(d["index"]))
+        return [[float(x) for x in d["embedding"]] for d in data]
+    except Exception:
+        log.warning("embedding_failed", n_texts=len(texts))
+        return None
 
 
 def _embed_passage(text: str) -> list[float] | None:
-    """Embed a document/memory for storage. Uses passage prefix for asymmetric retrieval."""
-    try:
-        results = list(_get_embedder().passage_embed([text]))
-        return [float(x) for x in results[0]]
-    except Exception:
-        log.warning("embedding_failed", func="passage")
-        return None
+    """Embed a document/memory for storage."""
+    vecs = _embed_via_server([text])
+    return vecs[0] if vecs else None
 
 
 def _embed_query(text: str) -> list[float] | None:
-    """Embed a search query. Uses query prefix for asymmetric retrieval."""
-    try:
-        results = list(_get_embedder().query_embed(text))
-        return [float(x) for x in results[0]]
-    except Exception:
-        log.warning("embedding_failed", func="query")
-        return None
+    """Embed a search query. Same vector space as passages (bge has no query prefix)."""
+    vecs = _embed_via_server([text])
+    return vecs[0] if vecs else None
 
 
 def _semantic_search(
@@ -1379,6 +1390,40 @@ def cleanup_archived_fts() -> None:
         _commit(db)
     except sqlite3.OperationalError:
         db.rollback()  # release the lock, retry next cycle
+
+
+def backfill_missing_embeddings(limit: int = 64) -> int:
+    """Embed active memories that have no memory_vec row. Returns count embedded.
+
+    Indexing proceeds without a vector when the embed server is unreachable
+    (boot ordering, an outage); this hourly pass heals the gap once it's back.
+    """
+    db = _db()
+    rows = db.execute(
+        """SELECT f.id, f.title, f.content FROM memory_fts f
+           JOIN memory_meta m ON m.id = f.id AND m.status = 'active'
+           WHERE f.id NOT IN (SELECT memory_id FROM memory_vec)
+           LIMIT ?""",
+        (limit,),
+    ).fetchall()
+    if not rows:
+        return 0
+    done = 0
+    for row in rows:
+        embedding = _embed_passage(f"{row['title']} {row['content']}")
+        if embedding is None:
+            break  # server still unreachable — retry next cycle
+        blob = struct.pack(f"{len(embedding)}f", *embedding)
+        rowid = _vec_rowid(row["id"])
+        db.execute("DELETE FROM memory_vec WHERE rowid = ?", (rowid,))
+        db.execute(
+            "INSERT INTO memory_vec (rowid, embedding, memory_id) VALUES (?, ?, ?)",
+            (rowid, blob, row["id"]),
+        )
+        done += 1
+    if done:
+        _commit(db)
+    return done
 
 
 def prune_old_fts_entries(retention_days: int) -> int:

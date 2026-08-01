@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Minimal OpenAI-compatible /v1/embeddings server wrapping Luke's exact embedding
-model (BAAI/bge-base-en-v1.5 via fastembed). Lets Letta embed passages with the SAME
-model Luke's sqlite-vec recall uses, so the Letta backend is parity-or-better rather
-than a regression from the weaker nomic model.
+"""Minimal OpenAI-compatible /v1/embeddings server for Luke's embedding model
+(BAAI/bge-base-en-v1.5 via fastembed). This is the SINGLE canonical copy of the
+model weights: Luke's memory.py embeds through it (sqlite-vec indexing + recall)
+and the Letta server embeds archive passages through it. Loading the model
+in-process per consumer duplicated ~450MB of identical weights each.
 
 Honors OpenAI's ``encoding_format``: Letta's client requests ``"base64"`` and decodes
 the response as packed little-endian float32 — returning plain float lists there is

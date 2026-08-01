@@ -25,6 +25,33 @@ def _clear_cached_properties() -> None:
 
 
 @pytest.fixture(autouse=True)
+def fake_embed_server(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Replace the HTTP embed seam with a deterministic in-process fake.
+
+    memory.py embeds via the local bge embed server (:17595); tests must never
+    depend on that daemon. The fake hashes tokens into a fixed-dim bag-of-words
+    vector: identical texts embed identically, overlapping texts stay
+    cosine-similar — enough for the duplicate/similarity code paths without
+    model weights or network.
+    """
+    import hashlib as _hashlib
+    import math as _math
+
+    def _fake(texts: list[str]) -> list[list[float]]:
+        out: list[list[float]] = []
+        for text in texts:
+            vec = [0.0] * 768
+            for token in text.lower().split():
+                idx = int(_hashlib.md5(token.encode()).hexdigest(), 16) % 768
+                vec[idx] += 1.0
+            norm = _math.sqrt(sum(x * x for x in vec)) or 1.0
+            out.append([x / norm for x in vec])
+        return out
+
+    monkeypatch.setattr("luke.memory._embed_via_server", _fake)
+
+
+@pytest.fixture(autouse=True)
 def sqlite_backends_guard(monkeypatch: pytest.MonkeyPatch) -> None:
     """Force the sqlite/sdk backends for every test, whatever .env says.
 

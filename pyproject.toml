@@ -13,6 +13,8 @@ dependencies = [
     "pyyaml>=6.0",
     "Pillow>=10.0",
     "sqlite-vec>=0.1.6",
+    # fastembed is imported only by scripts/bge_embed_server.py (the single
+    # canonical copy of the embedding model); luke itself embeds via HTTP.
     "fastembed>=0.4",
     "mlx-whisper>=0.4",
     "playwright>=1.50",
@@ -45,10 +47,6 @@ plugins = ["pydantic.mypy"]
 
 [[tool.mypy.overrides]]
 module = ["claude_agent_sdk.*"]
-ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-module = ["fastembed.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
