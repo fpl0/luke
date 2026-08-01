@@ -1,1 +1,0 @@
-/Users/filipelm/Luke/workspace/plans/goal-letta-full-power.md

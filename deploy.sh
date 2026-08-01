@@ -9,16 +9,22 @@
 #   1. PRE-DEPLOY: Run full test suite — abort if any fail
 #   2. DEPLOY:     Merge feature branch → main + push
 #   3. RESTART:    Graceful SIGTERM via launchctl kickstart -k (60s drain)
-#   4. HEALTH:     Watch logs for "Back online." within 90s
+#   4. HEALTH:     Watch logs for the startup_complete event within 90s
 #   5. ROLLBACK:   On health failure → git revert HEAD + push + restart
 
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Resolve LUKE_DIR the way the service does: environment, then .env, then
+# default. Watching the wrong log here makes the health check fail on a good
+# deploy and roll it back (happened 2026-08-01).
+if [[ -z "${LUKE_DIR:-}" ]] && [[ -f "$REPO_DIR/.env" ]]; then
+    LUKE_DIR="$(grep -E '^LUKE_DIR=' "$REPO_DIR/.env" | tail -1 | cut -d= -f2- | tr -d '"' | tr -d "'")"
+fi
 LUKE_DIR="${LUKE_DIR:-$HOME/.luke}"
 LUKE_LOG="$LUKE_DIR/luke.log"
 LAUNCHD_LABEL="com.luke"
-HEALTH_TIMEOUT=90   # seconds to wait for "Back online."
+HEALTH_TIMEOUT=90   # seconds to wait for startup_complete in the log
 FEATURE_BRANCH="${1:-}"
 
 # ─── Colours ─────────────────────────────────────────────────────────────────
@@ -49,7 +55,7 @@ do_rollback() {
     elapsed=5
     while (( elapsed < 60 )); do
         sleep 2; elapsed=$(( elapsed + 2 ))
-        if tail -c "+$((offset + 1))" "$LUKE_LOG" 2>/dev/null | grep -q 'Back online\.'; then
+        if tail -c "+$((offset + 1))" "$LUKE_LOG" 2>/dev/null | grep -q '"event": "startup_complete"'; then
             found=1; break
         fi
     done
@@ -68,6 +74,7 @@ cd "$REPO_DIR"
 command -v uv        >/dev/null 2>&1 || die "uv not found"
 command -v git       >/dev/null 2>&1 || die "git not found"
 command -v launchctl >/dev/null 2>&1 || die "launchctl not found (macOS only)"
+[[ -f "$LUKE_LOG" ]] || die "Luke log not found at $LUKE_LOG — wrong LUKE_DIR? Health check would always fail."
 
 # ─── Step 1: PRE-DEPLOY — full test suite ────────────────────────────────────
 info "Step 1/5 — Running test suite…"
@@ -107,13 +114,16 @@ launchctl kickstart -k "gui/$(id -u)/$LAUNCHD_LABEL" 2>/dev/null || {
 }
 
 # ─── Step 4: HEALTH CHECK ────────────────────────────────────────────────────
-info "Step 4/5 — Waiting up to ${HEALTH_TIMEOUT}s for \"Back online.\" in logs…"
+info "Step 4/5 — Waiting up to ${HEALTH_TIMEOUT}s for startup_complete in logs…"
 
+# "Back online." is a Telegram message, not a reliable log line — outbound
+# dedup suppresses it on back-to-back restarts, which made healthy deploys
+# roll back. startup_complete is written to the log on every clean boot.
 ELAPSED=0
 FOUND=0
 while (( ELAPSED < HEALTH_TIMEOUT )); do
     sleep 2; ELAPSED=$(( ELAPSED + 2 ))
-    if tail -c "+$((LOG_OFFSET + 1))" "$LUKE_LOG" 2>/dev/null | grep -q 'Back online\.'; then
+    if tail -c "+$((LOG_OFFSET + 1))" "$LUKE_LOG" 2>/dev/null | grep -q '"event": "startup_complete"'; then
         FOUND=1; break
     fi
 done
@@ -123,6 +133,6 @@ if (( FOUND )); then
     info "Step 5/5 — Deploy complete. Commit: $DEPLOY_SHA"
     exit 0
 else
-    err "Health check FAILED — \"Back online.\" not seen after ${HEALTH_TIMEOUT}s."
+    err "Health check FAILED — startup_complete not seen after ${HEALTH_TIMEOUT}s."
     do_rollback "$DEPLOY_SHA"
 fi

@@ -35,6 +35,13 @@ log: BoundLogger = structlog.get_logger()
 # deadlock. Only LockedConnection should touch this directly.
 _write_lock = threading.RLock()
 
+# If a thread dies between execute() and commit()/rollback(), the RLock stays
+# owned by the dead thread forever and every other writer parks indefinitely
+# (observed 2026-08-01: full pytest run deadlocked in
+# test_concurrent_writes_serialize with all workers in _acquire_write and no
+# live owner). A bounded wait converts that silent hang into a loud error.
+_ACQUIRE_TIMEOUT = 30.0  # seconds
+
 
 _WRITE_PREFIXES: tuple[str, ...] = ("INSERT", "UPDATE", "DELETE", "REPLACE")
 
@@ -82,9 +89,24 @@ class LockedConnection(sqlite3.Connection):
         object.__setattr__(self, "_writes_held", 0)
 
     def _acquire_write(self) -> None:
-        _write_lock.acquire()
+        if not _write_lock.acquire(timeout=_ACQUIRE_TIMEOUT):
+            log.error("write_lock_timeout", timeout_s=_ACQUIRE_TIMEOUT)
+            raise sqlite3.OperationalError(
+                f"write lock not acquired within {_ACQUIRE_TIMEOUT}s — "
+                "a writer likely died between execute() and commit()/rollback()"
+            )
         held = cast(int, object.__getattribute__(self, "_writes_held"))
         object.__setattr__(self, "_writes_held", held + 1)
+
+    def _release_one(self) -> None:
+        """Undo a single acquisition (used when the write statement itself fails)."""
+        held = cast(int, object.__getattribute__(self, "_writes_held"))
+        if held > 0:
+            try:
+                _write_lock.release()
+            except RuntimeError:
+                return
+            object.__setattr__(self, "_writes_held", held - 1)
 
     def _release_writes(self) -> None:
         held = cast(int, object.__getattribute__(self, "_writes_held"))
@@ -99,17 +121,32 @@ class LockedConnection(sqlite3.Connection):
     def execute(self, sql: str, parameters: Any = (), /) -> sqlite3.Cursor:
         if _is_write_sql(sql):
             self._acquire_write()
+            try:
+                return super().execute(sql, parameters)
+            except BaseException:
+                self._release_one()
+                raise
         return super().execute(sql, parameters)
 
     def executemany(self, sql: str, seq_of_parameters: Any, /) -> sqlite3.Cursor:
         if _is_write_sql(sql):
             self._acquire_write()
+            try:
+                return super().executemany(sql, seq_of_parameters)
+            except BaseException:
+                self._release_one()
+                raise
         return super().executemany(sql, seq_of_parameters)
 
     def executescript(self, sql_script: str, /) -> sqlite3.Cursor:
         # Conservatively acquire if any statement in the script is a write.
         if any(_is_write_sql(stmt) for stmt in sql_script.split(";")):
             self._acquire_write()
+            try:
+                return super().executescript(sql_script)
+            except BaseException:
+                self._release_one()
+                raise
         return super().executescript(sql_script)
 
     def commit(self) -> None:
@@ -121,5 +158,13 @@ class LockedConnection(sqlite3.Connection):
     def rollback(self) -> None:
         try:
             super().rollback()
+        finally:
+            self._release_writes()
+
+    def close(self) -> None:
+        # A connection discarded mid-transaction must not keep the process-wide
+        # write lock; sqlite rolls the transaction back on close, we release.
+        try:
+            super().close()
         finally:
             self._release_writes()

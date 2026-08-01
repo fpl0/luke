@@ -77,6 +77,58 @@ if (( age > MAX_STALE )); then
     rm -f "$HEARTBEAT_FILE"
 fi
 
+# ─── Replay-loop detection ───
+# A replay loop: every restart completes "healthy", the pending message batch
+# replays, the agent run it triggers kills or crashes the process before the
+# cursor advances, and the cycle repeats. The guardian can't see this — each
+# startup succeeds and clears its crash state. Signature: several
+# startup_complete events in a short window WITH messages stuck behind the
+# cursor. Remedy: advance the cursor past the poisoned batch and leave a
+# notification so Luke reports the skipped messages on next startup.
+LUKE_LOG="$LUKE_DIR/luke.log"
+LUKE_DB="$LUKE_DIR/luke.db"
+LOOP_STATE="$LUKE_DIR/.watchdog_replay_loop"
+LOOP_WINDOW=1200    # 20 minutes
+LOOP_THRESHOLD=3    # restarts within window
+LOOP_COOLDOWN=1800  # don't remediate again within 30 minutes
+
+last_remedy=$(cat "$LOOP_STATE" 2>/dev/null || echo 0)
+if (( now - last_remedy > LOOP_COOLDOWN )) && [[ -f "$LUKE_LOG" && -f "$LUKE_DB" ]]; then
+    recent_starts=$(tail -c 262144 "$LUKE_LOG" | python3 -c '
+import json, sys, time
+from datetime import datetime
+window, now, count = int(sys.argv[1]), time.time(), 0
+for line in sys.stdin:
+    try:
+        ev = json.loads(line)
+    except ValueError:
+        continue
+    if ev.get("event") != "startup_complete":
+        continue
+    try:
+        t = datetime.fromisoformat(ev["timestamp"].replace("Z", "+00:00")).timestamp()
+    except (KeyError, ValueError):
+        continue
+    if now - t <= window:
+        count += 1
+print(count)
+' "$LOOP_WINDOW" 2>/dev/null || echo 0)
+
+    if (( recent_starts >= LOOP_THRESHOLD )); then
+        pending=$(sqlite3 "$LUKE_DB" \
+            "SELECT COUNT(*) FROM messages m JOIN cursors c ON m.chat_id = c.chat_id WHERE m.id > c.last_id;" \
+            2>/dev/null || echo 0)
+        if (( pending > 0 )); then
+            log "REPLAY LOOP: $recent_starts starts in ${LOOP_WINDOW}s with $pending pending message(s) — skipping batch"
+            sqlite3 "$LUKE_DB" \
+                "UPDATE cursors SET last_id = (SELECT COALESCE(MAX(id), cursors.last_id) FROM messages WHERE chat_id = cursors.chat_id);" \
+                2>/dev/null || log "cursor skip FAILED — manual intervention needed"
+            echo "replay_loop|||Restart loop detected ($recent_starts restarts in 20 min). Skipped $pending pending message(s) to break the replay cycle — they were stored but never processed, so recent requests may need re-sending." >> "$LUKE_DIR/crash_notifications"
+            echo "$now" > "$LOOP_STATE"
+        fi
+    fi
+fi
+
 # ─── Dashboard health check ───
 # Ensure the dashboard launcher service is running. The launcher supervises
 # both server.py and cloudflared itself, so we just need to make sure
