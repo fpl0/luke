@@ -317,6 +317,7 @@ async def start_scheduler_loop(
                 expired_working = memory.expire_working_memories()
                 expired_corrections = memory.prune_pending_corrections()
                 embeddings_backfilled = memory.backfill_missing_embeddings()
+                plans_reconciled = memory.reconcile_stale_plans()
                 db.set_behavior_last_run("cleanup", datetime.now(UTC).isoformat())
                 log.info(
                     "hourly_maintenance",
@@ -328,6 +329,7 @@ async def start_scheduler_loop(
                     working_expired=expired_working,
                     corrections_expired=expired_corrections,
                     embeddings_backfilled=embeddings_backfilled,
+                    plans_reconciled=plans_reconciled,
                 )
             except sqlite3.OperationalError:
                 log.warning("hourly_maintenance_skipped", reason="database locked")
@@ -399,6 +401,9 @@ async def start_scheduler_loop(
                             pruned = memory.prune_old_fts_entries(settings.fts_retention_days)
                             if pruned:
                                 log.info("fts_pruned", count=pruned)
+                            reflections = memory.prune_stale_reflections()
+                            if reflections:
+                                log.info("stale_reflections_archived", count=reflections)
 
         # Step 2: Launch deep work as background task (long-lived, NOT awaited)
         deep_work_running = _deep_work_task is not None and not _deep_work_task.done()

@@ -46,7 +46,10 @@ class TestEmbeddingBackfill:
     ) -> None:
         """Embed server down → memory indexes without a vector (FTS still
         works); backfill_missing_embeddings() heals the gap once it's back."""
-        monkeypatch.setattr(memory, "_embed_via_server", lambda texts: None)
+        def _fake_down(texts: list[str]) -> None:
+            return None
+
+        monkeypatch.setattr(memory, "_embed_via_server", _fake_down)
         memory.index_memory("outage-mem", "insight", "Outage", "Indexed while down", [], [])
 
         conn = db._db()
@@ -58,11 +61,10 @@ class TestEmbeddingBackfill:
         assert any(r["id"] == "outage-mem" for r in memory.recall(query="Outage"))
 
         # Server "back up" — swap in a working fake (never the live daemon)
-        monkeypatch.setattr(
-            memory,
-            "_embed_via_server",
-            lambda texts: [[0.1] * 768 for _ in texts],
-        )
+        def _fake_up(texts: list[str]) -> list[list[float]]:
+            return [[0.1] * 768 for _ in texts]
+
+        monkeypatch.setattr(memory, "_embed_via_server", _fake_up)
         healed = memory.backfill_missing_embeddings()
         assert healed == 1
         row = conn.execute(
@@ -73,6 +75,86 @@ class TestEmbeddingBackfill:
     def test_backfill_noop_when_nothing_missing(self, test_db: Any) -> None:
         memory.index_memory("full-mem", "insight", "Full", "Indexed with vector", [], [])
         assert memory.backfill_missing_embeddings() == 0
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle hygiene: plan reconciliation + stale-reflection pruning
+# ---------------------------------------------------------------------------
+
+
+class TestReconcileStalePlans:
+    def _plan(self, tmp_settings: Any, name: str, status_line: str) -> Any:
+        plans = tmp_settings.workspace_dir / "plans"
+        plans.mkdir(parents=True, exist_ok=True)
+        p = plans / f"{name}.md"
+        p.write_text(f"# Plan\n\n{status_line}\n\nbody\n")
+        return p
+
+    def test_plan_paused_when_goal_archived(self, test_db: Any, tmp_settings: Any) -> None:
+        memory.index_memory("goal-old", "goal", "Old", "was a goal", [], [])
+        memory.archive_memory("goal-old")
+        p = self._plan(tmp_settings, "goal-old", "**Status:** in_progress")
+        assert memory.reconcile_stale_plans() == 1
+        assert "**Status:** paused — auto-reconciled" in p.read_text()
+        assert "goal archived" in p.read_text()
+
+    def test_plan_paused_when_goal_missing(self, test_db: Any, tmp_settings: Any) -> None:
+        p = self._plan(tmp_settings, "goal-ghost", "**Status:** blocked")
+        assert memory.reconcile_stale_plans() == 1
+        assert "goal memory missing" in p.read_text()
+
+    def test_active_goal_plan_untouched(self, test_db: Any, tmp_settings: Any) -> None:
+        memory.index_memory("goal-live", "goal", "Live", "current goal", [], [])
+        p = self._plan(tmp_settings, "goal-live", "**Status:** in_progress")
+        assert memory.reconcile_stale_plans() == 0
+        assert "**Status:** in_progress" in p.read_text()
+
+    def test_terminal_statuses_untouched(self, test_db: Any, tmp_settings: Any) -> None:
+        p = self._plan(tmp_settings, "goal-done", "**Status:** completed — shipped")
+        assert memory.reconcile_stale_plans() == 0
+        assert "completed — shipped" in p.read_text()
+
+    def test_non_goal_plans_ignored(self, test_db: Any, tmp_settings: Any) -> None:
+        plans = tmp_settings.workspace_dir / "plans"
+        plans.mkdir(parents=True, exist_ok=True)
+        (plans / "perf-audit.md").write_text("# Audit\n\n**Status:** in_progress\n")
+        assert memory.reconcile_stale_plans() == 0
+
+
+class TestPruneStaleReflections:
+    def _age(self, mem_id: str, days: int) -> None:
+        from datetime import UTC, datetime, timedelta
+
+        old = (datetime.now(UTC) - timedelta(days=days)).isoformat()
+        db._db().execute("UPDATE memory_meta SET created = ? WHERE id = ?", (old, mem_id))
+        db._db().commit()
+
+    def test_old_unused_reflexion_archived(self, test_db: Any) -> None:
+        memory.index_memory("reflexion-old-slop-123", "insight", "Slop", "never used", [], [])
+        self._age("reflexion-old-slop-123", 60)
+        assert memory.prune_stale_reflections() == 1
+        row = (
+            db._db()
+            .execute("SELECT status FROM memory_meta WHERE id='reflexion-old-slop-123'")
+            .fetchone()
+        )
+        assert row["status"] == "archived"
+
+    def test_recent_reflexion_kept(self, test_db: Any) -> None:
+        memory.index_memory("reflexion-fresh-456", "insight", "Fresh", "new lesson", [], [])
+        assert memory.prune_stale_reflections() == 0
+
+    def test_accessed_reflexion_kept(self, test_db: Any) -> None:
+        memory.index_memory("dream-used-789", "insight", "Used", "recalled often", [], [])
+        self._age("dream-used-789", 60)
+        db._db().execute("UPDATE memory_meta SET access_count = 10 WHERE id='dream-used-789'")
+        db._db().commit()
+        assert memory.prune_stale_reflections() == 0
+
+    def test_regular_insights_never_pruned(self, test_db: Any) -> None:
+        memory.index_memory("insight-real-lesson", "insight", "Real", "hand-written", [], [])
+        self._age("insight-real-lesson", 400)
+        assert memory.prune_stale_reflections() == 0
 
 
 # ---------------------------------------------------------------------------

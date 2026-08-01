@@ -1426,6 +1426,74 @@ def backfill_missing_embeddings(limit: int = 64) -> int:
     return done
 
 
+def reconcile_stale_plans() -> int:
+    """Pause plan files whose goal memory is archived or gone. Returns count.
+
+    The dashboard treats a plan's content-declared status as authoritative, so
+    a plan left 'in_progress' after its goal was archived haunts the active
+    view indefinitely (2026-08-01 hygiene found five, some months stale).
+    Deterministic code, not agent judgment: goal dead → plan paused.
+    """
+    plans_dir = settings.workspace_dir / "plans"
+    if not plans_dir.exists():
+        return 0
+    db = _db()
+    count = 0
+    for path in plans_dir.glob("goal-*.md"):
+        row = db.execute(
+            "SELECT status FROM memory_meta WHERE id = ?", (path.stem,)
+        ).fetchone()
+        if row and row["status"] == "active":
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        m = re.search(r"^(?:\*\*Status:\*\*|Status:)\s*(\w+).*$", text, re.MULTILINE)
+        if not m or m.group(1).lower() not in ("in_progress", "blocked"):
+            continue
+        reason = f"goal {row['status']}" if row else "goal memory missing"
+        stamp = datetime.now(UTC).date().isoformat()
+        text = (
+            text[: m.start()]
+            + f"**Status:** paused — auto-reconciled {stamp} ({reason})"
+            + text[m.end() :]
+        )
+        path.write_text(text, encoding="utf-8")
+        count += 1
+        log.info("plan_auto_paused", plan=path.name, reason=reason)
+    return count
+
+
+def prune_stale_reflections(max_age_days: int = 45, max_access: int = 2, limit: int = 50) -> int:
+    """Archive old, never-used auto-generated reflections. Returns count.
+
+    reflexion-/dream-/counterfactual- insights accumulate from nightly
+    behaviors; ones nothing recalled in six weeks are noise by definition
+    (Filipe: "AI slop"). Consolidation owns the useful ones — this owns the
+    residue. Goes through archive_memory so the Letta mirror stays in sync.
+    """
+    cutoff = (datetime.now(UTC) - timedelta(days=max_age_days)).isoformat()
+    rows = (
+        _db()
+        .execute(
+            """SELECT id FROM memory_meta
+               WHERE type = 'insight' AND status = 'active'
+                 AND (id LIKE 'reflexion-%' OR id LIKE 'dream-%'
+                      OR id LIKE 'counterfactual-%')
+                 AND created < ? AND access_count <= ? AND useful_count = 0
+               LIMIT ?""",
+            (cutoff, max_access, limit),
+        )
+        .fetchall()
+    )
+    for row in rows:
+        archive_memory(row["id"])
+    if rows:
+        log.info("stale_reflections_pruned", count=len(rows))
+    return len(rows)
+
+
 def prune_old_fts_entries(retention_days: int) -> int:
     """Archive low-importance episodes older than retention_days. Returns count."""
     if retention_days <= 0:

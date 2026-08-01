@@ -12,12 +12,14 @@ tick
   │     ├── FTS cleanup — remove archived entries from search index
   │     ├── Importance decay — apply type-specific forgetting rates
   │     ├── Session cleanup — remove stale sessions + model ratchet
-  │     └── Outbound log pruning — remove dedup entries older than 24h
+  │     ├── Outbound log pruning — remove dedup entries older than 24h
+  │     ├── Embedding backfill — heal memory_vec rows missed during embed-server outages
+  │     └── Plan reconciliation — auto-pause plans whose goal is archived/missing
   │
   ├── Collect due maintenance behaviors → run in parallel (asyncio.gather)
   │     ├── Consolidation (daily)
   │     ├── Proactive scan (daily) — can also take lightweight goal actions
-  │     └── Reflection (weekly) + FTS pruning
+  │     └── Reflection (weekly) + FTS pruning + stale-reflection pruning
   │
   ├── Launch deep work as background task (asyncio.create_task, non-blocking)
   │     └── Deep work — autonomous goal execution with lifecycle notifications
