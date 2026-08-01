@@ -396,6 +396,35 @@ class TestAgentResult:
 
 
 # ---------------------------------------------------------------------------
+# _resolve_model_id
+# ---------------------------------------------------------------------------
+
+
+class TestResolveModelId:
+    """Tier aliases must pin to explicit model IDs at the SDK boundary."""
+
+    def test_tier_aliases_resolve_to_pinned_ids(self) -> None:
+        from luke.agent import _MODEL_IDS, _resolve_model_id
+
+        assert _resolve_model_id("haiku") == _MODEL_IDS["haiku"]
+        assert _resolve_model_id("sonnet") == "claude-sonnet-5"
+        assert _resolve_model_id("opus") == "claude-opus-5"
+
+    def test_explicit_model_ids_pass_through(self) -> None:
+        from luke.agent import _resolve_model_id
+
+        assert _resolve_model_id("claude-haiku-4-5-20251001") == "claude-haiku-4-5-20251001"
+        assert _resolve_model_id("claude-opus-4-1-20250805") == "claude-opus-4-1-20250805"
+
+    def test_every_routing_tier_has_a_pinned_id(self) -> None:
+        from luke.agent import _MODEL_IDS
+        from luke.config import settings
+
+        for tier in (settings.model_low, settings.model_medium, settings.model_high):
+            assert tier in _MODEL_IDS
+
+
+# ---------------------------------------------------------------------------
 # _INTERNAL_RE
 # ---------------------------------------------------------------------------
 
