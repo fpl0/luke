@@ -206,7 +206,7 @@ def _effective_interval_formula(no_ops: int, base: float) -> float:
 
     Formula: base * (2 ** min(no_ops, 4))
     """
-    return base * (2 ** min(no_ops, 4))
+    return base * float(2 ** min(no_ops, 4))
 
 
 class TestEffectiveInterval:
@@ -472,6 +472,7 @@ class TestBehaviorEventMapping:
                         isinstance(comparator, ast.BinOp)
                         and isinstance(comparator.op, ast.Mult)
                         and isinstance(comparator.right, ast.Constant)
+                        and isinstance(comparator.right.value, int)
                     ):
                         fallback_multipliers.append(comparator.right.value)
         # deep_work uses 2x, proactive_scan uses 3x, others use 6x

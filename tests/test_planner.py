@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock, patch
 
@@ -46,9 +47,12 @@ def _mock_db(
     def _count_events(*event_types: str) -> int:
         return sum(unconsumed.get(e, 0) for e in event_types)
 
+    def _get_no_ops(name: str) -> int:
+        return no_ops.get(name, 0)
+
     m = MagicMock()
     m.get_behavior_last_run.side_effect = _get_last_run
-    m.get_behavior_no_ops.side_effect = lambda name: no_ops.get(name, 0)
+    m.get_behavior_no_ops.side_effect = _get_no_ops
     m.count_unconsumed_events.side_effect = _count_events
     m.get_daily_deep_work_cost.return_value = daily_cost
     m.ensure_utc = _real_ensure_utc
@@ -434,7 +438,7 @@ def _attn_settings(
 
 
 @pytest.fixture(autouse=True)
-def _reset_drop_log_cache():
+def reset_drop_log_cache() -> Iterator[None]:
     """Clear per-kind drop-log back-off cache between tests."""
     from luke.planner import _last_drop_log_ts
 

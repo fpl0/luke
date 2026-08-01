@@ -71,9 +71,13 @@ ignore_missing_imports = true
 asyncio_mode = "auto"
 filterwarnings = ["ignore::ResourceWarning"]
 
+[tool.uv]
+default-groups = ["dev", "test"]
+
 [dependency-groups]
 dev = [
     "mypy>=1.19.1",
+    "pyright>=1.1",
     "ruff>=0.15.6",
     "types-croniter>=6.0.0.20250809",
     "types-pyyaml>=6.0.12.20250915",

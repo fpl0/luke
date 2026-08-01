@@ -655,7 +655,7 @@ async def process(chat_id: str) -> None:
 
                 # Serialize corrections to avoid concurrent SQLite writers
                 # (fire-and-forget caused "database is locked" crashes)
-                async def _apply_all_corrections(corrs: list) -> None:
+                async def _apply_all_corrections(corrs: list[dict[str, Any]]) -> None:
                     for corr in corrs:
                         confidence = corr["confidence"]
                         mem_id = corr["memory_id"]
@@ -1838,47 +1838,6 @@ def _write_crash_breadcrumb(exc: BaseException, *, source: str = "main") -> None
     }
     with contextlib.suppress(OSError):
         crash_file.write_text(json.dumps(breadcrumb, indent=2, default=str))
-
-
-def _get_last_crash_summary() -> str | None:
-    """Read the most recent crash breadcrumb and return a summary."""
-    crash_dir = _crash_dir()
-    if not crash_dir.is_dir():
-        return None
-    crashes = sorted(
-        (f for f in crash_dir.iterdir() if f.name.startswith("crash-")),
-        key=lambda f: f.stat().st_mtime,
-        reverse=True,
-    )
-    if not crashes:
-        return None
-    # Only report crashes from the last 10 minutes (likely the crash we just recovered from)
-    if time.time() - crashes[0].stat().st_mtime > 600:
-        return None
-    try:
-        content = crashes[0].read_text()
-        # JSON format (new structured breadcrumbs)
-        if crashes[0].suffix == ".json":
-            data = json.loads(content)
-            exc_info = data.get("exception", {})
-            exc_type = exc_info.get("type", "Unknown")
-            exc_msg = exc_info.get("message", "")
-            source = data.get("source", "unknown")
-            uptime = data.get("uptime_s", "?")
-            ctx = data.get("context", {})
-            summary = f"{exc_type}: {exc_msg[:200]} (source={source}, uptime={uptime}s)"
-            if ctx.get("processing_chat"):
-                summary += f" [processing chat {ctx['processing_chat']}]"
-            return summary
-        # Legacy plain-text format
-        lines = content.splitlines()
-        exc_type = next(
-            (ln.split(": ", 1)[1] for ln in lines if ln.startswith("type: ")), "Unknown"
-        )
-        exc_msg = next((ln.split(": ", 1)[1] for ln in lines if ln.startswith("message: ")), "")
-        return f"{exc_type}: {exc_msg[:200]}"
-    except Exception:
-        return "Unknown crash (breadcrumb unreadable)"
 
 
 def _cleanup_old_breadcrumbs() -> None:

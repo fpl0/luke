@@ -93,7 +93,7 @@ class EventBus:
             bus.on("*", catch_all)
         """
         if inspect.iscoroutinefunction(handler):
-            self._async_handlers[pattern].append(handler)  # type: ignore[arg-type]
+            self._async_handlers[pattern].append(handler)
         else:
             self._sync_handlers[pattern].append(handler)  # type: ignore[arg-type]
 

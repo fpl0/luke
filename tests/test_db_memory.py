@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -836,19 +837,25 @@ class TestMemoryHistory:
 # ---------------------------------------------------------------------------
 
 
+def _classify_as(kind: str) -> Callable[[str, str], str]:
+    """Typed stand-in for memory.classify_relationship with a fixed verdict."""
+
+    def _classify(existing: str, new: str) -> str:
+        return kind
+
+    return _classify
+
+
 class TestApplyCorrection:
     def _content(self, mem_id: str) -> str:
-        return (
-            db._db()
-            .execute("SELECT content FROM memory_fts WHERE id = ?", (mem_id,))
-            .fetchone()["content"]
-        )
+        row = db._db().execute("SELECT content FROM memory_fts WHERE id = ?", (mem_id,)).fetchone()
+        return str(row["content"])
 
     def test_low_confidence_contradiction_is_flagged_not_destroyed(
         self, test_db: Any, monkeypatch: Any
     ) -> None:
         # Force the contradictory (destructive) classification regardless of embeddings.
-        monkeypatch.setattr(memory, "classify_relationship", lambda a, b: "contradictory")
+        monkeypatch.setattr(memory, "classify_relationship", _classify_as("contradictory"))
         memory.index_memory("e1", "entity", "Fact", "original important content")
 
         result = memory.apply_correction("e1", "totally different claim", confidence=0.74)
@@ -861,7 +868,7 @@ class TestApplyCorrection:
         assert len(memory.get_pending_corrections("e1")) == 1
 
     def test_high_confidence_contradiction_is_applied(self, test_db: Any, monkeypatch: Any) -> None:
-        monkeypatch.setattr(memory, "classify_relationship", lambda a, b: "contradictory")
+        monkeypatch.setattr(memory, "classify_relationship", _classify_as("contradictory"))
         memory.index_memory("e1", "entity", "Fact", "original content")
 
         result = memory.apply_correction("e1", "corrected content", confidence=0.95)
@@ -873,7 +880,7 @@ class TestApplyCorrection:
         self, test_db: Any, monkeypatch: Any
     ) -> None:
         # Human-approved path (resolve_correction) may replace even at low confidence.
-        monkeypatch.setattr(memory, "classify_relationship", lambda a, b: "contradictory")
+        monkeypatch.setattr(memory, "classify_relationship", _classify_as("contradictory"))
         memory.index_memory("e1", "entity", "Fact", "original content")
 
         result = memory.apply_correction(
@@ -885,7 +892,7 @@ class TestApplyCorrection:
 
     def test_history_snapshot_not_truncated(self, test_db: Any, monkeypatch: Any) -> None:
         # A replaced correction must be fully reversible — no 500-char truncation.
-        monkeypatch.setattr(memory, "classify_relationship", lambda a, b: "contradictory")
+        monkeypatch.setattr(memory, "classify_relationship", _classify_as("contradictory"))
         long_original = "X" * 1200
         memory.index_memory("e1", "entity", "Fact", long_original)
 
@@ -902,7 +909,7 @@ class TestApplyCorrection:
         assert row["old_content"] == long_original  # full snapshot, reversible
 
     def test_extendable_correction_still_appends(self, test_db: Any, monkeypatch: Any) -> None:
-        monkeypatch.setattr(memory, "classify_relationship", lambda a, b: "extendable")
+        monkeypatch.setattr(memory, "classify_relationship", _classify_as("extendable"))
         memory.index_memory("e1", "entity", "Fact", "base")
 
         result = memory.apply_correction("e1", "addendum", confidence=0.74)
@@ -1151,7 +1158,7 @@ class TestTaxonomyScoring:
         assert len(results) >= 1
         # taxonomy is in the internal dict even if not in MemoryResult TypedDict
         result_dict = dict(results[0])
-        assert "taxonomy" in result_dict or results[0].get("taxonomy") is not None  # type: ignore[union-attr]
+        assert "taxonomy" in result_dict or results[0].get("taxonomy") is not None
 
 
 class TestWorkingMemoryExpiry:

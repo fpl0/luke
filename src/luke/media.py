@@ -126,7 +126,8 @@ def encode_image(path: Path) -> dict[str, Any] | None:
 
     media_type = _MEDIA_TYPES.get(path.suffix.lower(), "image/jpeg")
     try:
-        with PIL.Image.open(path) as img:
+        with PIL.Image.open(path) as opened:
+            img: PIL.Image.Image = opened
             # Fix EXIF rotation (e.g. portrait phone photos)
             with contextlib.suppress(Exception):
                 img = ImageOps.exif_transpose(img) or img

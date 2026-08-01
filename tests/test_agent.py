@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from aiogram import Bot
+from claude_agent_sdk import HookCallback
 from claude_agent_sdk.types import SyncHookJSONOutput
 
 from luke.agent import (
@@ -164,16 +165,16 @@ class TestBuildStopHook:
 
     async def test_no_skill_prompt_below_threshold(self) -> None:
         result = await self._call(_AUTO_SKILL_THRESHOLD - 1, False)
-        assert "Skill extraction" not in result["systemMessage"]
+        assert "Skill extraction" not in result.get("systemMessage", "")
 
     async def test_skill_prompt_at_threshold(self) -> None:
         result = await self._call(_AUTO_SKILL_THRESHOLD, False)
-        assert "Skill extraction" in result["systemMessage"]
-        assert "procedure" in result["systemMessage"]
+        assert "Skill extraction" in result.get("systemMessage", "")
+        assert "procedure" in result.get("systemMessage", "")
 
     async def test_no_skill_prompt_for_autonomous_runs(self) -> None:
         result = await self._call(_AUTO_SKILL_THRESHOLD + 10, True)
-        assert "Skill extraction" not in result["systemMessage"]
+        assert "Skill extraction" not in result.get("systemMessage", "")
 
 
 # ---------------------------------------------------------------------------
@@ -228,7 +229,7 @@ class TestArtifactGate:
         scheduled: int = 0,
         fired: int = 0,
         autonomous: bool = False,
-    ):
+    ) -> HookCallback:
         return _build_stop_hook(
             {"n": 3},
             autonomous,
@@ -238,13 +239,13 @@ class TestArtifactGate:
             artifact_gate_fired={"n": fired},
         )
 
-    async def _run(self, hook) -> SyncHookJSONOutput:
+    async def _run(self, hook: HookCallback) -> SyncHookJSONOutput:
         return cast(SyncHookJSONOutput, await hook(MagicMock(), None, MagicMock()))
 
     async def test_blocks_when_requested_and_nothing_shipped(self) -> None:
         result = await self._run(self._hook(requested=True))
         assert result.get("decision") == "block"
-        assert "send_document" in result["reason"]
+        assert "send_document" in result.get("reason", "")
 
     async def test_passes_when_artifact_delivered(self) -> None:
         result = await self._run(self._hook(requested=True, delivered=1))
@@ -335,7 +336,7 @@ class TestSourceReadGate:
         read: int = 0,
         fired: int = 0,
         autonomous: bool = False,
-    ):
+    ) -> HookCallback:
         return _build_stop_hook(
             {"n": 3},
             autonomous,
@@ -344,13 +345,13 @@ class TestSourceReadGate:
             source_gate_fired={"n": fired},
         )
 
-    async def _run(self, hook) -> SyncHookJSONOutput:
+    async def _run(self, hook: HookCallback) -> SyncHookJSONOutput:
         return cast(SyncHookJSONOutput, await hook(MagicMock(), None, MagicMock()))
 
     async def test_blocks_when_requested_and_nothing_read(self) -> None:
         result = await self._run(self._hook(requested=True))
         assert result.get("decision") == "block"
-        assert "primary source" in result["reason"].lower()
+        assert "primary source" in result.get("reason", "").lower()
 
     async def test_passes_when_source_read(self) -> None:
         result = await self._run(self._hook(requested=True, read=1))
@@ -847,7 +848,7 @@ class TestPostToolUseHooks:
         import json
         import time as _time
 
-        from luke.agent import db
+        from luke import db
 
         tool_start_times: dict[str, float] = {"tu_123": _time.monotonic() - 0.5}
 
@@ -892,7 +893,7 @@ class TestPostToolUseHooks:
         """PostToolUseFailure hook should emit a tool_failure event."""
         import json
 
-        from luke.agent import db
+        from luke import db
 
         async def _post_tool_failure_hook(
             input_data: dict[str, Any],
@@ -932,7 +933,7 @@ class TestPostToolUseHooks:
         """SubagentStart hook should emit a subagent_start event."""
         import json
 
-        from luke.agent import db
+        from luke import db
 
         subagent_start_times: dict[str, float] = {}
 
@@ -969,7 +970,7 @@ class TestPostToolUseHooks:
         import json
         import time as _time
 
-        from luke.agent import db
+        from luke import db
 
         subagent_start_times: dict[str, float] = {"sa_002": _time.monotonic() - 2.0}
 
@@ -2454,13 +2455,13 @@ class TestContextQuery:
         "## Active Insights\n[dream-...] some long injected memory context\n\n"
     )
 
-    def test_prefers_user_text_over_str_prompt_with_memory(self):
+    def test_prefers_user_text_over_str_prompt_with_memory(self) -> None:
         # str path: memory_context prepended -> prompt carries the blob
         user_msg = "read the Prerna email and tell me what she wants"
         polluted = f"{self.MEMORY_BLOB}\n\n{user_msg}"
         assert _context_query(polluted, user_text=user_msg) == user_msg
 
-    def test_prefers_user_text_over_list_prompt_with_memory(self):
+    def test_prefers_user_text_over_list_prompt_with_memory(self) -> None:
         # multimodal path: memory inserted at index 0, real msg pushed to index 1
         user_msg = "make me a PDF of this"
         polluted = [
@@ -2469,7 +2470,7 @@ class TestContextQuery:
         ]
         assert _context_query(polluted, user_text=user_msg) == user_msg
 
-    def test_gate_fires_on_user_text_not_blob(self):
+    def test_gate_fires_on_user_text_not_blob(self) -> None:
         # The concrete failure: with the blob as query the source-read gate misses;
         # with user_text it fires. Proves the fix restores gate correctness.
         user_msg = "can you read the attached pdf and summarise the thread"
@@ -2480,15 +2481,15 @@ class TestContextQuery:
         assert _requests_source_read(_context_query(polluted, user_text=None)) is False
         assert _requests_source_read(_context_query(polluted, user_text=user_msg)) is True
 
-    def test_falls_back_to_str_prompt_when_no_user_text(self):
+    def test_falls_back_to_str_prompt_when_no_user_text(self) -> None:
         # Autonomous/scheduled callers pass no user_text -> use prompt as-is
         assert _context_query("do the nightly reflection", user_text=None) == (
             "do the nightly reflection"
         )
 
-    def test_falls_back_to_first_block_for_list_without_user_text(self):
+    def test_falls_back_to_first_block_for_list_without_user_text(self) -> None:
         blocks = [{"type": "text", "text": "hello"}, {"type": "text", "text": "world"}]
         assert _context_query(blocks, user_text=None) == "hello"
 
-    def test_empty_list_without_user_text_is_safe(self):
+    def test_empty_list_without_user_text_is_safe(self) -> None:
         assert _context_query([], user_text=None) == ""

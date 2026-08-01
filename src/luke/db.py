@@ -7,7 +7,7 @@ import sqlite3
 import threading
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Generator
 from datetime import UTC, datetime, timedelta
 from typing import Any, TypedDict, cast
 
@@ -23,7 +23,7 @@ _local = threading.local()  # thread-local: conn, batch_depth, has_vec
 
 
 @contextlib.contextmanager
-def batch() -> Iterator[None]:
+def batch() -> Generator[None]:
     """Suppress intermediate commits; single commit on exit. Nestable.
 
     Rolls back on exception at the outermost level; commits on success.

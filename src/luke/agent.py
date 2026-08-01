@@ -8,7 +8,7 @@ import json
 import re
 import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -596,8 +596,8 @@ def _task_overlap(a: str, b: str) -> float:
 
 
 def _duplicate_pending_task(
-    tool_input: dict[str, Any], existing: list[dict[str, Any]]
-) -> dict[str, Any] | None:
+    tool_input: dict[str, Any], existing: Sequence[Mapping[str, Any]]
+) -> Mapping[str, Any] | None:
     """Return an active task that the new schedule_task would duplicate, else None.
 
     A duplicate requires the SAME schedule_type, high prompt word-overlap
@@ -1647,6 +1647,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
             mem_restore,
             mem_bulk,
             mem_history,
+            mem_review_corrections,
             t_pin_attention,
             t_unpin_attention,
             t_cost,
@@ -1837,8 +1838,12 @@ async def _user_prompt_submit_hook(
     day_name = now.strftime("%A")
     log.debug("user_prompt_submit", local_time=time_str, day=day_name)
     return {
-        "hookEventName": "UserPromptSubmit",
-        "additionalContext": f"Current local time (Dublin): {time_str}. Day of week: {day_name}.",
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": (
+                f"Current local time (Dublin): {time_str}. Day of week: {day_name}."
+            ),
+        }
     }
 
 
@@ -1898,6 +1903,7 @@ _ALL_MCP_TOOL_NAMES: list[str] = [
     "restore",
     "bulk_memory",
     "memory_history",
+    "review_corrections",
     "pin_attention",
     "unpin_attention",
     "get_cost_report",
@@ -2062,7 +2068,7 @@ async def run_agent(
         # for the same deliverable (see _duplicate_pending_task). Steers to
         # reuse/update the existing task instead of stacking a second nudge.
         if tool_name == "mcp__luke__schedule_task":
-            tool_input = input_data.get("tool_input", {})
+            tool_input = cast(object, input_data.get("tool_input", {}))
             if isinstance(tool_input, dict):
                 try:
                     dup = _duplicate_pending_task(tool_input, db.list_tasks(chat_id))
@@ -2107,7 +2113,7 @@ async def run_agent(
             # schedule_task has been spawned this turn. Without this, the
             # commitment exists only as text and no execution path runs
             # (the May 14 2026 overnight-prep failure).
-            tool_input = input_data.get("tool_input", {})
+            tool_input = cast(object, input_data.get("tool_input", {}))
             if isinstance(tool_input, dict):
                 msg_text = tool_input.get("text", "") or tool_input.get("caption", "")
             else:
@@ -2162,7 +2168,7 @@ async def run_agent(
                 # is actually present — a file with no caption is a valid send,
                 # not an "empty message" (bug fixed 2026-07-13; false-positive
                 # blocked every document send since 2026-05-16).
-                tool_input = input_data.get("tool_input", {})
+                tool_input = cast(object, input_data.get("tool_input", {}))
                 if isinstance(tool_input, dict):
                     msg_text = tool_input.get("text", "") or tool_input.get("caption", "")
                 else:
@@ -2327,7 +2333,7 @@ async def run_agent(
             duration_ms = int((time.monotonic() - tool_start_times.pop(tid)) * 1000)
         agent_id = input_data.get("agent_id")
         agent_type = input_data.get("agent_type")
-        payload = {"tool": tool_name, "success": True}
+        payload: dict[str, Any] = {"tool": tool_name, "success": True}
         if duration_ms is not None:
             payload["duration_ms"] = duration_ms
         if agent_id:

@@ -2,9 +2,16 @@
 
 from __future__ import annotations
 
+from typing import cast
 from unittest.mock import MagicMock
 
 from luke.app import _extract_pending_actions, _extract_topics
+from luke.db import StoredMessage
+
+
+def _mock_messages(*contents: str) -> list[StoredMessage]:
+    """MagicMock stand-ins for StoredMessage, cast for the type checker."""
+    return cast(list[StoredMessage], [MagicMock(content=c) for c in contents])
 
 
 class TestExtractPendingActions:
@@ -49,17 +56,17 @@ class TestExtractPendingActions:
 
 class TestExtractTopics:
     def test_empty_messages(self) -> None:
-        msgs = [MagicMock(content="the the the")]
+        msgs = _mock_messages("the the the")
         result = _extract_topics(msgs, [])
         assert isinstance(result, list)
 
     def test_extracts_frequent_words(self) -> None:
-        msgs = [MagicMock(content="dashboard dashboard dashboard fixes")]
+        msgs = _mock_messages("dashboard dashboard dashboard fixes")
         result = _extract_topics(msgs, [])
         assert "dashboard" in result
 
     def test_filters_stopwords(self) -> None:
-        msgs = [MagicMock(content="the the the and and and")]
+        msgs = _mock_messages("the the the and and and")
         result = _extract_topics(msgs, [])
         assert "the" not in result
         assert "and" not in result

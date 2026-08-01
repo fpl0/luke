@@ -166,7 +166,7 @@ def _cosine_similarity(a: list[float], b_blob: bytes) -> float:
     """Cosine similarity between a list[float] and a packed-float blob."""
     dim = len(a)
     try:
-        b = struct.unpack(f"{dim}f", b_blob)
+        b: tuple[float, ...] = struct.unpack(f"{dim}f", b_blob)
     except struct.error:
         return 0.0
     dot = sum(x * y for x, y in zip(a, b, strict=True))

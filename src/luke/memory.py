@@ -2187,12 +2187,14 @@ def _get_birch() -> Any:
     global _birch_model
     if _birch_model is not None:
         return _birch_model
-    from sklearn.cluster import Birch  # type: ignore[import-not-found]
+    from sklearn.cluster import Birch  # type: ignore[import-untyped]
 
     _birch_model = Birch(
         threshold=settings.birch_threshold,
         branching_factor=settings.birch_branching_factor,
-        n_clusters=None,
+        # n_clusters=None disables the global clustering step (valid per sklearn
+        # docs; the inferred int annotation from the untyped source is too narrow)
+        n_clusters=None,  # pyright: ignore[reportArgumentType]
         compute_labels=True,
     )
     return _birch_model
@@ -2270,7 +2272,7 @@ def assign_cluster_online(mem_id: str, embedding: list[float] | None) -> int | N
         np_new = _embeddings_to_numpy_array(normalized_new)
 
         # If BIRCH hasn't been fitted yet, partial_fit first to initialize
-        from sklearn.exceptions import NotFittedError  # type: ignore[import-not-found]
+        from sklearn.exceptions import NotFittedError  # type: ignore[import-untyped]
 
         try:
             label = int(birch.predict(np_new)[0])

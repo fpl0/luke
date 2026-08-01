@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Iterator
 from typing import Any
 
 import pytest
@@ -11,7 +12,7 @@ from luke.bus import Event, EventBus
 
 
 @pytest.fixture()
-def bus(test_db: Any) -> EventBus:
+def bus(test_db: Any) -> Iterator[EventBus]:
     """Fresh event bus per test, backed by the test DB."""
     b = EventBus()
     yield b
@@ -41,10 +42,11 @@ class TestEvent:
 
     def test_event_hashable(self) -> None:
         """Events with dict payloads are not hashable (dict is unhashable)."""
-        Event(id=1, kind="x", payload={})
-        # frozen dataclass with slots — hash depends on field hashability
-        # dict is unhashable, so Event with non-empty payload isn't hashable
-        # but empty dict is fine for __eq__
+        # frozen dataclass with slots — hash depends on field hashability,
+        # and the payload dict is unhashable (even when empty)
+        e = Event(id=1, kind="x", payload={})
+        with pytest.raises(TypeError):
+            hash(e)
 
 
 # ---------------------------------------------------------------------------
