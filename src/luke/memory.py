@@ -1287,14 +1287,20 @@ def link_memories(from_id: str, to_id: str, relationship: str) -> bool:
 
 
 def invalidate_link(from_id: str, to_id: str, relationship: str) -> bool:
-    """Set valid_until on a specific link. Returns True if found and invalidated."""
+    """Set valid_until on a link pair. Returns True if found and invalidated.
+
+    Expires both orientations (from→to and to→from): graph traversal treats
+    links as undirected, and auto-linking (A-MEM) may have stored the reverse
+    row — leaving it active would resurrect the expired relationship.
+    """
     conn = _db()
     now = datetime.now(UTC).isoformat()
     cur = conn.execute(
         f"""UPDATE memory_links SET valid_until = ?
-           WHERE from_id = ? AND to_id = ? AND relationship = ?
+           WHERE ((from_id = ? AND to_id = ?) OR (from_id = ? AND to_id = ?))
+           AND relationship = ?
            {_valid_link_clause()}""",
-        (now, from_id, to_id, relationship),
+        (now, from_id, to_id, to_id, from_id, relationship),
     )
     _commit(conn)
     return cur.rowcount > 0
