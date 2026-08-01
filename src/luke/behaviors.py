@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import time
+from contextlib import suppress
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import structlog
@@ -561,6 +563,96 @@ def _parse_plan_status(goal_id: str) -> str | None:
         return None
 
 
+# ---------------------------------------------------------------------------
+# Plan momentum enforcement — stalled plans get worked, not remembered
+# ---------------------------------------------------------------------------
+# Filipe: "Luke has this thing where he keeps tasks open and never proactively
+# tackles them!" This is the deterministic counter: an in_progress plan nobody
+# touched for _STALL_NUDGE_HOURS emits a goal_updated event, which raises the
+# planner's deep-work intent to its highest priority — the work loop is pointed
+# back at the stalled plan by code, not by hoping a session notices. If the
+# plan is STILL untouched at _STALL_ALERT_HOURS, Filipe hears about it directly
+# (with the plan's actual next step), so open-but-idle work can no longer hide.
+
+_STALL_NUDGE_HOURS = 48.0
+_STALL_ALERT_HOURS = 96.0
+_STALL_REPEAT_HOURS = 24.0  # at most one nudge/alert per plan per day
+
+
+def _plan_last_updated(path: Path) -> datetime | None:
+    """A plan's freshness: its **Last updated:** header, else file mtime."""
+    import re
+
+    try:
+        text = path.read_text(encoding="utf-8")[:2000]
+        m = re.search(r"\*\*Last updated:\*\*\s*(\S+)", text)
+        if m:
+            with suppress(ValueError):
+                return db.ensure_utc(datetime.fromisoformat(m.group(1).rstrip(".,;")))
+        return datetime.fromtimestamp(path.stat().st_mtime, tz=UTC)
+    except OSError:
+        return None
+
+
+def _plan_next_step(path: Path) -> str:
+    """First unchecked checklist item, for actionable stall alerts."""
+    import re
+
+    with suppress(OSError):
+        m = re.search(r"^- \[ \] (.+)$", path.read_text(encoding="utf-8"), re.MULTILINE)
+        if m:
+            return m.group(1).strip()
+    return "(no unchecked step found — the plan needs steps)"
+
+
+async def enforce_plan_momentum(bot: Bot) -> int:
+    """Nudge or escalate every stalled in_progress plan. Returns plans acted on."""
+    plans_dir = settings.workspace_dir / "plans"
+    if not plans_dir.exists():
+        return 0
+    import re
+
+    now = datetime.now(UTC)
+    acted = 0
+    for path in plans_dir.glob("*.md"):
+        try:
+            head = path.read_text(encoding="utf-8")[:2000]
+        except OSError:
+            continue
+        m = re.search(r"\*\*Status:\*\*\s*(\S+)", head)
+        if not m or m.group(1).strip().lower() != "in_progress":
+            continue
+        updated = _plan_last_updated(path)
+        if updated is None:
+            continue
+        stale_h = (now - updated).total_seconds() / 3600
+        if stale_h < _STALL_NUDGE_HOURS:
+            continue
+        # Once per plan per day, tracked in behavior_state
+        marker = f"plan_nudge:{path.stem}"
+        last_nudge = db.get_behavior_last_run(marker)
+        if last_nudge is not None:
+            since = (now - db.ensure_utc(datetime.fromisoformat(last_nudge))).total_seconds()
+            if since < _STALL_REPEAT_HOURS * 3600:
+                continue
+        db.set_behavior_last_run(marker, now.isoformat())
+        acted += 1
+        bus.emit(
+            "goal_updated",
+            {"goal_id": path.stem, "reason": "plan_stalled", "stale_hours": round(stale_h)},
+        )
+        log.info("plan_stalled_nudge", plan=path.stem, stale_hours=round(stale_h))
+        if stale_h >= _STALL_ALERT_HOURS:
+            days = int(stale_h // 24)
+            await _notify(
+                bot,
+                f"⏸ No progress on {path.stem} for {days} days. Next step there: "
+                f"{_plan_next_step(path)}. I'm pointing my next work session at it — "
+                "if it's actually blocked on you or should be closed, say the word.",
+            )
+    return acted
+
+
 async def _run_attention_deep_work(bot: Bot, sem: asyncio.Semaphore, *, reason: str) -> bool:
     """Fallback deep work when no goals are eligible: drive from active-attention pins.
 
@@ -701,9 +793,17 @@ async def run_deep_work(bot: Bot, sem: asyncio.Semaphore) -> None:
         plan_path = plans_dir / f"{sanitize_memory_id(g['id'])}.md"
         if plan_path.exists():
             status = _parse_plan_status(g["id"])
+            stall_note = ""
+            if status == "in_progress":
+                updated = _plan_last_updated(plan_path)
+                if updated is not None:
+                    stale_h = (datetime.now(UTC) - updated).total_seconds() / 3600
+                    if stale_h >= _STALL_NUDGE_HOURS:
+                        stall_note = f" — ⚠ STALLED {int(stale_h // 24)}d+, prioritize this"
             plan_status.append(
                 f"[{g['id']}]: plan exists at workspace/plans/{plan_path.name}"
                 + (f" (status: {status})" if status else "")
+                + stall_note
             )
 
     # Include quality history context
@@ -785,7 +885,8 @@ async def run_deep_work(bot: Bot, sem: asyncio.Semaphore) -> None:
         + engagement_block
         + "\n\n"
         "Phase 1 — PLAN (do this first):\n"
-        "1. Pick the highest-priority goal\n"
+        "1. Pick the highest-priority goal — a goal whose plan is marked STALLED "
+        "outranks everything else; clear its next step before any other work\n"
         "2. Check if a work plan exists at workspace/plans/{goal_id}.md\n"
         "3. If no plan exists, create one. A plan with no steps is not a valid plan "
         "(Filipe's rule). Every plan MUST carry: a '**Status:**' line, "

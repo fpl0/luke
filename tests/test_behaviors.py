@@ -717,3 +717,77 @@ class TestAttentionFallbackTier:
         assert ran is True
         kwargs = mock_run.call_args.kwargs
         assert kwargs["model"] == settings.consolidation_model
+
+
+# ---------------------------------------------------------------------------
+# Plan momentum enforcement — stalled plans get nudged, deep stalls page Filipe
+# ---------------------------------------------------------------------------
+
+
+class TestEnforcePlanMomentum:
+    def _write_plan(
+        self,
+        tmp_settings: Any,
+        name: str,
+        *,
+        status: str = "in_progress",
+        updated_hours_ago: float = 0.0,
+    ) -> None:
+        from datetime import UTC, datetime, timedelta
+
+        plans = tmp_settings.workspace_dir / "plans"
+        plans.mkdir(parents=True, exist_ok=True)
+        updated = (datetime.now(UTC) - timedelta(hours=updated_hours_ago)).isoformat()
+        (plans / f"{name}.md").write_text(
+            f"# {name}\n\n**Status:** {status}\n**Last updated:** {updated}\n"
+            "**Steps completed:** 1/3\n\n## Steps\n- [x] done thing\n- [ ] ship the next artifact\n"
+        )
+
+    async def test_fresh_plan_untouched(self, test_db: Any, tmp_settings: Any) -> None:
+        from luke.behaviors import enforce_plan_momentum
+
+        self._write_plan(tmp_settings, "goal-fresh", updated_hours_ago=2)
+        with patch("luke.behaviors.send_long_message", new_callable=AsyncMock) as mock_send:
+            assert await enforce_plan_momentum(AsyncMock()) == 0
+        mock_send.assert_not_called()
+
+    async def test_stalled_plan_emits_goal_updated(self, test_db: Any, tmp_settings: Any) -> None:
+        """48h+ stall → goal_updated event, which drives the deep-work intent."""
+        from luke import db as luke_db
+        from luke.behaviors import enforce_plan_momentum
+
+        self._write_plan(tmp_settings, "goal-stalled", updated_hours_ago=72)
+        before = luke_db.count_unconsumed_events("goal_updated")
+        with patch("luke.behaviors.send_long_message", new_callable=AsyncMock) as mock_send:
+            assert await enforce_plan_momentum(AsyncMock()) == 1
+        assert luke_db.count_unconsumed_events("goal_updated") == before + 1
+        mock_send.assert_not_called()  # 72h < alert threshold: nudge silently
+
+    async def test_deep_stall_alerts_filipe_with_next_step(
+        self, test_db: Any, tmp_settings: Any
+    ) -> None:
+        from luke.behaviors import enforce_plan_momentum
+
+        self._write_plan(tmp_settings, "goal-abandoned-feeling", updated_hours_ago=120)
+        with patch("luke.behaviors.send_long_message", new_callable=AsyncMock) as mock_send:
+            assert await enforce_plan_momentum(AsyncMock()) == 1
+        mock_send.assert_called_once()
+        text = mock_send.call_args.args[2]
+        assert "No progress" in text
+        assert "ship the next artifact" in text
+
+    async def test_renudge_suppressed_within_a_day(self, test_db: Any, tmp_settings: Any) -> None:
+        from luke.behaviors import enforce_plan_momentum
+
+        self._write_plan(tmp_settings, "goal-stalled", updated_hours_ago=72)
+        with patch("luke.behaviors.send_long_message", new_callable=AsyncMock):
+            assert await enforce_plan_momentum(AsyncMock()) == 1
+            assert await enforce_plan_momentum(AsyncMock()) == 0  # daily rate limit
+
+    async def test_terminal_plans_ignored(self, test_db: Any, tmp_settings: Any) -> None:
+        from luke.behaviors import enforce_plan_momentum
+
+        self._write_plan(tmp_settings, "goal-done", status="completed", updated_hours_ago=500)
+        self._write_plan(tmp_settings, "goal-paused", status="paused", updated_hours_ago=500)
+        with patch("luke.behaviors.send_long_message", new_callable=AsyncMock):
+            assert await enforce_plan_momentum(AsyncMock()) == 0

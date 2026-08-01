@@ -46,6 +46,7 @@ class TestEmbeddingBackfill:
     ) -> None:
         """Embed server down → memory indexes without a vector (FTS still
         works); backfill_missing_embeddings() heals the gap once it's back."""
+
         def _fake_down(texts: list[str]) -> None:
             return None
 

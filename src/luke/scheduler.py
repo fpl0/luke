@@ -17,6 +17,7 @@ from structlog.stdlib import BoundLogger
 from . import db, memory
 from .agent import run_agent
 from .behaviors import (
+    enforce_plan_momentum,
     run_consolidation,
     run_deep_work,
     run_dream,
@@ -367,6 +368,7 @@ async def start_scheduler_loop(
                 expired_corrections = memory.prune_pending_corrections()
                 embeddings_backfilled = memory.backfill_missing_embeddings()
                 plans_reconciled = memory.reconcile_stale_plans()
+                plans_nudged = await enforce_plan_momentum(bot)
                 db.set_behavior_last_run("cleanup", datetime.now(UTC).isoformat())
                 log.info(
                     "hourly_maintenance",
@@ -379,6 +381,7 @@ async def start_scheduler_loop(
                     corrections_expired=expired_corrections,
                     embeddings_backfilled=embeddings_backfilled,
                     plans_reconciled=plans_reconciled,
+                    plans_nudged=plans_nudged,
                 )
             except sqlite3.OperationalError:
                 log.warning("hourly_maintenance_skipped", reason="database locked")

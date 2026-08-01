@@ -14,7 +14,8 @@ tick
   │     ├── Session cleanup — remove stale sessions + model ratchet
   │     ├── Outbound log pruning — remove dedup entries older than 24h
   │     ├── Embedding backfill — heal memory_vec rows missed during embed-server outages
-  │     └── Plan reconciliation — auto-pause plans whose goal is archived/missing
+  │     ├── Plan reconciliation — auto-pause plans whose goal is archived/missing
+  │     └── Plan momentum — stalled in_progress plans re-enter the deep-work queue; 4-day stalls page the user
   │
   ├── Collect due maintenance behaviors → run in parallel (asyncio.gather)
   │     ├── Consolidation (daily)

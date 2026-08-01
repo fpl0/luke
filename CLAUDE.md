@@ -216,7 +216,7 @@ Messages table stores `sender_name`, `sender_id` (Telegram user ID), `msg_id` (T
 ## Scheduler
 
 The scheduler loop runs every 60 seconds (configurable via `SCHEDULER_INTERVAL`) and wakes **instantly** when a task is created in-process (bus: `cron_created`) or when anything connects to `$LUKE_DIR/luke.sock` — the operator wake channel for externally queued tasks. It:
-1. Runs hourly maintenance: archived FTS cleanup + adaptive importance decay + stale session cleanup + outbound log pruning + embedding backfill + plan-status reconciliation (plans whose goal is archived/missing get auto-paused)
+1. Runs hourly maintenance: archived FTS cleanup + adaptive importance decay + stale session cleanup + outbound log pruning + embedding backfill + plan-status reconciliation (plans whose goal is archived/missing get auto-paused) + plan-momentum enforcement (an in_progress plan untouched 48h emits goal_updated so deep work re-targets it; 4-day stalls page Filipe with the plan's next step — in_progress MEANS momentum is expected; deliberately-dormant plans belong in paused)
 2. Collects due maintenance behaviors and runs them **in parallel** via `asyncio.gather()`:
    - Daily: consolidation (episodes → insights) + proactive scan (can take lightweight goal actions)
    - Weekly: reflection + FTS pruning + stale-reflection pruning (old never-accessed reflexion/dream insights auto-archived)

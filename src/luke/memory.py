@@ -1440,9 +1440,7 @@ def reconcile_stale_plans() -> int:
     db = _db()
     count = 0
     for path in plans_dir.glob("goal-*.md"):
-        row = db.execute(
-            "SELECT status FROM memory_meta WHERE id = ?", (path.stem,)
-        ).fetchone()
+        row = db.execute("SELECT status FROM memory_meta WHERE id = ?", (path.stem,)).fetchone()
         if row and row["status"] == "active":
             continue
         try:
