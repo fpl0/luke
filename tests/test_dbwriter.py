@@ -192,6 +192,7 @@ def test_lock_serializes_writes_under_contention(test_db: Any) -> None:
 
 def test_lock_not_held_after_cross_thread_writes(test_db: Any) -> None:
     """After all writes complete, the process-wide lock is fully released."""
+
     # Multiple threads write concurrently; we then probe the lock from the
     # main thread. It should acquire without blocking.
     def worker(i: int) -> None:
@@ -246,3 +247,43 @@ def test_close_releases_held_writes(test_db: Any) -> None:
     acquired = _write_lock.acquire(blocking=False)
     assert acquired, "write lock leaked after close() with open transaction"
     _write_lock.release()
+
+
+def test_failed_executemany_releases_lock(test_db: Any) -> None:
+    """executemany failures release the acquisition made for them."""
+    conn = db._db()
+    with pytest.raises(sqlite3.OperationalError):
+        conn.executemany("INSERT INTO no_such_table (x) VALUES (?)", [(1,), (2,)])
+    assert object.__getattribute__(conn, "_writes_held") == 0
+
+
+def test_failed_executescript_releases_lock(test_db: Any) -> None:
+    """executescript failures release the acquisition made for them."""
+    conn = db._db()
+    with pytest.raises(sqlite3.OperationalError):
+        conn.executescript("INSERT INTO no_such_table (x) VALUES (1);")
+    assert object.__getattribute__(conn, "_writes_held") == 0
+
+
+def test_zero_row_write_then_close_releases_lock(test_db: Any) -> None:
+    """A write matching zero rows, followed by close without commit, must not leak.
+
+    Regression: restore_memory('nonexistent') early-returned after a no-op
+    UPDATE without committing; the fixture then closed the connection at the
+    C level, leaving the lock owned by the main thread for the process
+    lifetime. Every multi-threaded write afterward deadlocked.
+    """
+    from luke import memory
+
+    assert memory.restore_memory("nonexistent") is False
+
+    def probe() -> bool:
+        # Acquire AND release inside this thread — RLocks are owner-released.
+        got = _write_lock.acquire(blocking=False)
+        if got:
+            _write_lock.release()
+        return got
+
+    with ThreadPoolExecutor(max_workers=1) as ex:
+        acquired = ex.submit(probe).result(timeout=5)
+    assert acquired, "restore_memory leaked the write lock"
