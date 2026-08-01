@@ -21,15 +21,16 @@ def req(method, path, body=None, timeout=300):
         return json.loads(resp.read().decode())
 
 
-def human_block():
-    for b in req("GET", f"/v1/agents/{AGENT}/core-memory/blocks"):
-        if b["label"] == "human":
-            return b["value"]
-    return None
+def snapshot_blocks():
+    """All core blocks as {label: value}. The agent may self-edit ANY block
+    (key-people/human/goals/...), so watching only `human` false-negatives —
+    that bug produced ~3 passes of phantom PARTIAL/BLOCKED verdicts."""
+    return {b["label"]: b["value"]
+            for b in req("GET", f"/v1/agents/{AGENT}/core-memory/blocks")}
 
 
-before = human_block()
-print("HUMAN_BEFORE:", before, flush=True)
+before = snapshot_blocks()
+print("BLOCKS_BEFORE:", {k: len(v) for k, v in before.items()}, flush=True)
 
 prompt = (
     "Two updates for what you know about me, then a question. Update 1: my partner "
@@ -62,9 +63,13 @@ for m in resp.get("messages", []):
     elif mt == "tool_return_message":
         print("TOOL_RETURN:", str(m.get("tool_return", ""))[:150], flush=True)
 
-after = human_block()
-print("HUMAN_AFTER:", after, flush=True)
-changed = (after or "") != (before or "")
+after = snapshot_blocks()
+changed_blocks = [k for k in after
+                  if (after.get(k) or "") != (before.get(k) or "")]
+print("CHANGED_BLOCKS:", changed_blocks, flush=True)
+changed = bool(changed_blocks)
 print("SELF_EDIT_PERSISTED:", changed, flush=True)
-print("VERDICT:", "PASS" if (changed and dt < 120) else "PARTIAL", flush=True)
+# Accept (Phase 1.4): Claude-driven turn self-edits ANY core block, fast (<15s).
+print("VERDICT:", "PASS" if (changed and dt < 15) else
+      ("SLOW" if changed else "NO_EDIT"), flush=True)
 print("DONE", flush=True)
