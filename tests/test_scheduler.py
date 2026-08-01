@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from luke import scheduler
 from luke.db import TaskRecord
 from luke.scheduler import _is_due, _run_task, start_scheduler_loop
 
@@ -984,3 +985,96 @@ class TestContinuationSinceFormat:
         # Documents the defect the scheduler fix avoids: 'T' > ' ' in the string
         # compare hides every same-day event.
         assert db.count_unconsumed_events("deep_work_oriented", since=since_iso) == 0
+
+
+# ---------------------------------------------------------------------------
+# Wake channel: immediate due-check on task creation / socket poke
+# ---------------------------------------------------------------------------
+
+
+class TestWakeChannel:
+    def test_task_created_handler_sets_wake(self) -> None:
+        scheduler._wake.clear()
+        scheduler._on_task_created(object())
+        assert scheduler._wake.is_set()
+        scheduler._wake.clear()
+
+    async def test_wake_socket_connection_sets_wake(self, tmp_settings: Any) -> None:
+        """A bare connection to $LUKE_DIR/luke.sock wakes the scheduler."""
+        import shutil
+        import tempfile
+        from pathlib import Path
+
+        # AF_UNIX paths are capped at 104 bytes on macOS; pytest tmp dirs are
+        # too deep, so bind under /tmp (mirrors the short real LUKE_DIR path).
+        short_dir = Path(tempfile.mkdtemp(dir="/tmp"))
+        tmp_settings.luke_dir = short_dir
+        scheduler._wake.clear()
+        server = await scheduler.start_wake_socket()
+        try:
+            _, writer = await asyncio.open_unix_connection(str(short_dir / "luke.sock"))
+            writer.close()
+            await asyncio.sleep(0.05)
+            assert scheduler._wake.is_set()
+        finally:
+            server.close()
+            await server.wait_closed()
+            scheduler._wake.clear()
+            shutil.rmtree(short_dir, ignore_errors=True)
+
+    async def test_wake_bypasses_tick_interval(self) -> None:
+        """With a long tick, wake() still runs the due-check immediately."""
+        recent_ts = datetime.now(UTC).isoformat()
+        mock_db = MagicMock()
+        mock_db.get_behavior_last_run.return_value = recent_ts
+        mock_db.get_due_tasks.return_value = []
+        mock_db.count_unconsumed_events.return_value = 0
+        mock_db.get_behavior_no_ops.return_value = 0
+        mock_db.consume_events.return_value = 0
+        mock_db.get_daily_outbound_count.return_value = 0
+        from luke.db import ensure_utc as _real_ensure_utc
+
+        mock_db.ensure_utc = _real_ensure_utc
+
+        mock_settings = MagicMock()
+        mock_settings.scheduler_interval = 30.0  # a plain tick can't fire in this test
+        mock_settings.cleanup_interval = 999999
+        for name in (
+            "episode_consolidation_interval",
+            "reflection_interval",
+            "proactive_scan_interval",
+            "deep_work_interval",
+            "insight_consolidation_interval",
+            "feedback_consolidation_interval",
+            "lifecycle_review_interval",
+            "skill_extraction_interval",
+            "dream_interval",
+        ):
+            setattr(mock_settings, name, 999999)
+        mock_settings.consolidation_min_cluster = 3
+        mock_settings.daily_attention_budget = 12
+        mock_settings.attention_urgent_reserve = 2
+
+        scheduler._wake.clear()
+        with (
+            patch("luke.scheduler.settings", new=mock_settings),
+            patch("luke.scheduler.db", new=mock_db),
+            patch("luke.planner.db", new=mock_db),
+            patch("luke.planner.settings", new=mock_settings),
+            patch("luke.scheduler.memory"),
+        ):
+            bot = AsyncMock()
+            shutdown = asyncio.Event()
+
+            async def poke_then_stop() -> None:
+                await asyncio.sleep(0.05)
+                scheduler.wake()
+                await asyncio.sleep(0.15)
+                shutdown.set()
+
+            async with asyncio.TaskGroup() as tg:
+                tg.create_task(scheduler.start_scheduler_loop(bot, _SEM, shutdown=shutdown))
+                tg.create_task(poke_then_stop())
+
+        # The wake — not the 30s tick — caused a due-check
+        assert mock_db.get_due_tasks.called

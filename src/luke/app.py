@@ -55,7 +55,7 @@ from .memory import (
     recall,
     touch_memories,
 )
-from .scheduler import start_scheduler_loop, write_heartbeat
+from .scheduler import start_scheduler_loop, start_wake_socket, write_heartbeat
 
 log: BoundLogger = structlog.get_logger()
 
@@ -1601,6 +1601,10 @@ async def main() -> None:
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, max_backoff)
 
+    # Operator wake channel: a poke at $LUKE_DIR/luke.sock runs the scheduler's
+    # due-check immediately (externally queued tasks start in ~1s, not ~60s)
+    wake_server = await start_wake_socket()
+
     async with asyncio.TaskGroup() as tg:
         tg.create_task(_resilient_polling())
         tg.create_task(start_scheduler_loop(bot, _sem, shutdown=shutdown_event))
@@ -1608,6 +1612,7 @@ async def main() -> None:
         async def _wait_for_shutdown() -> None:
             await shutdown_event.wait()
             log.info("stopping", phase="dispatcher")
+            wake_server.close()
             await dp.stop_polling()
             pending = set(_background_tasks)
             if pending:

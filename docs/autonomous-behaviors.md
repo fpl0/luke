@@ -4,7 +4,7 @@ Four agent invocations run on timers, independent of user messages. Each has a s
 
 ## Scheduler
 
-`start_scheduler_loop()` ticks every 60 seconds:
+`start_scheduler_loop()` ticks every 60 seconds — or immediately when woken: task creation fires a `cron_created` bus event, and external processes poke the unix socket at `$LUKE_DIR/luke.sock` after inserting a task row. Queue latency for new work is ~0s instead of 0-60s:
 
 ```
 tick

@@ -35,6 +35,57 @@ from .planner import BEHAVIOR_EVENTS, generate_intents, plan
 
 log: BoundLogger = structlog.get_logger()
 
+# Wake signal: set by task creation (bus: cron_created) or an external poke at
+# the wake socket. The loop waits on it alongside the tick timeout, so newly
+# queued work starts in ~0s instead of up to a full scheduler_interval later.
+_wake = asyncio.Event()
+
+
+def wake() -> None:
+    """Wake the scheduler loop now — the next due-check runs immediately."""
+    _wake.set()
+
+
+def _on_task_created(event: object) -> None:
+    """Bus handler: a task was just created in-process — check due-ness now."""
+    wake()
+
+
+async def start_wake_socket() -> asyncio.Server:
+    """Unix socket at $LUKE_DIR/luke.sock: any connection wakes the scheduler.
+
+    This is the operator channel's latency fix. External processes (Claude
+    Code operator sessions, scripts) queue work by inserting into the tasks
+    table; a poke here makes the scheduler pick it up immediately instead of
+    on the next tick. Same-user filesystem permissions are the auth boundary.
+    """
+    path = settings.luke_dir / "luke.sock"
+    path.unlink(missing_ok=True)
+
+    async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        wake()
+        writer.close()
+
+    return await asyncio.start_unix_server(_handle, path=str(path))
+
+
+async def _sleep_until_tick(shutdown: asyncio.Event | None) -> None:
+    """Wait one scheduler_interval — or less if woken or shut down."""
+    waiters = [asyncio.ensure_future(_wake.wait())]
+    if shutdown:
+        waiters.append(asyncio.ensure_future(shutdown.wait()))
+    try:
+        await asyncio.wait(
+            waiters,
+            timeout=settings.scheduler_interval,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+    finally:
+        for w in waiters:
+            w.cancel()
+        await asyncio.gather(*waiters, return_exceptions=True)
+    _wake.clear()
+
 
 def write_heartbeat(status: str = "idle") -> None:
     """Write a heartbeat file so the external watchdog knows we're alive.
@@ -284,17 +335,15 @@ async def start_scheduler_loop(
             log.warning("cron_memory_sync_failed", procedure=proc_id)
 
     bus.on("procedure_updated", _on_procedure_updated)
+    # Newly created tasks (schedule_task tool) start now, not next tick
+    bus.on("cron_created", _on_task_created)
 
     while not (shutdown and shutdown.is_set()):
-        # Use wait with timeout so we wake up promptly on shutdown
-        if shutdown:
-            try:
-                await asyncio.wait_for(shutdown.wait(), timeout=settings.scheduler_interval)
-                break  # Shutdown signalled
-            except TimeoutError:
-                pass  # Normal tick
-        else:
-            await asyncio.sleep(settings.scheduler_interval)
+        # Wait one tick — or less, when a task is created or the wake socket
+        # is poked. Shutdown interrupts the wait as before.
+        await _sleep_until_tick(shutdown)
+        if shutdown and shutdown.is_set():
+            break
         now_mono = time.monotonic()
         write_heartbeat("tick")
 
