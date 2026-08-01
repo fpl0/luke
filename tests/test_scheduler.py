@@ -99,12 +99,18 @@ class TestCron:
         assert _is_due(task, now) is False
 
     def test_restart_never_ran_but_within_first_window(self) -> None:
-        """After restart, task created 2 min ago with hourly cron — still not due."""
-        created = (datetime.now(UTC) - timedelta(minutes=2)).isoformat()
+        """After restart, task created 2 min ago with hourly cron — still not due.
+
+        Uses pinned times: with wall-clock now() this flaked in the first two
+        minutes after each hour, when the top-of-hour boundary genuinely falls
+        between creation and now.
+        """
+        created = datetime(2026, 8, 1, 12, 2, tzinfo=UTC).isoformat()
+        now = datetime(2026, 8, 1, 12, 4, tzinfo=UTC)
         task = _task(
             schedule_type="cron", schedule_value="0 * * * *", last_run=None, created_at=created
         )
-        assert _is_due(task, datetime.now(UTC)) is False
+        assert _is_due(task, now) is False
 
     def test_restart_never_ran_past_first_window(self) -> None:
         """After restart, task created 10 min ago with 5-min cron, never ran — due."""
