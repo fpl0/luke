@@ -8,7 +8,6 @@ Provides runtime context management for the agent:
 
 from __future__ import annotations
 
-import json
 import math
 import struct
 from datetime import UTC, datetime
@@ -177,15 +176,6 @@ def _cosine_similarity(a: list[float], b_blob: bytes) -> float:
     return dot / (norm_a * norm_b)
 
 
-def _parse_tags(tags_json: str) -> list[str]:
-    """Parse a tags_json blob to a list, tolerating malformed data."""
-    try:
-        tags = json.loads(tags_json or "[]")
-        return tags if isinstance(tags, list) else []
-    except (json.JSONDecodeError, TypeError):
-        return []
-
-
 def _load_priority_memories(query: str = "") -> list[dict[str, Any]]:
     """Load active memories scored for context injection priority.
 
@@ -200,20 +190,21 @@ def _load_priority_memories(query: str = "") -> list[dict[str, Any]]:
         """SELECT m.id, m.type, f.title, f.content,
                   COALESCE(m.importance, 1.0) AS importance,
                   m.updated, COALESCE(m.access_count, 0) AS access_count,
-                  COALESCE(m.last_accessed, '') AS last_accessed,
-                  COALESCE(m.tags_json, '[]') AS tags_json
+                  COALESCE(m.human_last_accessed, '') AS human_last_accessed,
+                  COALESCE(m.suppression, 0.0) AS suppression
            FROM memory_meta m
            JOIN memory_fts f ON m.id = f.id
            WHERE m.status = 'active'
            ORDER BY m.importance DESC, m.updated DESC"""
     ).fetchall()
 
-    # Lifecycle gate: a memory can be active (recallable) yet excluded from
-    # *proactive* injection. Closed / stale / do-not-surface threads carry a
-    # 'no-inject' tag. Without this, a high-importance closed entity keeps
-    # winning a context seat because the ranker scores importance/recency/
-    # access but never reads the lifecycle note buried in the content body.
-    rows = [r for r in rows if "no-inject" not in _parse_tags(r["tags_json"])]
+    # Suppression is a per-memory signal the ranker reads (not an external
+    # blocklist): 0.0 = normal, a fraction attenuates the score, and 1.0 is a
+    # hard veto for an explicit "never surface this" directive — the one thing
+    # a score-based ranker can't express on its own, because "never" is not a
+    # low number ("lower" always comes back). Relevance decay is handled by the
+    # scoring below (via human access-recency); this handles directives only.
+    rows = [r for r in rows if r["suppression"] < 1.0]
 
     # --- Query-aware scoring: embed query and load memory vectors ---
     query_vec: list[float] | None = None
@@ -267,7 +258,9 @@ def _load_priority_memories(query: str = "") -> list[dict[str, Any]]:
         # keep re-editing dormant memories (project-theo) while core entities
         # (person-filipe) rarely get edited yet are used constantly. Last
         # access tracks genuine relevance; lifetime access_count does not decay.
-        acc_rec = _recency_score(r["last_accessed"]) if r["last_accessed"] else 0.0
+        acc_rec = (
+            _recency_score(r["human_last_accessed"]) if r["human_last_accessed"] else 0.0
+        )
 
         # Type boost: goals/entities matter more for context — but for entities
         # the boost decays toward 1.0 as they go unused, so a dormant entity
@@ -288,6 +281,12 @@ def _load_priority_memories(query: str = "") -> list[dict[str, Any]]:
         # importance a permanent override that recency could never overcome.
         if r["importance"] >= 1.5 and acc_rec >= 0.3:
             score = max(score, 0.4)
+
+        # Graduated suppression: attenuate by an explicit per-memory signal
+        # (hard vetoes at 1.0 were already dropped above). Applied last so it
+        # discounts the final score, floor included.
+        if r["suppression"] > 0.0:
+            score *= 1.0 - r["suppression"]
 
         memories.append({
             "id": r["id"],

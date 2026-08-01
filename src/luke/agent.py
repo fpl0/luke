@@ -1906,6 +1906,10 @@ async def run_agent(
     urgent: bool = False,
     user_text: str | None = None,
 ) -> AgentResult:
+    # Mark this run's access as human-driven (or not) so the injection ranker's
+    # relevance signal (human_last_accessed) isn't polluted by autonomous churn.
+    memory.human_turn.set(not autonomous)
+
     root = settings.luke_dir
     effective_model = model or settings.agent_model
 

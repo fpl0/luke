@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import collections
+import contextvars
 import hashlib
 import json
 import math
@@ -1117,25 +1118,40 @@ def _apply_composite_scores(results: dict[str, dict[str, Any]]) -> None:
             entry["score"] = context_norm * 0.3
 
 
+# Human-turn flag: True only while serving a live conversation with Filipe,
+# False during autonomous runs (crons, dream loops, deep work). Set once per
+# run in run_agent. touch_memories consults it so that human_last_accessed —
+# the injection ranker's relevance signal — tracks genuine human interest and
+# is NOT polluted by automated sessions re-recalling dormant memories.
+human_turn: contextvars.ContextVar[bool] = contextvars.ContextVar("human_turn", default=False)
+
+
 def touch_memories(mem_ids: list[str], *, useful: bool = True, useful_only: bool = False) -> None:
     """Increment access_count and update last_accessed. If *useful*, also increment
     useful_count and strengthen co-access graph links (Hebbian learning).
-    If *useful_only*, increment only useful_count (for retroactive utility upgrade)."""
+    If *useful_only*, increment only useful_count (for retroactive utility upgrade).
+
+    During a human turn (human_turn ContextVar True), also bump human_last_accessed
+    so the injection ranker's relevance signal reflects Filipe's actual interest,
+    not automated churn."""
     if not mem_ids:
         return
     conn = _db()
     now = datetime.now(UTC).isoformat()
     ph = ",".join("?" for _ in mem_ids)
+    is_human = human_turn.get()
     if useful_only:
         set_clause = "useful_count = useful_count + 1"
         conn.execute(f"UPDATE memory_meta SET {set_clause} WHERE id IN ({ph})", mem_ids)
     else:
+        human_clause = ", human_last_accessed = ?" if is_human else ""
         set_clause = (
             "access_count = access_count + 1, useful_count = useful_count + 1, last_accessed = ?"
             if useful
             else "access_count = access_count + 1, last_accessed = ?"
-        )
-        conn.execute(f"UPDATE memory_meta SET {set_clause} WHERE id IN ({ph})", (now, *mem_ids))
+        ) + human_clause
+        params = (now, now, *mem_ids) if is_human else (now, *mem_ids)
+        conn.execute(f"UPDATE memory_meta SET {set_clause} WHERE id IN ({ph})", params)
     # Hebbian co-access: strengthen existing active links between co-recalled memories
     if useful and len(mem_ids) > 1:
         conn.execute(
