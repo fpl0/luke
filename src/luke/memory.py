@@ -1229,6 +1229,9 @@ def restore_memory(mem_id: str) -> bool:
         (mem_id,),
     )
     if cur.rowcount == 0:
+        # The no-op UPDATE still opened a write transaction (and took the
+        # process-wide write lock) — commit to release before bailing.
+        _commit(conn)
         return False
     # Re-index in FTS from existing meta (file may still be on disk)
     row = conn.execute("SELECT type FROM memory_meta WHERE id = ?", (mem_id,)).fetchone()
