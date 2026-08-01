@@ -407,8 +407,7 @@ async def run_reflexion(
                 prev_lines.append(f"[{ins['id']}]: {body}")
         if prev_lines:
             context_sections.append(
-                "Previous reflexion insights (do NOT repeat these):\n"
-                + "\n---\n".join(prev_lines)
+                "Previous reflexion insights (do NOT repeat these):\n" + "\n---\n".join(prev_lines)
             )
 
     prompt = (
@@ -562,9 +561,7 @@ def _parse_plan_status(goal_id: str) -> str | None:
         return None
 
 
-async def _run_attention_deep_work(
-    bot: Bot, sem: asyncio.Semaphore, *, reason: str
-) -> bool:
+async def _run_attention_deep_work(bot: Bot, sem: asyncio.Semaphore, *, reason: str) -> bool:
     """Fallback deep work when no goals are eligible: drive from active-attention pins.
 
     Returns True if a session was actually launched. When active-attention is
@@ -585,9 +582,10 @@ async def _run_attention_deep_work(
 
     # Same engagement grounding as the goal path: rating anchors to Filipe's
     # response since the last session, not to how much got produced (Goodhart).
-    since_iso = db.get_behavior_last_run("deep_work") or (
-        datetime.now(UTC) - timedelta(hours=24)
-    ).isoformat()
+    since_iso = (
+        db.get_behavior_last_run("deep_work")
+        or (datetime.now(UTC) - timedelta(hours=24)).isoformat()
+    )
     signals = db.get_engagement_signals(settings.chat_id, since_iso)
     bus.emit("deep_work_engagement_signals", {"since": since_iso, **signals})
     engagement_block = (
@@ -617,7 +615,7 @@ async def _run_attention_deep_work(
         "of prior output is NOT a 4-5 no matter how much you did; corrections are a "
         "negative signal. 1=ignored or wrong, 3=engaged but neutral, 5=clearly "
         "valued and used.\n"
-        "- Call log_deep_work_quality(\"attention-\" + pin-id, rating) with a "
+        '- Call log_deep_work_quality("attention-" + pin-id, rating) with a '
         "one-line justification citing which signal drove it.\n"
         "- Save a summary episode of what shipped.\n\n"
         "You may send at most ONE message to the user per session — only if "
@@ -758,9 +756,10 @@ async def run_deep_work(bot: Bot, sem: asyncio.Semaphore) -> None:
     # Self-assessment grounding: real signals of whether Filipe engaged with my
     # output since the last session. The rating must anchor to HIS response, not
     # my activity volume (the Goodhart loop). Window = since last deep-work run.
-    since_iso = db.get_behavior_last_run("deep_work") or (
-        datetime.now(UTC) - timedelta(hours=24)
-    ).isoformat()
+    since_iso = (
+        db.get_behavior_last_run("deep_work")
+        or (datetime.now(UTC) - timedelta(hours=24)).isoformat()
+    )
     signals = db.get_engagement_signals(settings.chat_id, since_iso)
     bus.emit("deep_work_engagement_signals", {"since": since_iso, **signals})
     engagement_block = (

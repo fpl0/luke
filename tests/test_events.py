@@ -326,12 +326,11 @@ class TestCountEventsMatching:
         test_db.emit_event("reflexion_fired", skipped)
         test_db.emit_event("reflexion_fired", skipped)
         test_db.emit_event("reflexion_fired", cont)
-        assert test_db.count_events_matching(
-            "reflexion_fired", "deep_work_skipped:all_goals_filtered"
-        ) == 2
-        assert test_db.count_events_matching(
-            "reflexion_fired", "continuation_failure:goal-x"
-        ) == 1
+        assert (
+            test_db.count_events_matching("reflexion_fired", "deep_work_skipped:all_goals_filtered")
+            == 2
+        )
+        assert test_db.count_events_matching("reflexion_fired", "continuation_failure:goal-x") == 1
 
     def test_counts_consumed_too(self, test_db: Any) -> None:
         # saturation must count regardless of consumed status (unlike count_unconsumed)

@@ -630,21 +630,19 @@ def index_memory(
     # relying on the agent to specify links manually every time.
     if embedding is not None:
         try:
-            similar = _semantic_search(
-                embedding, limit=4, include_private=True
-            )
+            similar = _semantic_search(embedding, limit=4, include_private=True)
             for cand in similar:
                 if cand["id"] == mem_id:
                     continue
                 if cand["score"] < 0.40:  # too dissimilar
                     continue
-                target_type_row = _db().execute(
-                    "SELECT type FROM memory_meta WHERE id = ?", (cand["id"],)
-                ).fetchone()
-                target_type = target_type_row["type"] if target_type_row else ""
-                rel = _DEFAULT_RELATIONSHIP.get(
-                    (mem_type, target_type), "related"
+                target_type_row = (
+                    _db()
+                    .execute("SELECT type FROM memory_meta WHERE id = ?", (cand["id"],))
+                    .fetchone()
                 )
+                target_type = target_type_row["type"] if target_type_row else ""
+                rel = _DEFAULT_RELATIONSHIP.get((mem_type, target_type), "related")
                 _db().execute(
                     """INSERT OR IGNORE INTO memory_links
                        (from_id, to_id, relationship, weight, created)
@@ -663,6 +661,7 @@ def index_memory(
     if mem_type == "procedure":
         try:
             from .bus import bus
+
             bus.emit("procedure_updated", {"procedure_id": mem_id, "title": title})
         except Exception:
             pass  # best-effort — don't fail index_memory over event
@@ -1324,7 +1323,8 @@ def cleanup_archived_fts() -> None:
     db = _db()
     try:
         db.execute(
-            "DELETE FROM memory_fts WHERE id IN (SELECT id FROM memory_meta WHERE status = 'archived')"
+            "DELETE FROM memory_fts WHERE id IN "
+            "(SELECT id FROM memory_meta WHERE status = 'archived')"
         )
         _commit(db)
     except sqlite3.OperationalError:
@@ -1597,9 +1597,7 @@ def apply_correction(
         # Guard the destructive path: a low-confidence "contradiction" that
         # would wipe the memory gets queued for review instead of applied.
         if not allow_destructive and confidence < DESTRUCTIVE_AUTO_CONFIDENCE:
-            flag_for_review(
-                mem_id, corrected_content, confidence=confidence, source=source
-            )
+            flag_for_review(mem_id, corrected_content, confidence=confidence, source=source)
             return {
                 "status": "flagged",
                 "mem_id": mem_id,

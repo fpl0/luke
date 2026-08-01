@@ -163,31 +163,21 @@ class TestCritiqueOutbound:
         assert v.decision == "block"
         assert "filler" in v.reason
 
-    async def test_network_error_fails_open(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setattr(
-            critic, "query", _make_failing_query(ConnectionError("boom"))
-        )
+    async def test_network_error_fails_open(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(critic, "query", _make_failing_query(ConnectionError("boom")))
         v = await critique_outbound("Heads up, your 3pm moved.", {"tool": "send"})
         assert v.decision == "pass"
         assert "critic-error" in v.reason
         assert "ConnectionError" in v.reason
 
-    async def test_parse_error_fails_open(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_parse_error_fails_open(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # Model returns gibberish — should fall through to pass.
-        monkeypatch.setattr(
-            critic, "query", _make_fake_query("hmm, hard to say")
-        )
+        monkeypatch.setattr(critic, "query", _make_fake_query("hmm, hard to say"))
         v = await critique_outbound("Heads up, your 3pm moved.", {"tool": "send"})
         assert v.decision == "pass"
         assert "critic-error" in v.reason
 
-    async def test_timeout_fails_open(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_timeout_fails_open(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from luke.config import settings
 
         monkeypatch.setattr(critic, "query", _make_hanging_query())
@@ -233,20 +223,14 @@ class TestCheckFreshness:
                 "timestamp": "2026-05-13T10:00:00+00:00",
             }
         ]
-        v = await check_freshness(
-            "The meeting is at 3pm in Vega room.", user_msgs
-        )
+        v = await check_freshness("The meeting is at 3pm in Vega room.", user_msgs)
         assert v.decision == "pass"
 
-    async def test_block_on_retraction(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_block_on_retraction(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(
             critic,
             "query",
-            _make_fake_query(
-                "DECISION: block draft answers a cancelled question"
-            ),
+            _make_fake_query("DECISION: block draft answers a cancelled question"),
         )
         user_msgs = [
             {
@@ -260,21 +244,15 @@ class TestCheckFreshness:
                 "timestamp": "2026-05-13T10:00:30+00:00",
             },
         ]
-        v = await check_freshness(
-            "The meeting is at 3pm in Vega room upstairs.", user_msgs
-        )
+        v = await check_freshness("The meeting is at 3pm in Vega room upstairs.", user_msgs)
         assert v.decision == "block"
         assert "cancelled" in v.reason
 
-    async def test_revise_on_stale_question(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_revise_on_stale_question(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(
             critic,
             "query",
-            _make_fake_query(
-                "DECISION: revise answers earlier question, ignores latest"
-            ),
+            _make_fake_query("DECISION: revise answers earlier question, ignores latest"),
         )
         user_msgs = [
             {
@@ -283,24 +261,18 @@ class TestCheckFreshness:
                 "timestamp": "2026-05-13T10:01:00+00:00",
             }
         ]
-        v = await check_freshness(
-            "Today's meeting is at 3pm in Vega room.", user_msgs
-        )
+        v = await check_freshness("Today's meeting is at 3pm in Vega room.", user_msgs)
         assert v.decision == "revise"
         assert "earlier" in v.reason
 
-    async def test_block_on_emotional_steamroll(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_block_on_emotional_steamroll(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # The Jul-24 miss: Filipe shares a raw last-day voice note and the
         # queued structured Friday review lands on top of it. The freshness
         # gate must block a structure-first draft over a live emotional share.
         monkeypatch.setattr(
             critic,
             "query",
-            _make_fake_query(
-                "DECISION: block leads with structure over a raw emotional share"
-            ),
+            _make_fake_query("DECISION: block leads with structure over a raw emotional share"),
         )
         user_msgs = [
             {
@@ -326,12 +298,8 @@ class TestCheckFreshness:
         assert "steamroll" in p
         assert "structure" in p and "presence" in p
 
-    async def test_network_error_fails_open(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setattr(
-            critic, "query", _make_failing_query(ConnectionError("boom"))
-        )
+    async def test_network_error_fails_open(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(critic, "query", _make_failing_query(ConnectionError("boom")))
         user_msgs = [
             {
                 "sender_name": "Filipe",
@@ -344,9 +312,7 @@ class TestCheckFreshness:
         assert "critic-error" in v.reason
         assert "ConnectionError" in v.reason
 
-    async def test_timeout_fails_open(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_timeout_fails_open(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from luke.config import settings
 
         monkeypatch.setattr(critic, "query", _make_hanging_query())
@@ -362,9 +328,7 @@ class TestCheckFreshness:
         assert v.decision == "pass"
         assert "timeout" in v.reason
 
-    async def test_prompt_includes_user_messages(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_prompt_includes_user_messages(self, monkeypatch: pytest.MonkeyPatch) -> None:
         fake, captured = _make_prompt_capturing_query("DECISION: pass")
         monkeypatch.setattr(critic, "query", fake)
         user_msgs = [
@@ -381,9 +345,7 @@ class TestCheckFreshness:
         assert "The meeting is at 3pm." in prompt
         assert "Filipe" in prompt
 
-    async def test_empty_user_messages_still_runs(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_empty_user_messages_still_runs(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # Defensive: empty list should still issue a query and pass-through.
         monkeypatch.setattr(critic, "query", _make_fake_query("DECISION: pass"))
         v = await check_freshness("Anything to talk about?", [])

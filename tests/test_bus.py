@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 from typing import Any
-from unittest.mock import MagicMock
 
 import pytest
 
@@ -42,7 +41,7 @@ class TestEvent:
 
     def test_event_hashable(self) -> None:
         """Events with dict payloads are not hashable (dict is unhashable)."""
-        e = Event(id=1, kind="x", payload={})
+        Event(id=1, kind="x", payload={})
         # frozen dataclass with slots — hash depends on field hashability
         # dict is unhashable, so Event with non-empty payload isn't hashable
         # but empty dict is fine for __eq__

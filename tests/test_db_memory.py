@@ -860,9 +860,7 @@ class TestApplyCorrection:
         # And it's queued for human review.
         assert len(memory.get_pending_corrections("e1")) == 1
 
-    def test_high_confidence_contradiction_is_applied(
-        self, test_db: Any, monkeypatch: Any
-    ) -> None:
+    def test_high_confidence_contradiction_is_applied(self, test_db: Any, monkeypatch: Any) -> None:
         monkeypatch.setattr(memory, "classify_relationship", lambda a, b: "contradictory")
         memory.index_memory("e1", "entity", "Fact", "original content")
 
@@ -885,9 +883,7 @@ class TestApplyCorrection:
         assert result["status"] == "applied"
         assert self._content("e1") == "human approved replacement"
 
-    def test_history_snapshot_not_truncated(
-        self, test_db: Any, monkeypatch: Any
-    ) -> None:
+    def test_history_snapshot_not_truncated(self, test_db: Any, monkeypatch: Any) -> None:
         # A replaced correction must be fully reversible — no 500-char truncation.
         monkeypatch.setattr(memory, "classify_relationship", lambda a, b: "contradictory")
         long_original = "X" * 1200
@@ -898,17 +894,14 @@ class TestApplyCorrection:
         row = (
             db._db()
             .execute(
-                "SELECT old_content FROM memory_history WHERE mem_id = ? "
-                "ORDER BY id DESC LIMIT 1",
+                "SELECT old_content FROM memory_history WHERE mem_id = ? ORDER BY id DESC LIMIT 1",
                 ("e1",),
             )
             .fetchone()
         )
         assert row["old_content"] == long_original  # full snapshot, reversible
 
-    def test_extendable_correction_still_appends(
-        self, test_db: Any, monkeypatch: Any
-    ) -> None:
+    def test_extendable_correction_still_appends(self, test_db: Any, monkeypatch: Any) -> None:
         monkeypatch.setattr(memory, "classify_relationship", lambda a, b: "extendable")
         memory.index_memory("e1", "entity", "Fact", "base")
 

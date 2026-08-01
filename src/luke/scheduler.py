@@ -15,7 +15,6 @@ from croniter import croniter
 from structlog.stdlib import BoundLogger
 
 from . import db, memory
-from .bus import bus
 from .agent import run_agent
 from .behaviors import (
     run_consolidation,
@@ -29,6 +28,7 @@ from .behaviors import (
     run_reflexion,
     run_skill_extraction,
 )
+from .bus import bus
 from .config import settings
 from .db import TaskRecord, ensure_utc
 from .planner import BEHAVIOR_EVENTS, generate_intents, plan
@@ -50,6 +50,7 @@ def write_heartbeat(status: str = "idle") -> None:
         tmp_path.rename(heartbeat_path)
     except OSError:
         pass  # best effort — don't crash the scheduler over a heartbeat
+
 
 # Track long-running deep work task across scheduler ticks
 _deep_work_task: asyncio.Task[None] | None = None
@@ -174,6 +175,9 @@ async def _run_task(task: TaskRecord, bot: Bot) -> None:
 
 
 _running_tasks: dict[str, asyncio.Task[None]] = {}
+
+# Strong refs to short-lived background tasks (prevents premature GC)
+_background_tasks: set[asyncio.Task[None]] = set()
 
 
 async def start_scheduler_loop(
@@ -429,10 +433,16 @@ async def start_scheduler_loop(
                                             unchecked_steps=unchecked,
                                         )
                                         goal_id = plan_file.stem
-                                        bus.emit("low_quality_work", {
-                                            "goal_id": goal_id,
-                                            "reason": f"Critic: claimed {claimed}/5 but 0 steps checked off",
-                                        })
+                                        bus.emit(
+                                            "low_quality_work",
+                                            {
+                                                "goal_id": goal_id,
+                                                "reason": (
+                                                    f"Critic: claimed {claimed}/5 "
+                                                    "but 0 steps checked off"
+                                                ),
+                                            },
+                                        )
                     except Exception:
                         log.warning("deep_work_critic_failed")
 
@@ -450,12 +460,8 @@ async def start_scheduler_loop(
                     """Wait briefly then check if deep_work_oriented was emitted."""
                     await asyncio.sleep(5)
                     # Check for deep_work_oriented events in the last 30 seconds
-                    since = (
-                        datetime.now(UTC) - timedelta(seconds=30)
-                    ).isoformat()
-                    oriented = db.count_unconsumed_events(
-                        "deep_work_oriented", since=since
-                    )
+                    since = (datetime.now(UTC) - timedelta(seconds=30)).isoformat()
+                    oriented = db.count_unconsumed_events("deep_work_oriented", since=since)
                     if oriented > 0:
                         bus.emit("continuation_success")
                         log.info("continuation_verified", result="success")
@@ -463,7 +469,9 @@ async def start_scheduler_loop(
                         bus.emit("continuation_failure")
                         log.info("continuation_verified", result="failure")
 
-                asyncio.create_task(_verify_continuation())
+                verify_task = asyncio.create_task(_verify_continuation())
+                _background_tasks.add(verify_task)
+                verify_task.add_done_callback(_background_tasks.discard)
 
         try:
             now = datetime.now(UTC)

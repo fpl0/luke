@@ -31,7 +31,6 @@ from claude_agent_sdk.types import (
 from structlog.stdlib import BoundLogger
 
 from . import db, memory
-from .bus import bus
 from .agent import (
     _TG_MAX_MSG_LEN,
     _trunc,
@@ -40,6 +39,7 @@ from .agent import (
     run_agent,
     send_long_message,
 )
+from .bus import bus
 from .config import settings
 from .db import ensure_utc
 from .media import build_prompt, extract_frame, transcribe
@@ -302,15 +302,14 @@ def _live_reaction_note(chat_id: str) -> str:
         return ""
     lines = []
     for r in reactions[:5]:
-        target = "your message" if r.get("msg_sender") == settings.assistant_name else "their own message"
+        is_own = r.get("msg_sender") == settings.assistant_name
+        target = "your message" if is_own else "their own message"
         preview = (r.get("msg_preview") or "").replace("\n", " ").strip()
         snippet = f' "{preview}…"' if preview else ""
         lines.append(f"- {r['emoji']} ({r['sentiment']}) on {target}{snippet}")
     return (
         "[LIVE — Filipe just reacted (last 15 min). Acknowledge it naturally if it "
-        "fits; let it shape your tone. Don't over-perform it.]\n"
-        + "\n".join(lines)
-        + "\n\n"
+        "fits; let it shape your tone. Don't over-perform it.]\n" + "\n".join(lines) + "\n\n"
     )
 
 

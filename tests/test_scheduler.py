@@ -458,7 +458,7 @@ class TestBehaviorEventMapping:
         import ast
         import inspect
 
-        from luke.planner import _maintenance_intents, _deep_work_intents
+        from luke.planner import _deep_work_intents, _maintenance_intents
 
         source = inspect.getsource(_maintenance_intents)
         source += "\n" + inspect.getsource(_deep_work_intents)
@@ -484,7 +484,7 @@ class TestBehaviorEventMapping:
         import ast
         import inspect
 
-        from luke.planner import _maintenance_intents, _deep_work_intents
+        from luke.planner import _deep_work_intents, _maintenance_intents
 
         source = inspect.getsource(_maintenance_intents)
         source += "\n" + inspect.getsource(_deep_work_intents)

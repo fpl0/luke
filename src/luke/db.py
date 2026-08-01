@@ -1300,8 +1300,17 @@ def log_cost(
         "(chat_id, cost_usd, num_turns, duration_api_ms, source, "
         " input_tokens, output_tokens, cache_create_tokens, cache_read_tokens) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (chat_id, cost_usd, num_turns, duration_api_ms, source,
-         input_tokens, output_tokens, cache_create_tokens, cache_read_tokens),
+        (
+            chat_id,
+            cost_usd,
+            num_turns,
+            duration_api_ms,
+            source,
+            input_tokens,
+            output_tokens,
+            cache_create_tokens,
+            cache_read_tokens,
+        ),
     )
     _commit(db)
 
@@ -1419,8 +1428,7 @@ def get_daily_outbound_count(chat_id: str) -> int:
     row = (
         _db()
         .execute(
-            "SELECT COUNT(*) FROM outbound_log "
-            "WHERE chat_id = ? AND timestamp >= date('now')",
+            "SELECT COUNT(*) FROM outbound_log WHERE chat_id = ? AND timestamp >= date('now')",
             (chat_id,),
         )
         .fetchone()
@@ -1537,8 +1545,7 @@ def get_engagement_signals(chat_id: str, since_iso: str) -> dict[str, int]:
     """
     conn = _db()
     replies = conn.execute(
-        "SELECT COUNT(*) AS c FROM messages "
-        "WHERE chat_id = ? AND sender != 'Luke' AND ts >= ?",
+        "SELECT COUNT(*) AS c FROM messages WHERE chat_id = ? AND sender != 'Luke' AND ts >= ?",
         (chat_id, since_iso),
     ).fetchone()["c"]
     react_rows = conn.execute(

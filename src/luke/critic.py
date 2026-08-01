@@ -198,9 +198,7 @@ def _format_user_messages(user_latest: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-async def check_freshness(
-    draft: str, user_latest: list[dict[str, Any]]
-) -> CriticVerdict:
+async def check_freshness(draft: str, user_latest: list[dict[str, Any]]) -> CriticVerdict:
     """Compare a draft outbound against the user's latest inbound messages.
 
     Returns CriticVerdict where:

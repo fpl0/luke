@@ -901,12 +901,21 @@ class TestPostToolUseHooks:
         ) -> dict[str, Any]:
             tool_name = input_data["tool_name"]
             error = input_data.get("error", "unknown")
-            payload: dict[str, Any] = {"tool": tool_name, "success": False, "error": str(error)[:500]}
+            payload: dict[str, Any] = {
+                "tool": tool_name,
+                "success": False,
+                "error": str(error)[:500],
+            }
             db.emit_event("tool_failure", json.dumps(payload))
             return {}
 
         result = await _post_tool_failure_hook(
-            {"tool_name": "Read", "tool_use_id": "tu_456", "tool_input": {}, "error": "File not found"},
+            {
+                "tool_name": "Read",
+                "tool_use_id": "tu_456",
+                "tool_input": {},
+                "error": "File not found",
+            },
             "tu_456",
             {},
         )
@@ -976,16 +985,23 @@ class TestPostToolUseHooks:
                 duration_ms = int((_time.monotonic() - subagent_start_times.pop(agent_id)) * 1000)
             db.emit_event(
                 "subagent_stop",
-                json.dumps({
-                    "agent_id": agent_id,
-                    "agent_type": agent_type,
-                    "duration_ms": duration_ms,
-                }),
+                json.dumps(
+                    {
+                        "agent_id": agent_id,
+                        "agent_type": agent_type,
+                        "duration_ms": duration_ms,
+                    }
+                ),
             )
             return {}
 
         result = await _subagent_stop_hook(
-            {"agent_id": "sa_002", "agent_type": "coder", "agent_transcript_path": "/tmp/t", "stop_hook_active": False},
+            {
+                "agent_id": "sa_002",
+                "agent_type": "coder",
+                "agent_transcript_path": "/tmp/t",
+                "stop_hook_active": False,
+            },
             None,
             {},
         )
@@ -1175,17 +1191,15 @@ class TestRecallBeforeReference:
                 send_count["n"] += 1
                 if autonomous:
                     tool_input = input_data.get("tool_input", {})
-                    msg_text = (
-                        tool_input.get("text", "")
-                        if isinstance(tool_input, dict)
-                        else ""
-                    )
+                    msg_text = tool_input.get("text", "") if isinstance(tool_input, dict) else ""
                     if recall_count["n"] == 0 and _references_past_events(msg_text):
-                        emitted.append({
-                            "event": "send_blocked_no_recall",
-                            "tool": tool_name,
-                            "preview": msg_text[:100],
-                        })
+                        emitted.append(
+                            {
+                                "event": "send_blocked_no_recall",
+                                "tool": tool_name,
+                                "preview": msg_text[:100],
+                            }
+                        )
                         return {
                             "decision": "block",
                             "reason": (
@@ -1405,9 +1419,7 @@ class TestOvernightCommitmentGate:
     # ----- _pre_tool_hook commitment gate -----
 
     @staticmethod
-    def _build_hook() -> tuple[
-        Any, dict[str, int], dict[str, int], list[dict[str, Any]]
-    ]:
+    def _build_hook() -> tuple[Any, dict[str, int], dict[str, int], list[dict[str, Any]]]:
         """Reproduce _pre_tool_hook's commitment-gate slice.
 
         Returns (hook, send_count, work_scheduled_count, emitted_events).
@@ -1434,20 +1446,17 @@ class TestOvernightCommitmentGate:
                 send_count["n"] += 1
                 tool_input = input_data.get("tool_input", {})
                 if isinstance(tool_input, dict):
-                    msg_text = tool_input.get("text", "") or tool_input.get(
-                        "caption", ""
-                    )
+                    msg_text = tool_input.get("text", "") or tool_input.get("caption", "")
                 else:
                     msg_text = ""
-                if (
-                    work_scheduled_count["n"] == 0
-                    and _commits_future_work(msg_text)
-                ):
-                    emitted.append({
-                        "event": "commitment_blocked_no_execution",
-                        "tool": tool_name,
-                        "preview": msg_text[:100],
-                    })
+                if work_scheduled_count["n"] == 0 and _commits_future_work(msg_text):
+                    emitted.append(
+                        {
+                            "event": "commitment_blocked_no_execution",
+                            "tool": tool_name,
+                            "preview": msg_text[:100],
+                        }
+                    )
                     return {
                         "decision": "block",
                         "reason": (
@@ -1567,8 +1576,7 @@ class TestOvernightCommitmentGate:
                 "tool_input": {
                     "path": "/tmp/foo.md",
                     "caption": (
-                        "Here's the outline. I'll have the full doc ready "
-                        "before 8am — sleep well."
+                        "Here's the outline. I'll have the full doc ready before 8am — sleep well."
                     ),
                 },
                 "tool_use_id": "tu_doc",
@@ -1609,9 +1617,7 @@ class TestOutboundQualityGate:
             if tool_name in _SEND_TOOLS:
                 tool_input = input_data.get("tool_input", {})
                 if isinstance(tool_input, dict):
-                    msg_text = tool_input.get("text", "") or tool_input.get(
-                        "caption", ""
-                    )
+                    msg_text = tool_input.get("text", "") or tool_input.get("caption", "")
                 else:
                     msg_text = ""
                 if tool_name in _TEXT_PRIMARY_TOOLS or msg_text.strip():
@@ -1619,11 +1625,13 @@ class TestOutboundQualityGate:
                 else:
                     rejection = None
                 if rejection:
-                    emitted.append({
-                        "reason": rejection,
-                        "tool": tool_name,
-                        "preview": msg_text[:100],
-                    })
+                    emitted.append(
+                        {
+                            "reason": rejection,
+                            "tool": tool_name,
+                            "preview": msg_text[:100],
+                        }
+                    )
                     return {
                         "decision": "block",
                         "reason": f"Quality gate: {rejection}",
@@ -1764,18 +1772,16 @@ class TestCriticGate:
                 send_count["n"] += 1
                 if autonomous:
                     tool_input = input_data.get("tool_input", {})
-                    msg_text = (
-                        tool_input.get("text", "")
-                        if isinstance(tool_input, dict)
-                        else ""
-                    )
+                    msg_text = tool_input.get("text", "") if isinstance(tool_input, dict) else ""
                     # Reproduce the recall gate so we know the critic
                     # only runs when the recall gate passes.
                     if recall_count["n"] == 0 and _references_past_events(msg_text):
-                        emitted.append({
-                            "event": "send_blocked_no_recall",
-                            "tool": tool_name,
-                        })
+                        emitted.append(
+                            {
+                                "event": "send_blocked_no_recall",
+                                "tool": tool_name,
+                            }
+                        )
                         return {"decision": "block", "reason": "recall first"}
 
                     # Critic gate — the slice under test.
@@ -1783,18 +1789,17 @@ class TestCriticGate:
                         critic_calls.append((msg_text, {"tool": tool_name}))
                         verdict = await verdict_fn(msg_text, {"tool": tool_name})
                         if verdict.decision != "pass":
-                            emitted.append({
-                                "event": "critic_blocked",
-                                "tool": tool_name,
-                                "verdict": verdict.decision,
-                                "reason": verdict.reason,
-                            })
+                            emitted.append(
+                                {
+                                    "event": "critic_blocked",
+                                    "tool": tool_name,
+                                    "verdict": verdict.decision,
+                                    "reason": verdict.reason,
+                                }
+                            )
                             return {
                                 "decision": "block",
-                                "reason": (
-                                    f"Critic ({verdict.decision}): "
-                                    f"{verdict.reason}"
-                                ),
+                                "reason": (f"Critic ({verdict.decision}): {verdict.reason}"),
                             }
             return {}
 
@@ -1846,9 +1851,7 @@ class TestCriticGate:
             {
                 "tool_name": "mcp__luke__send_message",
                 "tool_input": {
-                    "text": (
-                        "Absolutely! Great question — heads up your 3pm moved."
-                    ),
+                    "text": ("Absolutely! Great question — heads up your 3pm moved."),
                 },
                 "tool_use_id": "tu_c2",
             },
@@ -2010,45 +2013,36 @@ class TestFreshnessGate:
                 send_count["n"] += 1
                 if autonomous:
                     tool_input = input_data.get("tool_input", {})
-                    msg_text = (
-                        tool_input.get("text", "")
-                        if isinstance(tool_input, dict)
-                        else ""
-                    )
+                    msg_text = tool_input.get("text", "") if isinstance(tool_input, dict) else ""
                     if freshness_enabled and msg_text and len(msg_text) >= 30:
                         user_msgs = [
-                            r
-                            for r in recent_msgs
-                            if r.get("sender_name") != _s.assistant_name
+                            r for r in recent_msgs if r.get("sender_name") != _s.assistant_name
                         ][-2:]
                         if user_msgs:
                             try:
-                                latest_ts = str(
-                                    user_msgs[-1].get("timestamp", "")
-                                )
+                                latest_ts = str(user_msgs[-1].get("timestamp", ""))
                                 latest = datetime.fromisoformat(latest_ts)
                                 if latest.tzinfo is None:
                                     latest = latest.replace(tzinfo=UTC)
-                                age_minutes = (
-                                    datetime.now(UTC) - latest
-                                ).total_seconds() / 60
-                            except (ValueError, TypeError):
+                                age_minutes = (datetime.now(UTC) - latest).total_seconds() / 60
+                            except ValueError, TypeError:
                                 age_minutes = 999.0
                             if age_minutes <= window_minutes:
                                 fresh_calls.append((msg_text, user_msgs))
                                 verdict = await check_fn(msg_text, user_msgs)
                                 if verdict.decision != "pass":
-                                    emitted.append({
-                                        "event": "freshness_blocked",
-                                        "tool": tool_name,
-                                        "verdict": verdict.decision,
-                                        "reason": verdict.reason,
-                                    })
+                                    emitted.append(
+                                        {
+                                            "event": "freshness_blocked",
+                                            "tool": tool_name,
+                                            "verdict": verdict.decision,
+                                            "reason": verdict.reason,
+                                        }
+                                    )
                                     return {
                                         "decision": "block",
                                         "reason": (
-                                            f"Freshness ({verdict.decision}): "
-                                            f"{verdict.reason}"
+                                            f"Freshness ({verdict.decision}): {verdict.reason}"
                                         ),
                                     }
             return {}
@@ -2059,9 +2053,7 @@ class TestFreshnessGate:
     def _verdict_factory(decision: str, reason: str = "") -> Any:
         from luke.critic import CriticVerdict
 
-        async def _v(
-            text: str, user_msgs: list[dict[str, Any]]
-        ) -> CriticVerdict:
+        async def _v(text: str, user_msgs: list[dict[str, Any]]) -> CriticVerdict:
             return CriticVerdict(decision, reason)
 
         return _v
@@ -2078,9 +2070,7 @@ class TestFreshnessGate:
         }
 
     @staticmethod
-    def _stale_user_msg(
-        content: str, age_minutes: float = 60.0
-    ) -> dict[str, Any]:
+    def _stale_user_msg(content: str, age_minutes: float = 60.0) -> dict[str, Any]:
         from datetime import UTC, datetime, timedelta
 
         ts = (datetime.now(UTC) - timedelta(minutes=age_minutes)).isoformat()
@@ -2102,9 +2092,7 @@ class TestFreshnessGate:
             {
                 "tool_name": "mcp__luke__send_message",
                 "tool_input": {
-                    "text": (
-                        "The meeting is at 3pm in Vega room upstairs."
-                    ),
+                    "text": ("The meeting is at 3pm in Vega room upstairs."),
                 },
                 "tool_use_id": "tu_f1",
             },
@@ -2213,9 +2201,7 @@ class TestFreshnessGate:
             autonomous=True,
             freshness_enabled=True,
             recent_msgs=recent,
-            check_fn=self._verdict_factory(
-                "block", "answers a cancelled question"
-            ),
+            check_fn=self._verdict_factory("block", "answers a cancelled question"),
         )
         result = await hook(
             {
@@ -2242,9 +2228,7 @@ class TestFreshnessGate:
             autonomous=True,
             freshness_enabled=True,
             recent_msgs=recent,
-            check_fn=self._verdict_factory(
-                "revise", "answers earlier question"
-            ),
+            check_fn=self._verdict_factory("revise", "answers earlier question"),
         )
         result = await hook(
             {
@@ -2268,15 +2252,11 @@ class TestFreshnessGate:
         from luke.config import settings as _s
 
         recent = [
-            self._fresh_user_msg(
-                "never mind, found it", age_seconds=120.0
-            ),
+            self._fresh_user_msg("never mind, found it", age_seconds=120.0),
             {
                 "sender_name": _s.assistant_name,
                 "content": "got it, standing down",
-                "timestamp": self._fresh_user_msg(
-                    "x", age_seconds=10.0
-                )["timestamp"],
+                "timestamp": self._fresh_user_msg("x", age_seconds=10.0)["timestamp"],
             },
         ]
         hook, _emitted, calls = self._build_hook(
@@ -2299,9 +2279,7 @@ class TestFreshnessGate:
         # Only one call, and the latest is Filipe's message.
         assert len(calls) == 1
         user_latest = calls[0][1]
-        assert all(
-            m.get("sender_name") != _s.assistant_name for m in user_latest
-        )
+        assert all(m.get("sender_name") != _s.assistant_name for m in user_latest)
         assert user_latest[-1]["content"] == "never mind, found it"
 
 

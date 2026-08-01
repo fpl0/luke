@@ -3,10 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 from typing import Any
-
-import pytest
 
 from luke import context, db
 
@@ -25,7 +22,8 @@ def _insert_memory(
     now = datetime.now(UTC).isoformat()
     conn.execute(
         """INSERT INTO memory_meta
-           (id, type, created, updated, access_count, importance, status, tags_json, links_json, last_accessed)
+           (id, type, created, updated, access_count, importance, status,
+            tags_json, links_json, last_accessed)
            VALUES (?, ?, ?, ?, ?, ?, ?, '[]', '[]', ?)""",
         (mem_id, mem_type, now, now, access_count, importance, status, now),
     )
@@ -45,21 +43,27 @@ class TestBuildWorkingContext:
 
     def test_single_goal_injected(self, test_db: Any) -> None:
         conn = db._db()
-        _insert_memory(conn, "goal-test", "goal", "Test Goal", "Status: active\nProgress: 50%", importance=1.5)
+        _insert_memory(
+            conn, "goal-test", "goal", "Test Goal", "Status: active\nProgress: 50%", importance=1.5
+        )
         result = context.build_working_context()
         assert "goal-test" in result
         assert "Active Goals" in result
 
     def test_single_entity_injected(self, test_db: Any) -> None:
         conn = db._db()
-        _insert_memory(conn, "person-alice", "entity", "Alice", "Alice is a developer", importance=1.3)
+        _insert_memory(
+            conn, "person-alice", "entity", "Alice", "Alice is a developer", importance=1.3
+        )
         result = context.build_working_context()
         assert "person-alice" in result
         assert "Key Entities" in result
 
     def test_insights_show_title_only(self, test_db: Any) -> None:
         conn = db._db()
-        _insert_memory(conn, "insight-test", "insight", "Test Insight Title", "Long content here " * 50)
+        _insert_memory(
+            conn, "insight-test", "insight", "Test Insight Title", "Long content here " * 50
+        )
         result = context.build_working_context()
         assert "insight-test" in result
         assert "Test Insight Title" in result
@@ -67,7 +71,9 @@ class TestBuildWorkingContext:
 
     def test_archived_memories_excluded(self, test_db: Any) -> None:
         conn = db._db()
-        _insert_memory(conn, "goal-archived", "goal", "Old Goal", "Archived", importance=2.0, status="archived")
+        _insert_memory(
+            conn, "goal-archived", "goal", "Old Goal", "Archived", importance=2.0, status="archived"
+        )
         result = context.build_working_context()
         assert result == ""
 
@@ -86,8 +92,12 @@ class TestBuildWorkingContext:
         conn = db._db()
         for i in range(20):
             _insert_memory(
-                conn, f"entity-{i}", "entity", f"Entity {i}",
-                f"Content for entity {i} " * 100, importance=1.0,
+                conn,
+                f"entity-{i}",
+                "entity",
+                f"Entity {i}",
+                f"Content for entity {i} " * 100,
+                importance=1.0,
             )
         # Tiny budget — should include very few memories
         result = context.build_working_context(budget_tokens=200)
@@ -118,7 +128,9 @@ class TestBuildPreservationManifest:
 
     def test_includes_goals(self, test_db: Any) -> None:
         conn = db._db()
-        _insert_memory(conn, "goal-preserve", "goal", "Must Preserve Goal", "Active", importance=1.5)
+        _insert_memory(
+            conn, "goal-preserve", "goal", "Must Preserve Goal", "Active", importance=1.5
+        )
         result = context.build_preservation_manifest()
         assert "goal-preserve" in result
         assert "Must Preserve Goal" in result
@@ -225,9 +237,7 @@ _SAMPLE_CONSTITUTIONAL = {
         "Don't ask 'would you like me to...' — just do it",
     ],
     "decision_heuristics": {
-        "autonomy": {
-            "borderline": "do the work, show the result, ask before the final action"
-        }
+        "autonomy": {"borderline": "do the work, show the result, ask before the final action"}
     },
 }
 
@@ -320,7 +330,9 @@ class TestFormatConstitutionalSummary:
         assert "phrase-4" in result
         assert "phrase-5" not in result
 
-    def test_preservation_manifest_uses_constitutional_yaml(self, tmp_settings: Any, test_db: Any) -> None:
+    def test_preservation_manifest_uses_constitutional_yaml(
+        self, tmp_settings: Any, test_db: Any
+    ) -> None:
         """build_preservation_manifest() should include dynamically loaded invariants."""
         import yaml as _yaml
 
@@ -620,9 +632,7 @@ class TestActiveAttentionInContext:
         # Attention block sits above the memory injection header.
         assert result.index("<active-attention>") < result.index("# Injected Working Memory")
 
-    def test_no_attention_block_when_empty(
-        self, tmp_settings: Any, test_db: Any
-    ) -> None:
+    def test_no_attention_block_when_empty(self, tmp_settings: Any, test_db: Any) -> None:
         """No attention block is emitted when no items are pinned."""
         tmp_settings.chat_id = "100"
         tmp_settings.recent_outputs_enabled = False
@@ -631,9 +641,7 @@ class TestActiveAttentionInContext:
         result = context.build_working_context()
         assert "<active-attention>" not in result
 
-    def test_attention_survives_when_no_memories(
-        self, tmp_settings: Any, test_db: Any
-    ) -> None:
+    def test_attention_survives_when_no_memories(self, tmp_settings: Any, test_db: Any) -> None:
         """Attention items appear even when no memories are selected."""
         from luke import attention
 
@@ -645,9 +653,7 @@ class TestActiveAttentionInContext:
         assert "<active-attention>" in result
         assert "watch for Naiara's email" in result
 
-    def test_attention_below_recent_outputs(
-        self, tmp_settings: Any, test_db: Any
-    ) -> None:
+    def test_attention_below_recent_outputs(self, tmp_settings: Any, test_db: Any) -> None:
         """Attention block sits between recent-outputs and memory injection."""
         from luke import attention
 

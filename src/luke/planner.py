@@ -116,7 +116,7 @@ def effective_interval(name: str, base: float) -> float:
     """
     try:
         no_ops = int(db.get_behavior_no_ops(name))
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         no_ops = 0
     max_exp = _BACKOFF_CAPS.get(name, 4)
     return float(base * (2 ** min(no_ops, max_exp)))
@@ -232,9 +232,7 @@ def _maintenance_intents() -> list[Intent]:
             intents.append(Intent("reflection", 0.30, "time", cost))
 
     # --- Insight consolidation ---
-    interval = effective_interval(
-        "insight_consolidation", settings.insight_consolidation_interval
-    )
+    interval = effective_interval("insight_consolidation", settings.insight_consolidation_interval)
     elapsed = _seconds_since_last_run("insight_consolidation")
     if elapsed >= interval:
         has_insights = db.count_unconsumed_events("new_insight") >= 3

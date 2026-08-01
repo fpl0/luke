@@ -315,9 +315,7 @@ class TestRunReflexion:
             mock_db.get_recent_quality_scores.return_value = []
             mock_db.count_events_matching.return_value = 0  # not saturated
             mock_memory.recall.return_value = []
-            await run_reflexion(
-                AsyncMock(), _SEM, event_kind="quality_low", event_payload=payload
-            )
+            await run_reflexion(AsyncMock(), _SEM, event_kind="quality_low", event_payload=payload)
 
         mock_run_behavior.assert_called_once()
         prompt = mock_run_behavior.call_args.args[1]

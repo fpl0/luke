@@ -409,7 +409,9 @@ class TestBehaviorEventsMapping:
     def test_no_extra_behaviors_in_events_map(self) -> None:
         """BEHAVIOR_EVENTS shouldn't list behaviors that aren't maintenance."""
         for b in BEHAVIOR_EVENTS:
-            assert b in MAINTENANCE_BEHAVIORS, f"{b} in BEHAVIOR_EVENTS but not MAINTENANCE_BEHAVIORS"
+            assert b in MAINTENANCE_BEHAVIORS, (
+                f"{b} in BEHAVIOR_EVENTS but not MAINTENANCE_BEHAVIORS"
+            )
 
 
 # ---------------------------------------------------------------------------

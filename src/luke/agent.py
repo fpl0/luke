@@ -50,7 +50,6 @@ from claude_agent_sdk.types import (
     HookEvent,
     StreamEvent,
     SyncHookJSONOutput,
-    TextBlock,
     ThinkingConfig,
     ThinkingConfigAdaptive,
 )
@@ -127,6 +126,8 @@ def _check_outbound_quality(text: str) -> str | None:
         return "message too short to be substantive"
 
     return None
+
+
 _TG_MAX_MSG_LEN = 4096  # Telegram API hard limit
 _STREAMING_CURSOR = " ▍"  # visual typing indicator
 
@@ -305,9 +306,7 @@ def _commits_future_work(text: str) -> bool:
     """
     if not text or len(text) < 20:
         return False
-    return bool(_COMMITMENT_TIME_ANCHORS.search(text)) and bool(
-        _COMMITMENT_VERBS.search(text)
-    )
+    return bool(_COMMITMENT_TIME_ANCHORS.search(text)) and bool(_COMMITMENT_VERBS.search(text))
 
 
 def _references_past_events(text: str) -> bool:
@@ -374,9 +373,7 @@ def _requests_file_artifact(text: str) -> bool:
     """
     if not text or len(text) < 12:
         return False
-    return bool(_ARTIFACT_REQUEST_VERBS.search(text)) and bool(
-        _ARTIFACT_REQUEST_NOUNS.search(text)
-    )
+    return bool(_ARTIFACT_REQUEST_VERBS.search(text)) and bool(_ARTIFACT_REQUEST_NOUNS.search(text))
 
 
 # Send tools that deliver an actual FILE/attachment to Filipe. Distinct from a
@@ -435,14 +432,10 @@ def _requests_source_read(text: str) -> bool:
     """
     if not text or len(text) < 12:
         return False
-    return bool(_SOURCE_READ_VERBS.search(text)) and bool(
-        _SOURCE_READ_NOUNS.search(text)
-    )
+    return bool(_SOURCE_READ_VERBS.search(text)) and bool(_SOURCE_READ_NOUNS.search(text))
 
 
-def _context_query(
-    prompt: str | list[dict[str, Any]], user_text: str | None
-) -> str:
+def _context_query(prompt: str | list[dict[str, Any]], user_text: str | None) -> str:
     """The text that should drive memory retrieval and the Stop gates.
 
     Prefer ``user_text`` — the caller's clean, envelope-free user message captured
@@ -517,13 +510,65 @@ _AGENT_SCHEDULE_TOOLS: frozenset[str] = frozenset(
 # Reference: proc-scheduled-task-dedup, insight-scheduled-send-state-drift.
 _TASK_STOPWORDS: frozenset[str] = frozenset(
     {
-        "the", "a", "an", "and", "or", "but", "for", "with", "his", "her", "him",
-        "that", "this", "these", "those", "then", "than", "into", "onto", "from",
-        "filipe", "before", "after", "ahead", "about", "your", "yours", "them",
-        "will", "would", "should", "could", "have", "has", "had", "not", "you",
-        "remind", "reminder", "nudge", "check", "run", "send", "ask", "note",
-        "once", "cron", "interval", "task", "schedule", "scheduled", "when",
-        "day", "morning", "evening", "afternoon", "night", "today", "tomorrow",
+        "the",
+        "a",
+        "an",
+        "and",
+        "or",
+        "but",
+        "for",
+        "with",
+        "his",
+        "her",
+        "him",
+        "that",
+        "this",
+        "these",
+        "those",
+        "then",
+        "than",
+        "into",
+        "onto",
+        "from",
+        "filipe",
+        "before",
+        "after",
+        "ahead",
+        "about",
+        "your",
+        "yours",
+        "them",
+        "will",
+        "would",
+        "should",
+        "could",
+        "have",
+        "has",
+        "had",
+        "not",
+        "you",
+        "remind",
+        "reminder",
+        "nudge",
+        "check",
+        "run",
+        "send",
+        "ask",
+        "note",
+        "once",
+        "cron",
+        "interval",
+        "task",
+        "schedule",
+        "scheduled",
+        "when",
+        "day",
+        "morning",
+        "evening",
+        "afternoon",
+        "night",
+        "today",
+        "tomorrow",
     }
 )
 
@@ -981,11 +1026,14 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
             )
         except ValueError as exc:
             return _ok(f"Error: {exc}")
-        bus.emit("cron_created", {
-            "task_id": task_id,
-            "schedule_type": args["schedule_type"],
-            "prompt_preview": args["prompt"][:200],
-        })
+        bus.emit(
+            "cron_created",
+            {
+                "task_id": task_id,
+                "schedule_type": args["schedule_type"],
+                "prompt_preview": args["prompt"][:200],
+            },
+        )
         return _ok(f"Scheduled: {task_id}")
 
     @tool(
@@ -1951,14 +1999,10 @@ async def run_agent(
     tool_count: dict[str, int] = {"n": 0}
     # Detect an explicit inbound FILE-artifact request so the Stop hook can
     # enforce delivery-or-durable-handle before the turn closes.
-    artifact_requested = not autonomous and _requests_file_artifact(
-        prompt_text_for_context
-    )
+    artifact_requested = not autonomous and _requests_file_artifact(prompt_text_for_context)
     # Detect an explicit inbound request to consult a readable SOURCE so the
     # Stop hook can enforce an actual read before the turn closes.
-    source_read_requested = not autonomous and _requests_source_read(
-        prompt_text_for_context
-    )
+    source_read_requested = not autonomous and _requests_source_read(prompt_text_for_context)
     tool_start_times: dict[str, float] = {}  # tool_use_id -> monotonic start
     subagent_start_times: dict[str, float] = {}  # agent_id -> monotonic start
     effective_max_sends = max_sends if max_sends is not None else settings.max_sends_per_run
@@ -2032,17 +2076,20 @@ async def run_agent(
                         existing_id=dup.get("id"),
                         new_preview=str(tool_input.get("prompt", ""))[:80],
                     )
-                    bus.emit("duplicate_task_blocked", {
-                        "existing_id": dup.get("id"),
-                        "existing_value": dup.get("schedule_value"),
-                        "new_preview": str(tool_input.get("prompt", ""))[:100],
-                    })
+                    bus.emit(
+                        "duplicate_task_blocked",
+                        {
+                            "existing_id": dup.get("id"),
+                            "existing_value": dup.get("schedule_value"),
+                            "new_preview": str(tool_input.get("prompt", ""))[:100],
+                        },
+                    )
                     return {
                         "decision": "block",
                         "reason": (
                             "Near-duplicate of an existing active task "
                             f"(id={dup.get('id')}, fires {dup.get('schedule_value')}): "
-                            f"\"{str(dup.get('prompt',''))[:80]}\". Filipe would get "
+                            f'"{str(dup.get("prompt", ""))[:80]}". Filipe would get '
                             "the same nudge twice. Don't stack a second task — "
                             "either leave the existing one, or delete_task(it) and "
                             "reschedule once with the corrected time/content. "
@@ -2065,20 +2112,20 @@ async def run_agent(
                 msg_text = tool_input.get("text", "") or tool_input.get("caption", "")
             else:
                 msg_text = ""
-            if (
-                work_scheduled_count["n"] == 0
-                and _commits_future_work(msg_text)
-            ):
+            if work_scheduled_count["n"] == 0 and _commits_future_work(msg_text):
                 log.warning(
                     "commitment_blocked_no_execution",
                     chat_id=chat_id,
                     tool=tool_name,
                     preview=msg_text[:100],
                 )
-                bus.emit("commitment_blocked_no_execution", {
-                    "tool": tool_name,
-                    "preview": msg_text[:100],
-                })
+                bus.emit(
+                    "commitment_blocked_no_execution",
+                    {
+                        "tool": tool_name,
+                        "preview": msg_text[:100],
+                    },
+                )
                 return {
                     "decision": "block",
                     "reason": (
@@ -2131,11 +2178,14 @@ async def run_agent(
                         reason=rejection,
                         preview=msg_text[:100],
                     )
-                    bus.emit("message_rejected", {
-                        "reason": rejection,
-                        "tool": tool_name,
-                        "preview": msg_text[:100],
-                    })
+                    bus.emit(
+                        "message_rejected",
+                        {
+                            "reason": rejection,
+                            "tool": tool_name,
+                            "preview": msg_text[:100],
+                        },
+                    )
                     return {"decision": "block", "reason": f"Quality gate: {rejection}"}
 
                 # --- Recall-before-reference gate (autonomous only) ---
@@ -2149,10 +2199,13 @@ async def run_agent(
                         tool=tool_name,
                         preview=msg_text[:100],
                     )
-                    bus.emit("send_blocked_no_recall", {
-                        "tool": tool_name,
-                        "preview": msg_text[:100],
-                    })
+                    bus.emit(
+                        "send_blocked_no_recall",
+                        {
+                            "tool": tool_name,
+                            "preview": msg_text[:100],
+                        },
+                    )
                     return {
                         "decision": "block",
                         "reason": (
@@ -2167,16 +2220,10 @@ async def run_agent(
                 # and abort if the draft contradicts or stale-responds to
                 # it. Runs BEFORE the critic so we only spend on drafts
                 # that survived everything else. Fail-open via check_freshness.
-                if (
-                    settings.freshness_enabled
-                    and msg_text
-                    and len(msg_text) >= 30
-                ):
+                if settings.freshness_enabled and msg_text and len(msg_text) >= 30:
                     recent_rows = db.get_recent_messages(chat_id, limit=10)
                     user_msgs = [
-                        r
-                        for r in recent_rows
-                        if r.get("sender_name") != settings.assistant_name
+                        r for r in recent_rows if r.get("sender_name") != settings.assistant_name
                     ][-4:]
                     if user_msgs:
                         try:
@@ -2184,23 +2231,22 @@ async def run_agent(
                             latest = datetime.fromisoformat(latest_ts)
                             if latest.tzinfo is None:
                                 latest = latest.replace(tzinfo=UTC)
-                            age_minutes = (
-                                datetime.now(UTC) - latest
-                            ).total_seconds() / 60
-                        except (ValueError, TypeError):
+                            age_minutes = (datetime.now(UTC) - latest).total_seconds() / 60
+                        except ValueError, TypeError:
                             age_minutes = 999.0
                         if age_minutes <= settings.freshness_window_minutes:
                             from .critic import check_freshness
 
-                            fresh_verdict = await check_freshness(
-                                msg_text, user_msgs
+                            fresh_verdict = await check_freshness(msg_text, user_msgs)
+                            bus.emit(
+                                "freshness_ran",
+                                {
+                                    "tool": tool_name,
+                                    "decision": fresh_verdict.decision,
+                                    "reason": fresh_verdict.reason,
+                                    "age_minutes": round(age_minutes, 1),
+                                },
                             )
-                            bus.emit("freshness_ran", {
-                                "tool": tool_name,
-                                "decision": fresh_verdict.decision,
-                                "reason": fresh_verdict.reason,
-                                "age_minutes": round(age_minutes, 1),
-                            })
                             if fresh_verdict.decision != "pass":
                                 log.warning(
                                     "freshness_blocked",
@@ -2210,12 +2256,15 @@ async def run_agent(
                                     reason=fresh_verdict.reason,
                                     preview=msg_text[:100],
                                 )
-                                bus.emit("freshness_blocked", {
-                                    "tool": tool_name,
-                                    "verdict": fresh_verdict.decision,
-                                    "reason": fresh_verdict.reason,
-                                    "preview": msg_text[:100],
-                                })
+                                bus.emit(
+                                    "freshness_blocked",
+                                    {
+                                        "tool": tool_name,
+                                        "verdict": fresh_verdict.decision,
+                                        "reason": fresh_verdict.reason,
+                                        "preview": msg_text[:100],
+                                    },
+                                )
                                 return {
                                     "decision": "block",
                                     "reason": (
@@ -2232,15 +2281,16 @@ async def run_agent(
                 if settings.critic_enabled and msg_text and len(msg_text) >= 20:
                     from .critic import critique_outbound
 
-                    verdict = await critique_outbound(
-                        msg_text, {"tool": tool_name}
+                    verdict = await critique_outbound(msg_text, {"tool": tool_name})
+                    bus.emit(
+                        "critic_ran",
+                        {
+                            "tool": tool_name,
+                            "decision": verdict.decision,
+                            "reason": verdict.reason,
+                            "msg_len": len(msg_text),
+                        },
                     )
-                    bus.emit("critic_ran", {
-                        "tool": tool_name,
-                        "decision": verdict.decision,
-                        "reason": verdict.reason,
-                        "msg_len": len(msg_text),
-                    })
                     if verdict.decision != "pass":
                         log.warning(
                             "critic_blocked",
@@ -2250,18 +2300,18 @@ async def run_agent(
                             reason=verdict.reason,
                             preview=msg_text[:100],
                         )
-                        bus.emit("critic_blocked", {
-                            "tool": tool_name,
-                            "verdict": verdict.decision,
-                            "reason": verdict.reason,
-                            "preview": msg_text[:100],
-                        })
+                        bus.emit(
+                            "critic_blocked",
+                            {
+                                "tool": tool_name,
+                                "verdict": verdict.decision,
+                                "reason": verdict.reason,
+                                "preview": msg_text[:100],
+                            },
+                        )
                         return {
                             "decision": "block",
-                            "reason": (
-                                f"Critic ({verdict.decision}): "
-                                f"{verdict.reason}"
-                            ),
+                            "reason": (f"Critic ({verdict.decision}): {verdict.reason}"),
                         }
         return {}
 

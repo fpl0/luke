@@ -26,14 +26,16 @@ Usage::
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 import json
 import logging
 import time
 from collections import defaultdict
+from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field
 from fnmatch import fnmatch
-from typing import Any, Callable, Coroutine
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +73,8 @@ class EventBus:
         self._sync_handlers: dict[str, list[SyncHandler]] = defaultdict(list)
         self._async_handlers: dict[str, list[AsyncHandler]] = defaultdict(list)
         self._stats: dict[str, int] = defaultdict(int)  # kind → emit count
+        # Strong refs to in-flight handler tasks (prevents premature GC)
+        self._pending_tasks: set[asyncio.Task[None]] = set()
 
     # ------------------------------------------------------------------
     # Subscription
@@ -98,10 +102,8 @@ class EventBus:
         for registry in (self._sync_handlers, self._async_handlers):
             handlers = registry.get(pattern)
             if handlers:
-                try:
+                with contextlib.suppress(ValueError):
                     handlers.remove(handler)  # type: ignore[arg-type]
-                except ValueError:
-                    pass
                 if not handlers:
                     del registry[pattern]
 
@@ -209,7 +211,9 @@ class EventBus:
             return
 
         for handler in matching:
-            loop.create_task(self._safe_async_call(handler, event))
+            task = loop.create_task(self._safe_async_call(handler, event))
+            self._pending_tasks.add(task)
+            task.add_done_callback(self._pending_tasks.discard)
 
     @staticmethod
     async def _safe_async_call(handler: AsyncHandler, event: Event) -> None:

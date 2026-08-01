@@ -40,8 +40,7 @@ def pin(
     """Add a new active-attention item. Returns the row id."""
     conn = db._db()
     cur = conn.execute(
-        "INSERT INTO active_attention (chat_id, content, origin, related_id) "
-        "VALUES (?, ?, ?, ?)",
+        "INSERT INTO active_attention (chat_id, content, origin, related_id) VALUES (?, ?, ?, ?)",
         (chat_id, content, origin, related_id),
     )
     db._commit(conn)

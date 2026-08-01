@@ -156,7 +156,7 @@ def _recency_score(updated_iso: str, half_life_days: float = 14.0) -> float:
         return 0.0
     try:
         updated = ensure_utc(datetime.fromisoformat(updated_iso))
-    except (ValueError, AttributeError):
+    except ValueError, AttributeError:
         return 0.0
     age_days = (datetime.now(UTC) - updated).total_seconds() / 86400
     return math.exp(-math.log(2) * age_days / half_life_days)
@@ -169,7 +169,7 @@ def _cosine_similarity(a: list[float], b_blob: bytes) -> float:
         b = struct.unpack(f"{dim}f", b_blob)
     except struct.error:
         return 0.0
-    dot = sum(x * y for x, y in zip(a, b))
+    dot = sum(x * y for x, y in zip(a, b, strict=True))
     norm_a = math.sqrt(sum(x * x for x in a))
     norm_b = math.sqrt(sum(y * y for y in b))
     if norm_a == 0 or norm_b == 0:
@@ -224,8 +224,7 @@ def _load_priority_memories(query: str = "") -> list[dict[str, Any]]:
         if id_set:
             placeholders = ",".join("?" for _ in id_set)
             vec_rows = db.execute(
-                f"SELECT memory_id, embedding FROM memory_vec "
-                f"WHERE memory_id IN ({placeholders})",
+                f"SELECT memory_id, embedding FROM memory_vec WHERE memory_id IN ({placeholders})",
                 id_set,
             ).fetchall()
             for vr in vec_rows:
@@ -233,7 +232,6 @@ def _load_priority_memories(query: str = "") -> list[dict[str, Any]]:
 
     has_query = query_vec is not None and len(vec_map) > 0
 
-    now = datetime.now(UTC)
     max_access = max((r["access_count"] for r in rows), default=1) or 1
     log_max = math.log1p(max_access)
 
@@ -259,9 +257,7 @@ def _load_priority_memories(query: str = "") -> list[dict[str, Any]]:
         # keep re-editing dormant memories (project-theo) while core entities
         # (person-filipe) rarely get edited yet are used constantly. Last
         # access tracks genuine relevance; lifetime access_count does not decay.
-        acc_rec = (
-            _recency_score(r["human_last_accessed"]) if r["human_last_accessed"] else 0.0
-        )
+        acc_rec = _recency_score(r["human_last_accessed"]) if r["human_last_accessed"] else 0.0
 
         # Type boost: goals/entities matter more for context — but for entities
         # the boost decays toward 1.0 as they go unused, so a dormant entity
@@ -289,16 +285,18 @@ def _load_priority_memories(query: str = "") -> list[dict[str, Any]]:
         if r["suppression"] > 0.0:
             score *= 1.0 - r["suppression"]
 
-        memories.append({
-            "id": r["id"],
-            "type": r["type"],
-            "title": r["title"] or r["id"],
-            "content": r["content"] or "",
-            "importance": r["importance"],
-            "updated": r["updated"],
-            "access_count": r["access_count"],
-            "score": min(score, 1.0),
-        })
+        memories.append(
+            {
+                "id": r["id"],
+                "type": r["type"],
+                "title": r["title"] or r["id"],
+                "content": r["content"] or "",
+                "importance": r["importance"],
+                "updated": r["updated"],
+                "access_count": r["access_count"],
+                "score": min(score, 1.0),
+            }
+        )
 
     memories.sort(key=lambda m: m["score"], reverse=True)
     return memories
@@ -477,9 +475,7 @@ def build_preservation_manifest() -> str:
     except Exception:
         return _FALLBACK_PRESERVATION
 
-    sections: list[str] = [
-        "CRITICAL — structured preservation manifest for compaction:"
-    ]
+    sections: list[str] = ["CRITICAL — structured preservation manifest for compaction:"]
 
     # Active goals with IDs
     goal_rows = db.execute(
@@ -562,8 +558,7 @@ _FALLBACK_PRESERVATION = (
     "4. Key facts about the user from injected memories\n"
     "5. Any tool results not yet communicated\n"
     "6. Relationship links between memories\n"
-    "\n"
-    + _FALLBACK_CONSTITUTIONAL
+    "\n" + _FALLBACK_CONSTITUTIONAL
 )
 
 
@@ -584,7 +579,7 @@ def audit_compression(
     """Audit a compressed summary for information retention.
 
     Checks whether expected references (goals, entities, memory IDs) survived
-    compression. Computes a retention score (0.0–1.0) and optionally logs the
+    compression. Computes a retention score (0.0-1.0) and optionally logs the
     result to the compression_audit table.
 
     Args:
