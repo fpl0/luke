@@ -216,6 +216,10 @@ class TestRequestsFileArtifact:
 
 
 class TestArtifactGate:
+    @pytest.fixture(autouse=True)
+    def _isolated_db(self, test_db: Any) -> None:
+        """The stop hook emits events via bus.emit → db; isolate from the real DB."""
+
     def _hook(
         self,
         *,
@@ -320,6 +324,10 @@ class TestRequestsSourceRead:
 
 
 class TestSourceReadGate:
+    @pytest.fixture(autouse=True)
+    def _isolated_db(self, test_db: Any) -> None:
+        """The stop hook emits events via bus.emit → db; isolate from the real DB."""
+
     def _hook(
         self,
         *,
@@ -483,6 +491,10 @@ class TestOk:
 
 class TestBuildTools:
     """Test tool functions by calling _build_tools with mocked SDK."""
+
+    @pytest.fixture(autouse=True)
+    def _isolated_db(self, test_db: Any) -> None:
+        """Tools emit events via bus.emit → db; isolate from the real DB."""
 
     @pytest.fixture(autouse=True)
     def _patch_db_store(self) -> Any:

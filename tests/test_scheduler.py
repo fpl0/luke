@@ -377,6 +377,7 @@ class TestSchedulerLoop:
             patch("luke.scheduler.settings") as mock_settings,
             patch("luke.scheduler.db") as mock_db,
             patch("luke.scheduler.memory"),
+            patch("luke.scheduler.generate_intents", return_value=[]),
         ):
             mock_settings.scheduler_interval = 0.01  # Very fast ticks
             mock_settings.cleanup_interval = 999999
