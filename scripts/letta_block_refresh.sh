@@ -9,7 +9,13 @@ cd /Users/filipelm/Code/luke
 PY=/Users/filipelm/Code/luke/.letta-venv/bin/python
 STAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 echo "=== letta_block_refresh $STAMP ==="
-# Refresh first (sqlite -> blocks), then audit (verify fresh + log the ledger line).
+# 1. OBSERVE first: measure + log the drift accumulated since yesterday's re-pack. This is the
+#    evidence the 5.5 gate actually does work (a pack-then-audit alone is trivially fresh and
+#    proves nothing). Never fails the run — it's a ledger annotation, not a gate.
+echo "--- observe (pre-refresh drift) ---"
+"$PY" scripts/letta_block_drift_audit.py --observe
+# 2. Refresh (sqlite -> blocks).
 "$PY" scripts/letta_pack_core_blocks.py
+# 3. Audit (verify the re-pack landed fresh + log the ledger gate line the 3-day accept counts).
 echo "--- audit ---"
 "$PY" scripts/letta_block_drift_audit.py

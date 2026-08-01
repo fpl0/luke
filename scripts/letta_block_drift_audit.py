@@ -80,6 +80,13 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--agent", default="luke-agent-claude")
     ap.add_argument("--no-log", action="store_true")
+    ap.add_argument(
+        "--observe", action="store_true",
+        help="Evidence mode: measure the drift accumulated since the last re-pack and log it "
+             "tagged OBSERVED, then ALWAYS exit 0. Meant to run BEFORE the daily re-pack so the "
+             "ledger records the drift the mechanism actually corrected (otherwise the post-pack "
+             "audit is trivially fresh and proves nothing). Not a gate — never fails the run.",
+    )
     args = ap.parse_args()
 
     agent_id, results = audit(args.agent)
@@ -87,21 +94,28 @@ def main():
     all_fresh = all(v == "FRESH" for _, v, _ in results)
     for label, verdict, detail in results:
         print(f"  {verdict:8} {label:16} {detail}")
-    verdict = "ALL FRESH" if all_fresh else "DRIFT DETECTED"
+    if args.observe:
+        verdict = "OBSERVED CLEAN" if all_fresh else "OBSERVED DRIFT"
+    else:
+        verdict = "ALL FRESH" if all_fresh else "DRIFT DETECTED"
     print(f"\nRESULT: {verdict}")
 
     if not args.no_log:
         stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         drifted = [l for l, v, _ in results if v != "FRESH"]
-        line = (f"{stamp}  {verdict:14}  "
-                + ("all 5 blocks match sqlite" if all_fresh
-                   else f"drifted: {','.join(drifted)}") + "\n")
+        if all_fresh:
+            detail = ("no drift since last re-pack" if args.observe
+                      else "all 5 blocks match sqlite")
+        else:
+            detail = f"drifted: {','.join(drifted)}"
+        line = f"{stamp}  {verdict:14}  {detail}\n"
         os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
         with open(LOG_PATH, "a") as fh:
             fh.write(line)
         print(f"logged -> {os.path.relpath(LOG_PATH)}")
 
-    sys.exit(0 if all_fresh else 1)
+    # --observe is evidence, never a gate: always succeed so it can't break the daily run.
+    sys.exit(0 if (all_fresh or args.observe) else 1)
 
 
 if __name__ == "__main__":
