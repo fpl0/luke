@@ -19,7 +19,7 @@ pool** (no Claude turn). It proves the invariant three ways from ground truth:
       byte identical with the backend forced to "sdk" vs "letta". Import-time branching on the
       flag would change the surface; it doesn't.
 
-Run: python3 scripts/test_42_shell_isolation.py   (from repo root, app venv)
+Run: python3 scripts/probe_42_shell_isolation.py   (from repo root, app venv)
 """
 
 from __future__ import annotations
