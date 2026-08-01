@@ -73,7 +73,7 @@ def letta_semantic_search(
     filtered against Luke's own memory_meta. Returns ``None`` to signal fall-through
     to sqlite-vec (server down, no candidates, or nothing joinable).
     """
-    from .memory import _db  # local import avoids a circular dependency
+    from .db import _db  # local import avoids a circular dependency
 
     if not settings.letta_archive_id:
         return None  # no archive provisioned for this deployment — sqlite path

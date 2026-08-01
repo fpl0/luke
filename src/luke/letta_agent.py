@@ -147,11 +147,11 @@ def _passage_body(mem_id: str, cap: int) -> str | None:
     recall() returns id/type/title/score but not the body; the body lives in memory_fts.
     None if the row is missing (fail-safe — that passage is simply skipped).
     """
-    from . import memory as _memory
+    from .db import _db
 
     try:
         row = (
-            _memory._db()
+            _db()
             .execute("SELECT content FROM memory_fts WHERE id = ?", (mem_id,))
             .fetchone()
         )

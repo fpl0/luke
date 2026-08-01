@@ -122,7 +122,7 @@ def letta_write_through(mem_id: str) -> None:
 
 
 def _write_through_impl(mem_id: str) -> None:
-    from .memory import _db  # local import avoids a circular dependency
+    from .db import _db  # local import avoids a circular dependency
 
     db = _db()
     row = db.execute(

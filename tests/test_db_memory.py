@@ -1318,3 +1318,44 @@ class TestSkillLoop:
         trigger = db.get_skill_trigger("proc-deploy")
         assert trigger is not None
         assert trigger["confidence"] == pytest.approx(0.9)
+
+
+class TestPendingCorrectionsHygiene:
+    """flag_for_review dedup + prune: the queue must stay bounded and drainable."""
+
+    def test_reflag_refreshes_instead_of_duplicating(self, test_db: Any) -> None:
+        memory.index_memory("e1", "entity", "Fact", "content")
+
+        first = memory.flag_for_review("e1", "correction v1", source="consolidation_scan")
+        again = memory.flag_for_review("e1", "correction v2", source="consolidation_scan")
+
+        assert first["status"] == "flagged"
+        assert again["status"] == "refreshed"
+        pending = memory.get_pending_corrections("e1")
+        assert len(pending) == 1
+        assert pending[0]["corrected_content"] == "correction v2"
+
+    def test_distinct_sources_flag_separately(self, test_db: Any) -> None:
+        memory.index_memory("e1", "entity", "Fact", "content")
+        memory.flag_for_review("e1", "from scan", source="consolidation_scan")
+        memory.flag_for_review("e1", "from auto", source="auto_detection")
+        assert len(memory.get_pending_corrections("e1")) == 2
+
+    def test_prune_expires_stale_pending(self, test_db: Any) -> None:
+        memory.index_memory("e1", "entity", "Fact", "content")
+        memory.flag_for_review("e1", "old correction")
+        memory.index_memory("e2", "entity", "Other", "content")
+        memory.flag_for_review("e2", "fresh correction")
+
+        # Backdate the first row past the retention window.
+        conn = db._db()
+        conn.execute(
+            "UPDATE pending_corrections SET created_at = '2020-01-01T00:00:00+00:00' "
+            "WHERE mem_id = 'e1'"
+        )
+        conn.commit()
+
+        expired = memory.prune_pending_corrections(retention_days=30)
+        assert expired == 1
+        assert memory.get_pending_corrections("e1") == []
+        assert len(memory.get_pending_corrections("e2")) == 1
