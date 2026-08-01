@@ -27,6 +27,9 @@ Single Python process: aiogram dispatches Telegram messages → Claude Agent SDK
 | `src/luke/app.py` | Orchestrator: Telegram handlers, `_store` helper, `process` + `_dispatch`, main loop |
 | `src/luke/agent.py` | Claude SDK client + 27 MCP tools (Telegram, memory, scheduling, monitoring) + model routing |
 | `src/luke/memory.py` | Memory subsystem: FTS5 indexing, semantic search, graph traversal, scoring, decay |
+| `src/luke/letta_adapter.py` | Letta backend for recall's semantic candidates (fail-safe, falls back to sqlite-vec) |
+| `src/luke/letta_writer.py` | Live write-through mirror of memory writes into the Letta archive |
+| `src/luke/letta_agent.py` | Letta core-block context assembly + canonical turn driver |
 | `src/luke/db.py` | SQLite: messages, sessions, tasks, cost tracking |
 | `src/luke/config.py` | Settings from `.env` via pydantic-settings (`SecretStr` for token) |
 | `src/luke/scheduler.py` | Cron/interval/once task execution + hourly maintenance |
@@ -147,6 +150,7 @@ Allowed types: `feat`, `fix`, `docs`, `test`, `refactor`, `chore`, `perf`, `buil
 Always write tests for new functionality. Test files live in `tests/` and mirror the source structure:
 - `tests/test_db.py` — message storage, sessions, tasks
 - `tests/test_db_memory.py` — memory.py: indexing, recall, FTS, embeddings, graph, scoring
+- `tests/test_letta_adapter.py`, `tests/test_letta_writer.py`, `tests/test_letta_agent.py` — Letta backend seams (mocked HTTP; never touch a live server)
 - `tests/test_media.py` — image encoding, transcription, ffmpeg
 - `tests/test_behaviors.py` — autonomous behavior functions
 - `tests/test_scheduler.py` — scheduler loop, task execution
@@ -202,6 +206,7 @@ Key behaviors:
 - **Self-healing** — `sync_memory_index()` on startup detects unindexed files and indexes them (with embeddings)
 - **Recall limit** — configurable via `RECALL_CONTENT_LIMIT` env var (default: 2000 chars)
 - **Embeddings** — `fastembed` + `sqlite-vec` (both required); hybrid FTS + semantic search always active
+- **Letta backend** — `MEMORY_BACKEND=letta` sources recall's semantic candidates from a Letta server and mirrors writes into its archive; `AGENT_BACKEND=letta` sources the turn's world model from self-editing core blocks. Both seams fail back to sqlite on any error. See `docs/letta.md`
 - **Voice transcription** — `mlx-whisper` (required); configurable model via `WHISPER_MODEL` env var (default: `mlx-community/whisper-large-v3-turbo`). Transcripts saved as `.txt` alongside `.ogg` files
 
 ## Message Storage

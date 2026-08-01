@@ -1,0 +1,10 @@
+/Users/filipelm/Code/luke/.letta-venv/lib/python3.12/site-packages/letta/cli/cli.py:32: FastAPIDeprecationWarning: ORJSONResponse is deprecated, FastAPI now serializes data directly to JSON bytes via Pydantic when a return type or response model is set, which is faster and doesn't need a custom response class. Read more in the FastAPI docs: https://fastapi.tiangolo.com/advanced/custom-response/#orjson-or-response-model and https://fastapi.tiangolo.com/tutorial/response-model/
+  from letta.server.rest_api.app import start_server
+/Users/filipelm/Code/luke/.letta-venv/lib/python3.12/site-packages/fastapi/openapi/utils.py:303: UserWarning: Duplicate Operation ID retrieve_metrics_for_run for function retrieve_metrics_for_run at /Users/filipelm/Code/luke/.letta-venv/lib/python3.12/site-packages/letta/server/rest_api/routers/v1/runs.py
+  warnings.warn(message, stacklevel=1)
+/Users/filipelm/Code/luke/.letta-venv/lib/python3.12/site-packages/fastapi/openapi/utils.py:303: UserWarning: Duplicate Operation ID create_chat_completion for function create_chat_completion at /Users/filipelm/Code/luke/.letta-venv/lib/python3.12/site-packages/letta/server/rest_api/routers/v1/chat_completions.py
+  warnings.warn(message, stacklevel=1)
+INFO:     Started server process [64715]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://localhost:8283 (Press CTRL+C to quit)
