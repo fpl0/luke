@@ -302,6 +302,7 @@ async def start_scheduler_loop(
                 pruned_outbound = db.cleanup_outbound_log()
                 pruned_events = db.cleanup_events()
                 expired_working = memory.expire_working_memories()
+                expired_corrections = memory.prune_pending_corrections()
                 db.set_behavior_last_run("cleanup", datetime.now(UTC).isoformat())
                 log.info(
                     "hourly_maintenance",
@@ -311,6 +312,7 @@ async def start_scheduler_loop(
                     outbound_pruned=pruned_outbound,
                     events_pruned=pruned_events,
                     working_expired=expired_working,
+                    corrections_expired=expired_corrections,
                 )
             except sqlite3.OperationalError:
                 log.warning("hourly_maintenance_skipped", reason="database locked")

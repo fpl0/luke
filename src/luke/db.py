@@ -437,29 +437,6 @@ _MIGRATIONS: list[tuple[int, str, list[str]]] = [
         ],
     ),
     (
-        10,
-        "add pending_corrections table and enhance memory_history with content snapshots",
-        [
-            """CREATE TABLE IF NOT EXISTS pending_corrections (
-                id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                mem_id          TEXT NOT NULL,
-                corrected_content TEXT NOT NULL,
-                confidence      REAL NOT NULL,
-                source          TEXT NOT NULL DEFAULT 'auto_detection',
-                status          TEXT NOT NULL DEFAULT 'pending',
-                created_at      TEXT NOT NULL,
-                resolved_at     TEXT
-            )""",
-            "CREATE INDEX IF NOT EXISTS idx_pc_mem ON pending_corrections(mem_id)",
-            "CREATE INDEX IF NOT EXISTS idx_pc_status ON pending_corrections(status)",
-            "ALTER TABLE memory_history ADD COLUMN old_content TEXT",
-            "ALTER TABLE memory_history ADD COLUMN new_content TEXT",
-            "ALTER TABLE memory_history ADD COLUMN change_type TEXT",
-            "ALTER TABLE memory_history ADD COLUMN source TEXT",
-            "ALTER TABLE memory_history ADD COLUMN confidence REAL",
-        ],
-    ),
-    (
         11,
         "add cache token tracking to cost_log for prompt caching analysis",
         [

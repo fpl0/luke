@@ -666,6 +666,17 @@ def index_memory(
         except Exception:
             pass  # best-effort — don't fail index_memory over event
 
+    # Phase 2.2c: mirror this committed write into the Letta archive when backend=letta,
+    # so the shadow-run stays live instead of drifting between daily delta-syncs. Fully
+    # fail-safe (no-op off the letta backend; never raises). Reversible: delete this call
+    # + src/luke/letta_writer.py to revert.
+    try:
+        from .letta_writer import letta_write_through
+
+        letta_write_through(mem_id)
+    except Exception:
+        log.warning("letta_write_through_hook_failed", mem_id=mem_id)
+
     return embedding
 
 
@@ -754,14 +765,25 @@ def recall(
     sem_ranked: list[str] = []
     query_embedding: list[float] | None = None
     if query:
-        query_embedding = _embed_query(query)
-        if query_embedding is not None:
-            sem_results = _semantic_search(
-                query_embedding,
-                mem_type=mem_type,
-                limit=limit,
-                include_private=include_private,
+        sem_results: list[dict[str, Any]] | None = None
+        # Letta backend (reversible via settings.memory_backend): source semantic
+        # candidates from the Letta vector store, falling back to sqlite-vec on any miss.
+        if settings.memory_backend == "letta":
+            from .letta_adapter import letta_semantic_search
+
+            sem_results = letta_semantic_search(
+                query, mem_type=mem_type, limit=limit, include_private=include_private
             )
+        if sem_results is None:
+            query_embedding = _embed_query(query)
+            if query_embedding is not None:
+                sem_results = _semantic_search(
+                    query_embedding,
+                    mem_type=mem_type,
+                    limit=limit,
+                    include_private=include_private,
+                )
+        if sem_results is not None:
             # Filter by cluster if provided
             if cluster_ids:
                 cluster_id_set = set(cluster_ids)
@@ -1218,6 +1240,21 @@ def archive_memory(mem_id: str) -> None:
         (mem_id,),
     )
     _commit(conn)
+    # Phase 2.2b: mirror the forget into the Letta ledger. At this point the FTS row is
+    # still present (cleanup_archived_fts is a separate lazy pass), so the write-through
+    # re-mirrors the passage carrying status='archived'; the adapter skips archived
+    # passages and the sqlite active-join drops them, so recall stays correct. Fail-safe.
+    _letta_status_write_through(mem_id)
+
+
+def _letta_status_write_through(mem_id: str) -> None:
+    """Fire the Letta write-through for a status/link change. Never raises."""
+    try:
+        from .letta_writer import letta_write_through
+
+        letta_write_through(mem_id)
+    except Exception:
+        log.warning("letta_write_through_hook_failed", mem_id=mem_id)
 
 
 def restore_memory(mem_id: str) -> bool:
@@ -1256,6 +1293,8 @@ def restore_memory(mem_id: str) -> bool:
                     ),
                 )
     _commit(conn)
+    # Phase 2.2b: mirror the restore (status back to 'active') into the Letta ledger.
+    _letta_status_write_through(mem_id)
     return True
 
 
@@ -1290,6 +1329,11 @@ def link_memories(from_id: str, to_id: str, relationship: str) -> bool:
         (from_id, to_id, relationship, now),
     )
     _commit(conn)
+    if cur.rowcount > 0:
+        # Phase 2.2b: a new edge was committed — re-mirror the from_id passage so its
+        # Letta `links` metadata reflects the live graph (the write-through reads
+        # memory_links, not links_json). Fail-safe; only on a genuinely new edge.
+        _letta_status_write_through(from_id)
     return cur.rowcount > 0
 
 
@@ -1671,9 +1715,30 @@ def flag_for_review(
     confidence: float = 0.6,
     source: str = "auto_detection",
 ) -> dict[str, Any]:
-    """Flag a potential correction for agent review."""
+    """Flag a potential correction for agent review.
+
+    One pending row per (mem_id, source): the daily consolidation scan re-detects
+    the same contradictions every run, and unconditional inserts grew the queue
+    unboundedly (3,000+ rows, the same memory flagged 150+ times). Re-flagging an
+    already-pending memory refreshes the existing row instead of adding another.
+    """
     conn = _db()
     now = datetime.now(UTC).isoformat()
+    existing = conn.execute(
+        """SELECT id FROM pending_corrections
+           WHERE mem_id = ? AND source = ? AND status = 'pending'
+           ORDER BY created_at DESC LIMIT 1""",
+        (mem_id, source),
+    ).fetchone()
+    if existing:
+        conn.execute(
+            """UPDATE pending_corrections
+               SET corrected_content = ?, confidence = ?, created_at = ?
+               WHERE id = ?""",
+            (corrected_content, confidence, now, existing["id"]),
+        )
+        _commit(conn)
+        return {"status": "refreshed", "mem_id": mem_id, "confidence": confidence}
     conn.execute(
         """INSERT INTO pending_corrections
            (mem_id, corrected_content, confidence,
@@ -1683,6 +1748,24 @@ def flag_for_review(
     )
     _commit(conn)
     return {"status": "flagged", "mem_id": mem_id, "confidence": confidence}
+
+
+def prune_pending_corrections(retention_days: int = 30) -> int:
+    """Expire pending corrections nobody acted on within *retention_days*.
+
+    A pending correction is a prompt for review, not an archive: if it sat
+    unreviewed for a month it is stale (the scan will re-flag anything still
+    contradictory). Returns the number of rows expired.
+    """
+    conn = _db()
+    cutoff = (datetime.now(UTC) - timedelta(days=retention_days)).isoformat()
+    cur = conn.execute(
+        """UPDATE pending_corrections SET status = 'expired', resolved_at = ?
+           WHERE status = 'pending' AND created_at < ?""",
+        (datetime.now(UTC).isoformat(), cutoff),
+    )
+    _commit(conn)
+    return cur.rowcount
 
 
 def get_pending_corrections(
