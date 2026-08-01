@@ -200,6 +200,7 @@ def _load_priority_memories(query: str = "") -> list[dict[str, Any]]:
         """SELECT m.id, m.type, f.title, f.content,
                   COALESCE(m.importance, 1.0) AS importance,
                   m.updated, COALESCE(m.access_count, 0) AS access_count,
+                  COALESCE(m.last_accessed, '') AS last_accessed,
                   COALESCE(m.tags_json, '[]') AS tags_json
            FROM memory_meta m
            JOIN memory_fts f ON m.id = f.id
@@ -261,14 +262,31 @@ def _load_priority_memories(query: str = "") -> list[dict[str, Any]]:
             # Static fallback: importance 40%, recency 35%, access 25%
             score = 0.40 * imp + 0.35 * rec + 0.25 * freq
 
-        # Type boost: goals and entities are always higher priority for context
-        if r["type"] in ("goal", "entity"):
+        # Access-recency: how recently this memory was actually USED, not
+        # edited. `updated` is a poor staleness signal — dream/cron sessions
+        # keep re-editing dormant memories (project-theo) while core entities
+        # (person-filipe) rarely get edited yet are used constantly. Last
+        # access tracks genuine relevance; lifetime access_count does not decay.
+        acc_rec = _recency_score(r["last_accessed"]) if r["last_accessed"] else 0.0
+
+        # Type boost: goals/entities matter more for context — but for entities
+        # the boost decays toward 1.0 as they go unused, so a dormant entity
+        # stops out-ranking live ones on type alone. Goals stay flat-boosted:
+        # an active goal is relevant regardless of when it was last touched.
+        if r["type"] == "goal":
             score *= 1.3
+        elif r["type"] == "entity":
+            score *= 1.0 + 0.3 * acc_rec
         elif r["type"] == "insight":
             score *= 1.1
 
-        # Floor: high-importance memories never drop below 0.4
-        if r["importance"] >= 1.5:
+        # Floor: protect high-importance memories from dropping out — but ONLY
+        # while they're still in use. Gating on access-recency (not importance
+        # alone) is what lets a stale-but-important memory decay: project-theo
+        # (1.55) loses the floor once unused, while person-filipe (1.99, edited
+        # in May but accessed daily) keeps it. An unconditional floor made
+        # importance a permanent override that recency could never overcome.
+        if r["importance"] >= 1.5 and acc_rec >= 0.3:
             score = max(score, 0.4)
 
         memories.append({
