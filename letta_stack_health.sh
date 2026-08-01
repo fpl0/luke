@@ -74,8 +74,14 @@ code=$(curl -s -o /dev/null -m 5 -w "%{http_code}" http://localhost:8283/v1/heal
 code=$(curl -s -o /dev/null -m 5 -w "%{http_code}" http://localhost:17596/v1/models 2>/dev/null)
 [[ "$code" == "200" ]] || down+=("bridge:17596($code)")
 
+# bge embed server — the archive's embedding endpoint; recall degrades to sqlite
+# silently when it's down (the 2026-08-01 recall-500 morning), so it MUST be probed.
+code=$(curl -s -o /dev/null -m 5 -w "%{http_code}" http://localhost:17595/health 2>/dev/null)
+[[ "$code" == "200" ]] || down+=("bge-embed:17595($code)")
+
+# Ollama — serves the qwen sleeptime consolidation agent, not the archive embeddings.
 code=$(curl -s -o /dev/null -m 5 -w "%{http_code}" http://localhost:11434/api/tags 2>/dev/null)
-[[ "$code" == "200" ]] || down+=("embed:11434($code)")
+[[ "$code" == "200" ]] || down+=("ollama:11434($code)")
 
 # ─── Delta-sync freshness (only meaningful when shadow-run is live) ───
 sync_stale=""
