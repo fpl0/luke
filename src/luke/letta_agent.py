@@ -57,7 +57,7 @@ def _get_core_blocks(agent_id: str, timeout: float = 10.0) -> list[dict[str, Any
     url = f"{settings.letta_base_url}/v1/agents/{agent_id}/core-memory/blocks"
     try:
         req = urllib.request.Request(url, headers={"Accept": "application/json"})
-        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 (localhost)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             blocks = json.load(resp)
         if not isinstance(blocks, list) or not blocks:
             log.warning("letta_core_blocks_empty", agent_id=agent_id)
@@ -72,7 +72,7 @@ def _render_block(block: dict[str, Any]) -> str:
     """Render one core block in Letta's own labelled-block format."""
     label = block.get("label", "block")
     value = (block.get("value") or "").strip()
-    ro = " read_only=\"true\"" if block.get("read_only") else ""
+    ro = ' read_only="true"' if block.get("read_only") else ""
     return f'<block label="{label}"{ro}>\n{value}\n</block>'
 
 
@@ -103,7 +103,7 @@ def build_letta_context(agent_id: str | None = None) -> str | None:
             ordered.append(b)
 
     rendered = "\n\n".join(_render_block(b) for b in ordered)
-    total_chars = sum(len((b.get("value") or "")) for b in ordered)
+    total_chars = sum(len(b.get("value") or "") for b in ordered)
     log.info(
         "letta_context_assembled",
         agent_id=agent_id,
@@ -113,7 +113,8 @@ def build_letta_context(agent_id: str | None = None) -> str | None:
     return (
         "<letta-core-memory>\n"
         "# Always-in-context world model — sourced live from your Letta core memory blocks.\n"
-        "# These self-edit across turns; they are the ground truth, not a per-turn re-injection.\n\n"
+        "# These self-edit across turns; they are the ground truth, not a\n"
+        "# per-turn re-injection.\n\n"
         f"{rendered}\n"
         "</letta-core-memory>"
     )
@@ -149,9 +150,11 @@ def _passage_body(mem_id: str, cap: int) -> str | None:
     from . import memory as _memory
 
     try:
-        row = _memory._db().execute(
-            "SELECT content FROM memory_fts WHERE id = ?", (mem_id,)
-        ).fetchone()
+        row = (
+            _memory._db()
+            .execute("SELECT content FROM memory_fts WHERE id = ?", (mem_id,))
+            .fetchone()
+        )
     except Exception as e:
         log.warning("letta_recall_body_failed", mem_id=mem_id, error=str(e))
         return None
@@ -217,7 +220,8 @@ def build_recall_injection(
         "<retrieved-memories>\n"
         "# Retrieved from your memory for THIS turn (Luke's own recall — FTS5 + semantic +\n"
         "# graph, ranked). These are turn-specific facts from your archive, beyond the\n"
-        "# always-in-context core blocks. Ground your reply in them; cite specifics when relevant.\n\n"
+        "# always-in-context core blocks. Ground your reply in them; cite\n"
+        "# specifics when relevant.\n\n"
         f"{body}\n"
         "</retrieved-memories>"
     )
@@ -251,8 +255,13 @@ def drive_letta_turn(
     """
     agent_id = agent_id or settings.letta_agent_id
     if not agent_id:
-        return {"seconds": 0.0, "reply": "", "tools": [], "injected": False,
-                "error": "no letta_agent_id configured"}
+        return {
+            "seconds": 0.0,
+            "reply": "",
+            "tools": [],
+            "injected": False,
+            "error": "no letta_agent_id configured",
+        }
     msg = compose_letta_turn_input(user_msg) if inject_recall else user_msg
     injected = msg is not user_msg
 
@@ -261,14 +270,21 @@ def drive_letta_turn(
     t0 = _clock()
     try:
         req = urllib.request.Request(
-            url, data=data, method="POST",
+            url,
+            data=data,
+            method="POST",
             headers={"Content-Type": "application/json", "Accept": "application/json"},
         )
-        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 (localhost)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             payload = json.load(resp)
     except Exception as e:
-        return {"seconds": _clock() - t0, "reply": "", "tools": [],
-                "injected": injected, "error": repr(e)[:300]}
+        return {
+            "seconds": _clock() - t0,
+            "reply": "",
+            "tools": [],
+            "injected": injected,
+            "error": repr(e)[:300],
+        }
 
     reply, tools = "", []
     for m in payload.get("messages", []):
@@ -277,13 +293,23 @@ def drive_letta_turn(
             c = m.get("content", "")
             if isinstance(c, list):
                 c = " ".join(x.get("text", "") for x in c if isinstance(x, dict))
-            reply += (c or "")
+            reply += c or ""
         elif mt == "tool_call_message":
             tools.append((m.get("tool_call") or {}).get("name"))
-    log.info("letta_turn", agent_id=agent_id, seconds=round(_clock() - t0, 2),
-             injected=injected, tools=tools)
-    return {"seconds": _clock() - t0, "reply": reply.strip(), "tools": tools,
-            "injected": injected, "error": None}
+    log.info(
+        "letta_turn",
+        agent_id=agent_id,
+        seconds=round(_clock() - t0, 2),
+        injected=injected,
+        tools=tools,
+    )
+    return {
+        "seconds": _clock() - t0,
+        "reply": reply.strip(),
+        "tools": tools,
+        "injected": injected,
+        "error": None,
+    }
 
 
 def compose_letta_turn_input(user_msg: str, *, k: int = 6) -> str:

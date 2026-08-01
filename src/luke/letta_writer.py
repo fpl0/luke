@@ -56,9 +56,7 @@ def _find_passage_ids(surface: str, luke_id: str) -> list[str]:
     to (near-)identical vectors and ranks at the top, so a modest over-fetch + exact
     luke_id filter reliably catches every copy. Returns [] on any failure (create-only).
     """
-    body = json.dumps(
-        {"query": surface[:512], "archive_id": _archive(), "limit": 25}
-    ).encode()
+    body = json.dumps({"query": surface[:512], "archive_id": _archive(), "limit": 25}).encode()
     req = urllib.request.Request(
         f"{_base()}/v1/passages/search",
         data=body,
