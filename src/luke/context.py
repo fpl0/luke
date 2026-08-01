@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import math
 import struct
+from contextlib import suppress
 from datetime import UTC, datetime
 from typing import Any
 
@@ -684,6 +685,9 @@ def audit_compression(
             )
             db.commit()
         except Exception as e:
+            # Roll back so a failed write releases the process-wide write lock.
+            with suppress(Exception):
+                _db().rollback()
             log.warning("compression_audit_persist_failed", error=str(e))
 
     return result
