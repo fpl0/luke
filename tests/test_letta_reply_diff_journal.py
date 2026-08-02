@@ -43,7 +43,8 @@ def rd(tmp_path, monkeypatch):
     sys.modules["letta_reply_diff"] = mod
     spec.loader.exec_module(mod)
     # Redirect every artefact into tmp so the real logs/ are never touched.
-    for name in ("SET_PATH", "RUNS_PATH", "PACK_PATH", "KEY_PATH", "PARTIAL_PATH"):
+    monkeypatch.setattr(mod, "LOGS", str(tmp_path))
+    for name in ("SET_PATH", "RUNS_PATH", "PACK_PATH", "KEY_PATH", "PARTIAL_PATH", "VERDICT_LOG"):
         monkeypatch.setattr(mod, name, str(tmp_path / os.path.basename(getattr(mod, name))))
     return mod
 
@@ -102,3 +103,118 @@ def test_pack_refuses_a_short_runs_file(rd, capsys):
     assert e.value.code == 1
     assert "REFUSING" in capsys.readouterr().out
     assert not os.path.exists(rd.PACK_PATH), "a refused pack must not leave an artefact"
+
+
+# --- provenance: right row count, wrong harness -----------------------------------------
+#
+# The count check above cannot see this class at all. On 2026-08-02 the runs file on disk
+# held 20 rows replayed on Aug-01 21:12Z under the two-tool, unanchored, 2-message-buffer
+# agent, while the set had been rebuilt that morning under the fixed harness. `pack` ran
+# happily and wrote a 49k judge pack with a fresh key: 20 == 20. Judging it would have
+# produced a verdict stamped today that measured the exact harness the re-run exists to
+# replace — and the plan's standing warning ("do NOT re-judge the Aug-01 pack") was the only
+# thing standing between that pack and a number.
+
+
+def _packable(msg_id, sdk="sdk answer " * 5, letta="letta answer " * 5):
+    return {"msg_id": msg_id, "ts": "2026-07-01T10:00:00+00:00", "prompt": f"p{msg_id}",
+            "bucket": "b", "sdk_reply": sdk, "letta_reply": letta, "invalid": None}
+
+
+def _stage(rd, n=3, set_built=SET_BUILT, runs_built=SET_BUILT, stamped=True):
+    with open(rd.SET_PATH, "w") as f:
+        json.dump({"built": set_built, "prompts": [{"msg_id": i} for i in range(n)]}, f)
+    runs = {"ran": "2026-08-02T12:00:00+00:00", "rows": [_packable(i) for i in range(n)]}
+    if stamped:
+        runs["set_built"] = runs_built
+    with open(rd.RUNS_PATH, "w") as f:
+        json.dump(runs, f)
+
+
+def test_pack_refuses_runs_replayed_against_a_previous_set_build(rd, capsys):
+    _stage(rd, runs_built=OLD_BUILT)
+    with pytest.raises(SystemExit) as e:
+        rd.cmd_pack()
+    assert e.value.code == 1
+    out = capsys.readouterr().out
+    assert "REFUSING" in out and OLD_BUILT in out
+    assert not os.path.exists(rd.PACK_PATH), "a refused pack must not leave an artefact"
+
+
+def test_pack_refuses_an_unstamped_runs_file(rd, capsys):
+    """Every runs file written before this guard existed is, by definition, from an old harness."""
+    _stage(rd, stamped=False)
+    with pytest.raises(SystemExit) as e:
+        rd.cmd_pack()
+    assert e.value.code == 1
+    assert "(unstamped)" in capsys.readouterr().out
+    assert not os.path.exists(rd.PACK_PATH)
+
+
+def test_pack_writes_a_stamped_key_when_provenance_matches(rd):
+    _stage(rd)
+    rd.cmd_pack()
+    with open(rd.KEY_PATH) as f:
+        key = json.load(f)
+    assert key["set_built"] == SET_BUILT
+    assert set(key["arms"]) == {"0", "1", "2"}
+
+
+def test_run_stamps_the_set_build_and_pack_then_accepts(rd, monkeypatch):
+    """The write half of the guard, exercised rather than read.
+
+    A guard that refuses everything is not a guard, and the two refusal tests above pass
+    just as happily if `run` never writes the stamp at all — the whole pipeline would simply
+    be dead. Drive `cmd_run` for real against a stubbed turn driver (no OAuth, no live
+    agent) and check the artefact it produces is one `pack` accepts.
+    """
+    from luke import letta_agent
+
+    monkeypatch.setattr(letta_agent, "compose_letta_turn_input",
+                        lambda prompt, as_of=None: f"<mem id=1>ctx</mem>\n{prompt}")
+    monkeypatch.setattr(letta_agent, "drive_letta_turn",
+                        lambda body, inject_recall=True: {"reply": "a real answer " * 8,
+                                                          "seconds": 1.0, "tools": []})
+    prompts = [{"msg_id": i, "ts": "2026-07-01T10:00:00+00:00", "prompt": f"p{i}",
+                "bucket": "b", "sdk_reply": "sdk answer " * 5, "score": 1,
+                "prior_context": []} for i in range(2)]
+    with open(rd.SET_PATH, "w") as f:
+        json.dump({"built": SET_BUILT, "prompts": prompts}, f)
+
+    rd.cmd_run()
+    with open(rd.RUNS_PATH) as f:
+        assert json.load(f)["set_built"] == SET_BUILT
+
+    rd.cmd_pack()  # must NOT raise SystemExit
+    assert os.path.exists(rd.PACK_PATH)
+
+
+def test_score_refuses_a_key_packed_from_different_runs(rd, capsys):
+    """Re-run, forget to re-pack, judge the pack still sitting on disk."""
+    _stage(rd)
+    with open(rd.KEY_PATH, "w") as f:
+        json.dump({"set_built": OLD_BUILT, "arms": {"0": {"A": "sdk", "B": "letta"}}}, f)
+    judgments = str(rd.KEY_PATH) + ".judgments"
+    with open(judgments, "w") as f:
+        json.dump([{"msg_id": 0, "material_divergence": False}], f)
+
+    with pytest.raises(SystemExit) as e:
+        rd.cmd_score(judgments)
+    assert e.value.code == 1
+    assert "REFUSING" in capsys.readouterr().out
+    assert not os.path.exists(rd.VERDICT_LOG), "a refused score must not append a verdict"
+
+
+def test_score_refuses_a_legacy_unstamped_key(rd, capsys):
+    _stage(rd)
+    with open(rd.KEY_PATH, "w") as f:
+        json.dump({"0": {"A": "sdk", "B": "letta", "invalid": None}}, f)
+    judgments = str(rd.KEY_PATH) + ".judgments"
+    with open(judgments, "w") as f:
+        json.dump([{"msg_id": 0, "material_divergence": False}], f)
+
+    with pytest.raises(SystemExit) as e:
+        rd.cmd_score(judgments)
+    assert e.value.code == 1
+    assert "no provenance stamp" in capsys.readouterr().out
+    assert not os.path.exists(rd.VERDICT_LOG)

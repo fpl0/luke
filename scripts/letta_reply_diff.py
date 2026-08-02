@@ -465,7 +465,13 @@ def cmd_run(limit: int | None = None, fresh: bool = False) -> None:
         return
 
     with open(RUNS_PATH, "w") as f:
-        json.dump({"ran": datetime.now(timezone.utc).isoformat(), "rows": rows}, f, indent=2)
+        # set_built is the provenance link back to the harness these replies were produced
+        # under. Without it the runs file is undatable: `pack` could only count rows, and 20
+        # rows replayed in August under a two-tool, unanchored, 2-message-buffer agent look
+        # exactly like 20 rows replayed today. That is not hypothetical — it was the state on
+        # disk when this was written.
+        json.dump({"ran": datetime.now(timezone.utc).isoformat(),
+                   "set_built": set_built, "rows": rows}, f, indent=2)
     os.remove(PARTIAL_PATH)
     print(f"\nwrote {RUNS_PATH}")
     print(f"  valid={len(rows) - n_inv}/{len(rows)}  invalid={n_inv} (count as failures)")
@@ -479,17 +485,38 @@ def _arm_order(msg_id: int) -> tuple[str, str]:
 
 
 def cmd_pack() -> None:
+    if not os.path.exists(RUNS_PATH):
+        # Normal state, not an error condition: `run` deletes nothing but writes RUNS_PATH
+        # only on a complete replay, and stale files from an older lineage are quarantined
+        # rather than left lying around. Say so instead of raising a traceback.
+        print(f"No runs file at {RUNS_PATH} — run `run` to completion first.")
+        sys.exit(1)
     with open(RUNS_PATH) as f:
-        rows = json.load(f)["rows"]
+        runs = json.load(f)
+    rows = runs["rows"]
+
+    with open(SET_PATH) as f:
+        spec = json.load(f)
+    n_set, set_built = len(spec["prompts"]), spec["built"]
 
     # Second half of the partial-run guard. `run` refuses to write RUNS_PATH short, but an
     # older or hand-edited runs file could still be short, and the accept clause (>=18/20) is
     # only meaningful against a full 20. Refuse rather than silently rescale the denominator.
-    with open(SET_PATH) as f:
-        n_set = len(json.load(f)["prompts"])
     if len(rows) != n_set:
         print(f"REFUSING: runs has {len(rows)} row(s), set has {n_set}. "
               f"The accept clause is defined over the whole set — re-run `run` to completion.")
+        sys.exit(1)
+
+    # Third guard, and the one the count check cannot cover: rows from the RIGHT set size but
+    # the WRONG harness. The journal already refuses to resume such rows mid-run; a completed
+    # runs file from an earlier build was still packable, because 20 == 20. The failure is
+    # silent and total — the pack, the key and the verdict all look current, and the gate
+    # reports on the very harness it was rebuilt to replace.
+    runs_built = runs.get("set_built")
+    if runs_built != set_built:
+        print(f"REFUSING: runs were replayed against set build {runs_built or '(unstamped)'}, "
+              f"the set on disk is {set_built}. These replies predate the current harness — "
+              f"re-run `run` (add --fresh if a journal from the old build is present).")
         sys.exit(1)
 
     key, parts = {}, []
@@ -529,15 +556,31 @@ def cmd_pack() -> None:
     with open(PACK_PATH, "w") as f:
         f.write("\n".join(parts))
     with open(KEY_PATH, "w") as f:
-        json.dump(key, f, indent=2)
+        # The key carries the same stamp so `score` can prove the judgments it is unblinding
+        # belong to the runs on disk — a re-run that is judged against the PREVIOUS pack's key
+        # is the same staleness bug one step further down the pipeline.
+        json.dump({"set_built": set_built, "arms": key}, f, indent=2)
     print(f"wrote {PACK_PATH} ({len(rows)} items)  +  {KEY_PATH} (do not read until judged)")
 
 
 def cmd_score(judgments_path: str) -> None:
     with open(RUNS_PATH) as f:
-        rows = {str(r["msg_id"]): r for r in json.load(f)["rows"]}
+        runs = json.load(f)
+    rows = {str(r["msg_id"]): r for r in runs["rows"]}
     with open(KEY_PATH) as f:
-        key = json.load(f)
+        keyfile = json.load(f)
+    # A flat key predates the provenance stamp, so by construction it was written by an older
+    # pack — refuse rather than fall back to reading it, which is the convenient direction.
+    if not isinstance(keyfile, dict) or "arms" not in keyfile:
+        print("REFUSING: key file has no provenance stamp — it was written by an older `pack`. "
+              "Re-run `pack` against the current runs before scoring.")
+        sys.exit(1)
+    if keyfile.get("set_built") != runs.get("set_built"):
+        print(f"REFUSING: key was packed from set build {keyfile.get('set_built')}, runs are "
+              f"from {runs.get('set_built')}. The judgments belong to a different pack — "
+              f"re-run `pack` and re-judge.")
+        sys.exit(1)
+    key = keyfile["arms"]
     with open(judgments_path) as f:
         raw = json.load(f)
     judgments = raw["judgments"] if isinstance(raw, dict) else raw
