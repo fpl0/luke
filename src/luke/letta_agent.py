@@ -162,8 +162,40 @@ def _passage_body(mem_id: str, cap: int) -> str | None:
     return body
 
 
+def _drop_memories_created_after(hits: list[dict], as_of: str) -> list[dict]:
+    """Keep only the hits whose memory already existed at *as_of* (ISO timestamp).
+
+    Used by the 5.1R replay to answer from the archive as it stood at a recorded prompt's
+    moment. Fail-safe in the direction that keeps the gate honest: a hit whose creation time
+    cannot be read is DROPPED, not kept — an unfilterable memory could be a post-cutoff fact,
+    and letting one through would silently reintroduce the anachronism this exists to remove.
+    """
+    from .db import _db
+
+    ids = [h["id"] for h in hits]
+    if not ids:
+        return hits
+    try:
+        rows = _db().execute(
+            f"SELECT id, created FROM memory_meta WHERE id IN ({','.join('?' for _ in ids)})",
+            ids,
+        ).fetchall()
+    except Exception as e:
+        log.warning("letta_recall_as_of_failed", error=str(e))
+        return []
+    created = {r["id"]: r["created"] for r in rows}
+    kept = [h for h in hits if created.get(h["id"]) and str(created[h["id"]]) <= as_of]
+    log.info("letta_recall_as_of", as_of=as_of, hits=len(hits), kept=len(kept))
+    return kept
+
+
 def build_recall_injection(
-    query: str, *, k: int = 6, per_passage_cap: int = 700, total_char_budget: int = 4200
+    query: str,
+    *,
+    k: int = 6,
+    per_passage_cap: int = 700,
+    total_char_budget: int = 4200,
+    as_of: str | None = None,
 ) -> str | None:
     """Retrieve the turn's top-k memories via Luke's recall() and render them for injection.
 
@@ -171,6 +203,18 @@ def build_recall_injection(
     the query is empty, recall returns nothing, or any error occurs (fail-safe — the turn
     then runs on core blocks alone). ``total_char_budget`` caps the whole block so a turn's
     input stays well under the bridge's cached-context ceiling proven in Phase 1.4.
+
+    ``as_of`` (ISO timestamp) restricts retrieval to memories that already existed at that
+    moment. Live turns leave it None and see everything; the 5.1R replay gate sets it to
+    each recorded prompt's own timestamp, so the Letta arm answers from the archive as it
+    stood then rather than from today's. Without it the gate penalises Letta for being
+    *currently right* about facts that post-date the prompt it is replaying.
+
+    Caveat, deliberate and not yet closed: the cutoff is on a memory's *creation* time.
+    Entities updated in place (created in March, rewritten in July) still pass and carry
+    post-cutoff facts in their body. The turn-level anchor in ``compose_letta_turn_input``
+    covers that case behaviourally; a full point-in-time reconstruction would have to
+    replay ``memory_history``.
     """
     query = (query or "").strip()
     if not query:
@@ -179,10 +223,20 @@ def build_recall_injection(
     try:
         from . import memory as _memory
 
-        hits = _memory.recall(query=query, limit=k)
+        # Over-fetch when anchoring, since the cutoff filter below will discard some hits
+        # and the caller still expects up to k passages.
+        hits = _memory.recall(query=query, limit=k * 3 if as_of else k)
     except Exception as e:
         log.warning("letta_recall_injection_failed", error=str(e))
         return None
+
+    if as_of:
+        # NOT recall(before=...): that argument is an *additive* temporal strategy, not a
+        # filter — it unions extra rows into the result set rather than restricting the FTS
+        # and embedding strategies. Verified in memory.py before relying on it. The cutoff
+        # has to be applied here, on creation time, which is the "did this exist yet"
+        # question the replay actually asks.
+        hits = _drop_memories_created_after(hits, as_of)[:k]
 
     if not hits:
         return None
@@ -360,7 +414,7 @@ def drive_letta_turn(
     }
 
 
-def compose_letta_turn_input(user_msg: str, *, k: int = 6) -> str:
+def compose_letta_turn_input(user_msg: str, *, k: int = 6, as_of: str | None = None) -> str:
     """Build the message body to send to the Letta agent for one turn.
 
     Prepends the recall injection (turn-specific archive facts, ranked by Luke's own
@@ -373,7 +427,16 @@ def compose_letta_turn_input(user_msg: str, *, k: int = 6) -> str:
     both call, so the retrieval half of the migration lives in one tested place rather than
     being reconstructed per caller.
     """
-    inj = build_recall_injection(user_msg, k=k)
+    inj = build_recall_injection(user_msg, k=k, as_of=as_of)
+    anchor = ""
+    if as_of:
+        # Belt and braces with the ``before=`` filter above: that drops memories which did
+        # not yet exist, this covers the ones that existed but were later rewritten in place.
+        anchor = (
+            f"[Answer as of {as_of}. Anything dated after that moment has not happened yet — "
+            "if a retrieved memory mentions one, ignore it and answer from what was true then. "
+            'Where you genuinely do not know, say so plainly rather than filling the gap.]\n'
+        )
     if not inj:
-        return user_msg
-    return f"{inj}\n\n[Answer using the retrieved facts above where relevant.]\n{user_msg}"
+        return f"{anchor}{user_msg}" if anchor else user_msg
+    return f"{inj}\n\n{anchor}[Answer using the retrieved facts above where relevant.]\n{user_msg}"

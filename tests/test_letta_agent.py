@@ -117,6 +117,73 @@ def test_injection_recall_error_is_none(test_db: Any, monkeypatch: pytest.Monkey
     assert letta_agent.build_recall_injection("query") is None
 
 
+# --- as_of time anchoring (the 5.1R replay's fairness guarantee) --------------
+
+
+def _seed_at(mem_id: str, created: str) -> None:
+    """Seed a memory and force its creation timestamp, so the cutoff has something to bite."""
+    _seed(mem_id, f"Title {mem_id}", f"body of {mem_id}")
+    from luke.db import _db
+
+    _db().execute("UPDATE memory_meta SET created = ? WHERE id = ?", (created, mem_id))
+    _db().commit()
+
+
+def test_as_of_drops_memories_that_did_not_exist_yet(
+    test_db: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The whole point of the anchor: a fact written after the prompt must not reach the arm.
+
+    Without this the reply-diff gate penalises Letta for being *currently* right about
+    something that had not happened on the day of the prompt it is replaying.
+    """
+    _seed_at("old", "2026-06-01T00:00:00+00:00")
+    _seed_at("future", "2026-07-20T00:00:00+00:00")
+
+    def fake_recall(**kw: Any) -> list[dict[str, Any]]:
+        return [_hit("old"), _hit("future")]
+
+    monkeypatch.setattr(memory, "recall", fake_recall)
+
+    unanchored = letta_agent.build_recall_injection("q")
+    assert unanchored is not None
+    assert '<mem id="old"' in unanchored and '<mem id="future"' in unanchored
+
+    anchored = letta_agent.build_recall_injection("q", as_of="2026-07-01T00:00:00+00:00")
+    assert anchored is not None
+    assert '<mem id="old"' in anchored
+    assert '<mem id="future"' not in anchored
+
+
+def test_as_of_drops_hits_with_unreadable_creation_time(
+    test_db: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fail-safe direction: unfilterable means dropped, never silently kept."""
+
+    def fake_recall(**kw: Any) -> list[dict[str, Any]]:
+        return [_hit("ghost-never-indexed")]
+
+    monkeypatch.setattr(memory, "recall", fake_recall)
+    assert letta_agent.build_recall_injection("q", as_of="2026-07-01T00:00:00+00:00") is None
+
+
+def test_compose_carries_as_of_anchor_even_without_hits(
+    test_db: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The anchor covers entities created early but rewritten in place later, so it must
+    survive the no-injection path rather than riding along with the retrieved block."""
+
+    def fake_recall(**kw: Any) -> list[dict[str, Any]]:
+        return []
+
+    monkeypatch.setattr(memory, "recall", fake_recall)
+    out = letta_agent.compose_letta_turn_input("what's the plan?", as_of="2026-07-01T00:00:00+00:00")
+    assert "Answer as of 2026-07-01T00:00:00+00:00" in out
+    assert "what's the plan?" in out
+    # Live turns pass no anchor and must be byte-identical to before.
+    assert letta_agent.compose_letta_turn_input("what's the plan?") == "what's the plan?"
+
+
 def test_compose_passthrough_when_no_hits(test_db: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     def fake_recall(**kw: Any) -> list[dict[str, Any]]:
         return []

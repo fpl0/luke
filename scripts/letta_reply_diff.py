@@ -71,6 +71,11 @@ LOOKBACK_DAYS = 45
 MIN_PROMPT_CHARS = 25
 MIN_REPLY_CHARS = 180
 MAX_REPLY_GAP_MIN = 20
+# Conversation depth carried into the Letta arm. 8 messages ~ four exchanges, bounded by a
+# 90-minute gap so the walk stops at a session boundary instead of dragging in last night's
+# thread. Applied uniformly to every row — never tuned per prompt.
+PRIOR_TURNS = 8
+PRIOR_GAP_MIN = 90
 
 # Bucket targets — the gate asks for a mix of factual-recall / conversational / action-ish.
 BUCKET_TARGETS = {"factual": 8, "action": 6, "conversational": 6}
@@ -246,10 +251,28 @@ def cmd_build() -> None:
         # "what about now?" to a harness gap rather than to the memory substrate. Applied
         # uniformly to every row (never selectively), and recorded here so a reviewer can
         # see exactly what each arm was given.
+        # Walk back up to PRIOR_TURNS messages in the same chat, stopping at a gap of more
+        # than PRIOR_GAP_MIN — that gap is a session boundary, and dragging yesterday's
+        # thread in would be noise, not context. The first cut of this carried only two
+        # messages (~one exchange), which cost real rows in the Aug-01 run: prompts sitting
+        # deep in a live thread lost state the SDK arm had in its buffer, and the divergence
+        # was scored against the memory substrate rather than against the harness.
         prior = []
-        for j in range(i - 1, max(i - 3, -1), -1):
-            if rows[j][1] == chat:
-                prior.append(f"{rows[j][2]}: {_html_strip(rows[j][3] or '')[:600]}")
+        anchor_ts = ts
+        for j in range(i - 1, -1, -1):
+            if len(prior) >= PRIOR_TURNS:
+                break
+            if rows[j][1] != chat:
+                continue
+            try:
+                if datetime.fromisoformat(anchor_ts) - datetime.fromisoformat(rows[j][4]) > timedelta(
+                    minutes=PRIOR_GAP_MIN
+                ):
+                    break
+            except Exception:
+                break
+            anchor_ts = rows[j][4]
+            prior.append(f"{rows[j][2]}: {_html_strip(rows[j][3] or '')[:600]}")
         cands.append(
             {
                 "msg_id": mid,
@@ -308,12 +331,19 @@ def cmd_run() -> None:
         # Compose recall on the CLEAN prompt (so retrieval is keyed on the real ask, not
         # on the conversation preamble), then prepend the buffer and drive with
         # inject_recall=False so the injection is not built twice.
-        body = compose_letta_turn_input(c["prompt"])
+        # as_of pins the arm to the prompt's own moment: recall is filtered to memories that
+        # already existed, and the composed body carries an explicit "answer as of" anchor
+        # for entities that existed but were later rewritten in place. Without this the SDK
+        # arm is a recording from the prompt's date while the Letta arm answers from today,
+        # and Letta gets marked down for correctly knowing things that had not happened yet.
+        body = compose_letta_turn_input(c["prompt"], as_of=c["ts"])
         # Tracked here rather than read off the turn result: driving with
         # inject_recall=False means drive_letta_turn always reports injected=False, so the
         # guard has to observe the composition itself. This is the check that proves the
-        # retrieval half fired instead of the turn coasting on core blocks alone.
-        injected = body != c["prompt"]
+        # retrieval half fired instead of the turn coasting on core blocks alone. Detect the
+        # injection marker specifically — a `body != prompt` comparison would now be
+        # satisfied by the as_of anchor alone and would silently stop testing retrieval.
+        injected = "<mem id=" in body
         prior = c.get("prior_context") or []
         if prior:
             body = "[Recent conversation, for context:]\n" + "\n".join(prior) + "\n\n" + body
