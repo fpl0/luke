@@ -85,6 +85,35 @@ def reset_buffer() -> bool:
         return False
 
 
+def check_context_window() -> str | None:
+    """Fail loudly when the agent's declared context_window does not fit its model.
+
+    This is a preflight, not a nicety. The agent ran with ``context_window: 32000`` on a
+    Sonnet model until 2026-08-02 — a value copied from the qwen3:8b config, correct there
+    and badly wrong here. Nothing errored; Letta simply evicted the oldest messages
+    mid-turn to stay under the limit, which silently deleted the agent's own tool findings
+    while it was still investigating and produced empty replies.
+
+    A wrong-but-plausible number that degrades behaviour instead of raising is exactly the
+    class of defect a gate should catch, so the gate refuses to report a verdict until it
+    is right: a green scored under a truncating context window would be measuring the
+    wrong system.
+
+    Returns None when healthy, else a description of the problem.
+    """
+    try:
+        with urllib.request.urlopen(f"{LETTA}/v1/agents/{AGENT}", timeout=60) as resp:
+            cfg = json.load(resp).get("llm_config") or {}
+    except Exception as e:
+        return f"could not read the agent's llm_config: {e!r}"
+    model, window = str(cfg.get("model", "")), int(cfg.get("context_window") or 0)
+    # Only Claude-backed agents are held to this; the qwen sleeptime agent is legitimately 32K.
+    if "claude" in model.lower() and window < 100_000:
+        return (f"model {model!r} declares context_window={window:,}, which truncates it. "
+                f"Expected >=100,000 — see scripts/letta_luke_on_claude.py")
+    return None
+
+
 def _git_head() -> tuple[str, str]:
     """The current HEAD short-sha and subject — ground truth for the git turn."""
     r = subprocess.run(["git", "-C", REPO, "--no-pager", "log", "--oneline", "-1"],
@@ -189,6 +218,12 @@ def _build_cases() -> list[dict]:
 
 def main() -> int:
     from luke.letta_agent import drive_letta_turn
+
+    bad_window = check_context_window()
+    if bad_window:
+        print(f"PREFLIGHT FAIL: {bad_window}")
+        print("VERDICT: FAIL (not run — the agent is misconfigured)")
+        return 1
 
     cases = _build_cases()
     print(f"driving {len(cases)} live turns through drive_letta_turn "

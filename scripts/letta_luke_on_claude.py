@@ -23,11 +23,21 @@ HUMAN = (
 )
 
 # LLM config points at the Claude bridge (OpenAI-compatible), NOT ollama/qwen.
+#
+# context_window MUST track the model. This said 32000 until 2026-08-02 — copied verbatim
+# from the qwen3:8b config, where it was correct, into a Sonnet agent where it is not.
+# The symptom was subtle and expensive: with the read-tool surface attached, four or five
+# 8000-char tool returns overflow 32K, so Letta evicted the *earliest* messages mid-turn
+# ("18 messages have been hidden from view due to memory constraints") — throwing away the
+# agent's own findings while it was still investigating. It then re-read the same files to
+# recover them, burned the whole step budget, and returned an EMPTY reply. In production
+# that is silence in Telegram, which is exactly Filipe's complaint on 26 July ("sometimes
+# I don't even get an answer").
 llm_cfg = {
     "model": "claude-sonnet-4-6",
     "model_endpoint_type": "openai",
     "model_endpoint": "http://localhost:17596/v1",
-    "context_window": 32000,
+    "context_window": 200000,
 }
 emb_cfg = {
     "embedding_endpoint_type": "openai",
