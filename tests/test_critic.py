@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 from collections.abc import AsyncIterator
+from datetime import UTC, date, datetime
 from typing import Any
 
 import pytest
@@ -13,6 +14,7 @@ from luke import critic
 from luke.critic import (
     _FRESHNESS_SYSTEM_PROMPT,
     CriticVerdict,
+    _critic_system_prompt,
     _parse_verdict,
     check_freshness,
     critique_outbound,
@@ -350,3 +352,47 @@ class TestCheckFreshness:
         monkeypatch.setattr(critic, "query", _make_fake_query("DECISION: pass"))
         v = await check_freshness("Anything to talk about?", [])
         assert v.decision == "pass"
+
+
+# ---------------------------------------------------------------------------
+# Critic system prompt — date grounding
+# ---------------------------------------------------------------------------
+
+
+class TestCriticSystemPrompt:
+    """The critic must not adjudicate a calendar it cannot see.
+
+    Regression: on 2026-08-02 the critic revised a correct "Sunday, 2 August"
+    to "Saturday" from parametric memory, vetoing a morning briefing that the
+    deterministic weekday gate had already cleared.
+    """
+
+    def test_binds_today_and_weekday(self) -> None:
+        p = _critic_system_prompt(date(2026, 8, 2))
+        assert "2026-08-02" in p
+        assert "Sunday" in p
+
+    def test_forbids_flagging_weekday_date_pairs(self) -> None:
+        p = _critic_system_prompt(date(2026, 8, 2))
+        assert "Never flag a weekday as wrong for its date" in p
+
+    def test_defaults_to_current_date(self) -> None:
+        p = _critic_system_prompt()
+        today = datetime.now(UTC).date()
+        assert today.isoformat() in p
+        assert today.strftime("%A") in p
+
+    async def test_outbound_critic_prompt_carries_the_date(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        seen: list[str] = []
+
+        async def fake_collect(prompt: str, system_prompt: str) -> str:
+            seen.append(system_prompt)
+            return "DECISION: pass"
+
+        monkeypatch.setattr(critic, "_collect_text", fake_collect)
+        v = await critique_outbound("Morning — Sunday, 2 August.", {"tool": "send_message"})
+        assert v.decision == "pass"
+        assert len(seen) == 1
+        assert datetime.now(UTC).date().isoformat() in seen[0]

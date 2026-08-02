@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import re
 from dataclasses import dataclass
+from datetime import UTC, date, datetime
 from typing import Any
 
 import structlog
@@ -30,7 +31,7 @@ from .config import settings
 log: BoundLogger = structlog.get_logger()
 
 
-_CRITIC_SYSTEM_PROMPT = (
+_CRITIC_SYSTEM_TEMPLATE = (
     "You are a critic for outgoing messages from Luke, a personal AI agent.\n"
     "Luke's voice: warm, unhurried, sometimes wry. Never customer-service.\n"
     'Never "Great question!" or "Absolutely!" or "I apologize for the inconvenience".\n'
@@ -40,7 +41,26 @@ _CRITIC_SYSTEM_PROMPT = (
     "(**bold**, *italic*, `code`) is WRONG and shows as literal characters. "
     "Never tell Luke to use markdown or that HTML 'won't render' — the reverse "
     "is true. Do not flag well-formed HTML tags as a formatting problem.\n"
+    "DATES: today is {today} ({weekday}). Weekday/date pairs are already "
+    "verified against the calendar by a deterministic gate that runs BEFORE "
+    "you and blocks any mismatch — so every pair you see has already passed. "
+    "Never flag a weekday as wrong for its date; you do not have a calendar "
+    "and would be guessing over a check that does.\n"
 )
+
+
+def _critic_system_prompt(today: date | None = None) -> str:
+    """Critic system prompt with today's date bound in.
+
+    The date is injected rather than left to the model: on 2026-08-02 the
+    critic revised a correct "Sunday, 2 August" to "Saturday" from parametric
+    memory alone, vetoing a send that the deterministic weekday gate had
+    already cleared. A critic with no calendar must not adjudicate calendars.
+    """
+    d = today or datetime.now(UTC).date()
+    return _CRITIC_SYSTEM_TEMPLATE.format(
+        today=d.isoformat(), weekday=d.strftime("%A")
+    )
 
 
 _CRITIC_USER_TEMPLATE = (
@@ -121,7 +141,7 @@ def _parse_verdict(raw: str) -> CriticVerdict:
     return CriticVerdict(decision, reason)
 
 
-async def _collect_text(prompt: str, system_prompt: str = _CRITIC_SYSTEM_PROMPT) -> str:
+async def _collect_text(prompt: str, system_prompt: str) -> str:
     """Run the SDK query and concatenate assistant text blocks."""
     options = ClaudeAgentOptions(
         model=settings.critic_model,
@@ -158,7 +178,7 @@ async def critique_outbound(text: str, context: dict[str, Any]) -> CriticVerdict
     prompt = _CRITIC_USER_TEMPLATE.format(text=text)
     try:
         raw = await asyncio.wait_for(
-            _collect_text(prompt),
+            _collect_text(prompt, system_prompt=_critic_system_prompt()),
             timeout=settings.critic_timeout_s,
         )
     except TimeoutError:
