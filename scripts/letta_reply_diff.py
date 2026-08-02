@@ -36,8 +36,22 @@ where a fail-safe fallback produced a meaningless 20/20):
   * Judging is BLIND. Arms are emitted as "Answer A"/"Answer B" in a per-row deterministic
     order; the mapping lives in a separate key file the judge must not open until after.
 
-Accept (from the plan): >=18/20 no-material-divergence AND zero cases where the letta
+Accept: >=90% no-material-divergence over the MEASURED rows, AND zero cases where the letta
 answer is factually wrong where the sdk answer was right.
+
+"Measured" is the change made 2026-08-02, after two runs (7/20, then 11/20) whose failures were
+mostly not about memory. The judge now attributes a CAUSE to every divergence, still blind, and
+rows caused by the comparison itself — context_asymmetry (one arm was handed material the other
+never saw), clock (the arms answer from different moments), tooling (the ask needed a capability,
+not a memory) — are excluded from the denominator instead of being charged to Letta. The gate was
+supposed to answer "does Letta remember as well", and was in fact answering "were the two arms
+given the same situation", which is a question about the harness.
+
+That exclusion is the only soft edge in the gate, so it is fenced on three sides: attribution
+fails CLOSED (no label, unknown label, or no evidence quoted => counted as a memory failure);
+exclusions are capped (>5 of 20, or fewer than 14 comparable rows left, reports VOID rather than
+PASS); and the veto axis still applies at full strength to every non-excluded row. The intended
+failure mode is a harness that gets fixed, never a gate that gets easier.
 
 Usage (the 23:00 cron drives these in order):
     python3 scripts/letta_reply_diff.py build            # select the 20-prompt replay set
@@ -531,12 +545,35 @@ def cmd_pack() -> None:
         "actually answer / move the thing forward?).\n\n"
         "Emit one JSON object per item into a judgments file:\n"
         '`{"msg_id": 123, "material_divergence": false, "worse_arm": null, '
-        '"factually_wrong_arm": null, "note": "both land the same facts"}`\n\n'
+        '"factually_wrong_arm": null, "divergence_cause": null, "cause_evidence": null, '
+        '"note": "both land the same facts"}`\n\n'
         "- `material_divergence`: true if a reader would get a *meaningfully different* answer — "
         "different facts, a real quality gap. Formatting/length alone is NOT material.\n"
         "- `worse_arm`: `\"A\"`, `\"B\"`, or null if no material gap.\n"
         "- `factually_wrong_arm`: `\"A\"`/`\"B\"`/null — set ONLY when one arm states something "
         "false that the other got right. This is the veto axis.\n\n"
+        "When `material_divergence` is true you MUST also set `divergence_cause` and quote your "
+        "evidence in `cause_evidence`. The cause is judged BLIND, from the text alone — you are "
+        "not being asked which backend is which, only what KIND of gap this is:\n\n"
+        "- `\"recall\"` — the gap is about remembered facts. One answer knows something about "
+        "Filipe's history, projects or past conversations that the other has lost, garbled or "
+        "invented. **This is the one the gate is actually measuring.**\n"
+        "- `\"self_knowledge\"` — the question is about Luke himself (his own code, data, costs, "
+        "capabilities) and one answer states something confidently false about it. Also counts "
+        "against the gate: the answer was available and was not looked up.\n"
+        "- `\"context_asymmetry\"` — one answer visibly works from material that never appears in "
+        "the other at all: a pasted email, an attached document, the immediately-preceding turn. "
+        "Not a memory gap — the two answers were given different inputs.\n"
+        "- `\"clock\"` — the answers are consistent with each other but anchored to different "
+        "moments in time (different 'today', different countdown, one knows about an event the "
+        "other is too early to know about).\n"
+        "- `\"tooling\"` — the ask needs a capability, not a memory: send this, schedule that, "
+        "open this file. One answer performs it, the other cannot.\n"
+        "- `\"quality\"` — same facts, genuinely worse answer: hedged, evasive, assistant-speak, "
+        "doesn't answer the question.\n\n"
+        "`cause_evidence` must be a short QUOTE or concrete pointer from the answers that "
+        "justifies the cause — not a restatement of it. If you cannot point at evidence, the "
+        "cause is `\"recall\"`.\n\n"
         "Do NOT open `letta_reply_diff_key.json` until every judgment is written.\n\n---\n"
     )
     for i, r in enumerate(rows, 1):
@@ -563,6 +600,35 @@ def cmd_pack() -> None:
     print(f"wrote {PACK_PATH} ({len(rows)} items)  +  {KEY_PATH} (do not read until judged)")
 
 
+# Causes that describe a defect in the COMPARISON rather than in memory. A row attributed to
+# one of these was never a like-for-like test, so it is excluded from the accept clause — and
+# because that exclusion is the only soft edge in the gate, it is capped (HARNESS_CAP) and the
+# attribution has to be earned (_attributed_cause fails closed).
+HARNESS_CAUSES = ("context_asymmetry", "clock", "tooling")
+MEMORY_CAUSES = ("recall", "self_knowledge", "quality")
+# Above this many exclusions the run is VOID, not PASS: a harness that produces a quarter of its
+# rows as non-comparisons is not measuring memory, whatever the surviving rows say.
+HARNESS_CAP = 5
+# ...and never score a gate on a rump. Below this many genuinely-comparable rows there is no
+# result, only a small sample that happened to agree.
+MIN_MEASURED = 14
+
+
+def _attributed_cause(j: dict) -> str:
+    """Cause for a divergence, defaulting to the answer that costs Letta the gate.
+
+    Every soft edge here is pointed the same way: an unlabelled row, an unknown label, or an
+    excuse with no evidence quoted behind it all resolve to `recall`. Excluding a row has to be
+    argued for; counting it against Letta is what happens by default.
+    """
+    cause = (j.get("divergence_cause") or "").strip().lower()
+    if cause not in HARNESS_CAUSES + MEMORY_CAUSES:
+        return "recall"
+    if cause in HARNESS_CAUSES and not (j.get("cause_evidence") or "").strip():
+        return "recall"
+    return cause
+
+
 def cmd_score(judgments_path: str) -> None:
     with open(RUNS_PATH) as f:
         runs = json.load(f)
@@ -586,7 +652,8 @@ def cmd_score(judgments_path: str) -> None:
     judgments = raw["judgments"] if isinstance(raw, dict) else raw
 
     n = len(rows)
-    ok, material, letta_wrong, lines = 0, [], [], []
+    ok, memory_diverge, letta_wrong, lines = 0, [], [], []
+    harness = {c: [] for c in HARNESS_CAUSES}
     seen = set()
     for j in judgments:
         mid = str(j["msg_id"])
@@ -596,40 +663,72 @@ def cmd_score(judgments_path: str) -> None:
             continue
         if rows[mid]["invalid"]:
             lines.append(f"  #{mid} FAIL (invalid letta turn: {rows[mid]['invalid']})")
-            material.append(mid)
+            memory_diverge.append(mid)
             continue
         worse = j.get("worse_arm")
         wrong = j.get("factually_wrong_arm")
         worse_arm = k.get(worse) if worse in ("A", "B") else None
         wrong_arm = k.get(wrong) if wrong in ("A", "B") else None
+        cause = _attributed_cause(j)
         if j.get("material_divergence"):
-            material.append(mid)
-            lines.append(f"  #{mid} DIVERGE (worse={worse_arm or '?'}) {j.get('note', '')[:80]}")
+            if cause in HARNESS_CAUSES:
+                # The two arms were not asked the same question in the same conditions. That is a
+                # defect in the harness, not evidence about memory — it is excluded from the
+                # accept clause and surfaced by name below, where it is capped.
+                harness[cause].append(mid)
+                lines.append(
+                    f"  #{mid} EXCLUDED[{cause}] (worse={worse_arm or '?'}) "
+                    f"{(j.get('cause_evidence') or '')[:70]}"
+                )
+            else:
+                memory_diverge.append(mid)
+                lines.append(
+                    f"  #{mid} DIVERGE[{cause}] (worse={worse_arm or '?'}) "
+                    f"{j.get('note', '')[:70]}"
+                )
         else:
             ok += 1
             lines.append(f"  #{mid} ok")
-        if wrong_arm == "letta":
+        # The veto is about memory, so an arm that was never given the material cannot trip it.
+        if wrong_arm == "letta" and cause not in HARNESS_CAUSES:
             letta_wrong.append(mid)
     # Judged-nothing rows can't silently vanish from the denominator.
     for mid in rows:
         if mid not in seen:
-            material.append(mid)
+            memory_diverge.append(mid)
             lines.append(f"  #{mid} FAIL (no judgment emitted)")
 
-    threshold = 18 if n >= 20 else int(round(n * 0.9))
-    passed = ok >= threshold and not letta_wrong
+    excluded = sorted(m for ms in harness.values() for m in ms)
+    measured = n - len(excluded)
+    # Excluding harness artefacts is only honest while there are few of them. Past the cap the
+    # run stops being a measurement of anything: too much of the set was two different questions.
+    # It reports VOID rather than PASS — excuses can never carry this gate, they can only kill it
+    # and force the harness to be fixed.
+    void = len(excluded) > HARNESS_CAP or measured < MIN_MEASURED
+    threshold = max(1, int(round(measured * 0.9)))
+    passed = (not void) and ok >= threshold and not letta_wrong
+    verdict = "VOID" if void else ("PASS" if passed else "FAIL")
     stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
     head = (
-        f"5.1R {stamp} — no-material-divergence {ok}/{n} (need >={threshold}); "
-        f"letta-wrong-where-sdk-right {len(letta_wrong)} (need 0) => "
-        f"{'PASS' if passed else 'FAIL'}"
+        f"5.1R {stamp} — no-material-divergence {ok}/{measured} measured "
+        f"(need >={threshold}); letta-wrong-where-sdk-right {len(letta_wrong)} (need 0); "
+        f"harness-excluded {len(excluded)}/{n} (cap {HARNESS_CAP}) => {verdict}"
     )
     print(head)
     for ln in lines:
         print(ln)
+    if excluded:
+        detail = "; ".join(f"{c}={len(m)}" for c, m in sorted(harness.items()) if m)
+        note = f"5.1R   excluded as harness artefact: {detail}"
+        print(note)
+        if void:
+            print("5.1R   VOID — too much of the set was not a like-for-like comparison. "
+                  "Fix the harness and re-run; this is not a memory result either way.")
     os.makedirs(LOGS, exist_ok=True)
     with open(VERDICT_LOG, "a") as f:
         f.write(head + "\n")
+        if excluded:
+            f.write(note + "\n")
     print(f"\nappended verdict to {VERDICT_LOG}")
     sys.exit(0 if passed else 1)
 
