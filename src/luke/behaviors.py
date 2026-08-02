@@ -13,7 +13,7 @@ import structlog
 from aiogram import Bot
 from structlog.stdlib import BoundLogger
 
-from . import attention, db, memory
+from . import attention, db, memory, work_claim
 from .agent import AgentResult, run_agent, send_long_message
 from .bus import bus
 from .config import settings
@@ -752,6 +752,8 @@ async def run_deep_work(bot: Bot, sem: asyncio.Semaphore) -> None:
     skipped_goals: list[str] = []
     reflexion_goals: list[str] = []  # goals that triggered reflexion before proceeding
     active_goal_ids: list[str] = []  # goals actually entering this session
+    claims: list[work_claim.Claim] = []  # goals this session holds; released in finally
+    peer_held: list[str] = []  # goals a live sibling session is already building
     for g in goals:
         gid = g["id"]
 
@@ -773,18 +775,49 @@ async def run_deep_work(bot: Bot, sem: asyncio.Semaphore) -> None:
             reflexion_goals.append(gid)
 
         body = read_memory_body(g["type"], g["id"], 1000)
-        if body:
-            goal_sections.append(f"[{gid}]:\n{body}")
-            active_goal_ids.append(gid)
+        if not body:
+            continue
+
+        # Yield goals a live sibling session is already building. The scheduler
+        # dedups per TASK id (docs/concurrency.md), which never fires here: the
+        # dedicated build crons, this tick and the Sunday audit are different
+        # tasks driving the SAME goal, so two sessions end up editing the same
+        # files. Until now the claim was only advisory prompt text inside three
+        # cron prompts — enforcement depended on an agent remembering to run
+        # step 0, and nothing at all covered this path. Observed 2026-08-02
+        # 11:07Z: this tick woke 7 minutes into the 11:00 build cron's session
+        # and was one Edit away from clobbering a plan file the peer had open.
+        # Claiming here (rather than only peeking) also makes the mechanism
+        # symmetric — a build cron now yields to a running deep-work session
+        # instead of walking into it.
+        c = work_claim.claim(gid, holder="deep_work tick")
+        if c is None:
+            peer_held.append(gid)
+            continue
+        claims.append(c)
+        goal_sections.append(f"[{gid}]:\n{body}")
+        active_goal_ids.append(gid)
 
     if skipped_goals:
         log.info("deep_work_goals_skipped", skipped=skipped_goals)
 
     if not goal_sections:
+        if peer_held:
+            # Every eligible goal is being built right now. Deliberately do NOT
+            # fall back to attention-pin work: the pins point at these same
+            # goals, so the fallback would send a second session into the exact
+            # work we just yielded on. A wasted session is the cheap outcome
+            # here; the expensive one is two sessions racing the same files.
+            bus.emit("deep_work_skipped", {"reason": "all_goals_claimed", "goals": peer_held})
+            log.info("deep_work_yielded_to_peer", goals=peer_held)
+            return
         if await _run_attention_deep_work(bot, sem, reason="all_goals_filtered"):
             return
         bus.emit("deep_work_skipped", {"reason": "all_goals_filtered"})
         return
+
+    if peer_held:
+        log.info("deep_work_partial_yield", peer_held=peer_held, proceeding=active_goal_ids)
 
     # Check for existing work plans
     plans_dir = settings.workspace_dir / "plans"
@@ -952,45 +985,59 @@ async def run_deep_work(bot: Bot, sem: asyncio.Semaphore) -> None:
         "🔨 Deep work session starting — goals on deck: " + ", ".join(active_goal_ids),
     )
 
-    result = await _run_behavior(
-        "deep_work",
-        prompt,
-        bot,
-        sem,
-        model=settings.deep_work_model,  # always opus for coding/building
-        max_turns=settings.deep_work_max_turns,
-        max_sends=1,
-        timeout=settings.deep_work_timeout,
-        goals_reviewed=len(goals),
-    )
+    # The finally covers the whole session — the window that actually matters,
+    # since a claim held past the work is what lets a peer walk in. An exception
+    # in the prompt-building above would leak a claim until its TTL instead;
+    # that direction is self-healing (peers yield, the TTL reclaims) so it is
+    # left to the TTL rather than widened into a 200-line try block.
+    try:
+        result = await _run_behavior(
+            "deep_work",
+            prompt,
+            bot,
+            sem,
+            model=settings.deep_work_model,  # always opus for coding/building
+            max_turns=settings.deep_work_max_turns,
+            max_sends=1,
+            timeout=settings.deep_work_timeout,
+            goals_reviewed=len(goals),
+        )
 
-    elapsed = time.monotonic() - started_mono
-    mins = max(1, int(elapsed / 60))
-    if result is None:
-        # Distinguish "ran out of wall clock" from "actually broke" — they need
-        # very different responses, and conflating them hid a pure timeout as a
-        # crash (Filipe asked which it was, 2026-08-02).
-        if elapsed >= settings.deep_work_timeout * 0.95:
-            reason = (
-                f"hit its {int(settings.deep_work_timeout / 60)}m time ceiling after {mins}m "
-                "(work up to that point is saved)"
-            )
-        else:
-            reason = f"errored after {mins}m"
-        await _notify(bot, f"⚠️ Deep work session {reason} — it will retry next cycle.")
-        return
+        elapsed = time.monotonic() - started_mono
+        mins = max(1, int(elapsed / 60))
+        if result is None:
+            # Distinguish "ran out of wall clock" from "actually broke" — they need
+            # very different responses, and conflating them hid a pure timeout as a
+            # crash (Filipe asked which it was, 2026-08-02).
+            if elapsed >= settings.deep_work_timeout * 0.95:
+                reason = (
+                    f"hit its {int(settings.deep_work_timeout / 60)}m time ceiling "
+                    f"after {mins}m (work up to that point is saved)"
+                )
+            else:
+                reason = f"errored after {mins}m"
+            await _notify(bot, f"⚠️ Deep work session {reason} — it will retry next cycle.")
+            return
 
-    lines = [f"✅ Deep work session done ({mins}m)."]
-    for gid in active_goal_ids:
-        before, after = statuses_before.get(gid), _parse_plan_status(gid)
-        if after == "completed" and before != "completed":
-            lines.append(f"🎉 {gid} is COMPLETE.")
-        elif after != before:
-            lines.append(f"{gid}: plan {before or 'none'} → {after or 'none'}")
-    summary = _latest_deep_work_summary(started_iso)
-    if summary:
-        lines.append(summary)
-    await _notify(bot, "\n".join(lines))
+        lines = [f"✅ Deep work session done ({mins}m)."]
+        for gid in active_goal_ids:
+            before, after = statuses_before.get(gid), _parse_plan_status(gid)
+            if after == "completed" and before != "completed":
+                lines.append(f"🎉 {gid} is COMPLETE.")
+            elif after != before:
+                lines.append(f"{gid}: plan {before or 'none'} → {after or 'none'}")
+        summary = _latest_deep_work_summary(started_iso)
+        if summary:
+            lines.append(summary)
+        await _notify(bot, "\n".join(lines))
+    finally:
+        for c in claims:
+            # Only release a claim we really own. A fail-open claim carries an
+            # empty token, and release() reads an empty token as "force" — so
+            # releasing one would unlink whatever claim file is there, which
+            # could be a live peer's. Same guard as work_claim.claimed().
+            if c.token:
+                work_claim.release(c.goal_id, c.token)
 
 
 async def run_feedback_consolidation(bot: Bot, sem: asyncio.Semaphore) -> None:

@@ -69,10 +69,31 @@ from .config import settings
 
 log = structlog.get_logger()
 
-# A deep-work session runs ~30 min (the 2026-08-01 01:03Z session was killed by a 30-minute
-# watchdog). 45 min leaves headroom for a slow-but-healthy session without letting a crashed
-# one sit on the goal for long.
-DEFAULT_TTL_SECONDS = 2700
+# The TTL has to outlive the session it protects, so it is DERIVED from the session ceiling
+# rather than guessed. The first cut hardcoded 2700 ("a deep-work session runs ~30 min — the
+# 2026-08-01 01:03Z session was killed by a 30-minute watchdog"), and that assumption expired
+# within a day: commit 6abfe45 raised `deep_work_timeout` to 5400. The constant stayed 2700,
+# so every claim silently stopped covering the second half of the session it was taken for —
+# at minute 45 the goal reads FREE and a peer walks straight into the running session. That is
+# the exact collision this module exists to prevent, merely delayed by 45 minutes.
+#
+# The cost of the fix is one-sided and worth paying: a session that dies WITHOUT releasing
+# sits on its goal for ~95 min instead of ~45. That failure is safe (a peer yields and does
+# something else) and only reachable on the CLI path, where no pid is recorded — in-process
+# callers record a real pid, so a crash is detected immediately regardless of TTL. Being
+# robbed mid-session is the unsafe direction, and it already cost 1,245 uncommitted lines.
+_TTL_MARGIN_SECONDS = 300
+
+
+def default_ttl_seconds() -> int:
+    """Claim lifetime: the deep-work session ceiling plus a margin."""
+    try:
+        return int(settings.deep_work_timeout) + _TTL_MARGIN_SECONDS
+    except Exception:  # pragma: no cover - settings is always readable in practice
+        return 5700
+
+
+DEFAULT_TTL_SECONDS = default_ttl_seconds()
 
 _SAFE_ID = re.compile(r"[^A-Za-z0-9._-]")
 
@@ -246,13 +267,24 @@ def claim(
 
 
 def release(goal_id: str, token: str) -> bool:
-    """Release a claim. Only the holder's token can release it; True if it was removed."""
+    """Release a claim. Only the holder's token can release it; True if it was removed.
+
+    An EMPTY token is refused rather than treated as a force-unlink. The only thing that
+    produces a token-less claim is the fail-open path, which never wrote a claim file — so
+    "release" from such a holder would delete whatever claim happens to be there, quite
+    possibly a live peer's, turning a defensive fallback into the collision this module
+    exists to prevent. Two call sites already had to remember that guard themselves; the
+    trap belongs here instead.
+    """
     try:
+        if not token:
+            log.info("work_claim_release_no_token", goal_id=goal_id)
+            return False
         path = _claim_path(goal_id)
         rec = _read(path)
         if not rec:
             return False
-        if token and rec.get("token") != token:
+        if rec.get("token") != token:
             log.info("work_claim_release_rejected", goal_id=goal_id)
             return False
         os.unlink(path)

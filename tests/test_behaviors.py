@@ -562,7 +562,11 @@ class TestRunDeepWork:
         # Deep work is non-urgent — must not draw from the attention reserve
         assert not call_kwargs.get("urgent", False)
 
-    async def test_agent_exception_handled(self) -> None:
+    async def test_agent_exception_handled(self, tmp_settings: Any) -> None:
+        # tmp_settings is required, not decorative: run_deep_work now takes a work
+        # claim, and work_claim reads the REAL settings singleton (patching
+        # luke.behaviors.settings does not reach it), so without this the test
+        # would write claim files into the live store.
         from luke.behaviors import run_deep_work
 
         with (
@@ -611,6 +615,138 @@ class TestRunDeepWork:
             await run_deep_work(AsyncMock(), _SEM)
 
         mock_agent.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Deep work yields to a live peer session on the same goal
+# ---------------------------------------------------------------------------
+
+
+class TestDeepWorkPeerYield:
+    """The 2026-08-02 11:07Z collision: a deep-work tick woke 7 minutes into the
+    11:00 build cron's session, both driving goal-letta-parity. Per-task-id dedup
+    does not see it, and the claim was only advisory prompt text in three cron
+    prompts — nothing covered this path.
+    """
+
+    def _goal(self, tmp_settings: Any, gid: str = "g1") -> dict[str, Any]:
+        (tmp_settings.memory_dir / "goals").mkdir(parents=True, exist_ok=True)
+        (tmp_settings.memory_dir / "goals" / f"{gid}.md").write_text(
+            f"---\nid: {gid}\ntype: goal\n---\n\n# {gid}\n\nShip it"
+        )
+        return {"id": gid, "type": "goal", "title": gid, "score": 1.0}
+
+    async def test_peer_held_goal_is_not_built(self, tmp_settings: Any) -> None:
+        from luke import work_claim
+        from luke.behaviors import run_deep_work
+
+        tmp_settings.store_dir.mkdir(parents=True, exist_ok=True)
+        peer = work_claim.claim("g1", holder="cron 11:00 build")
+        assert peer is not None
+
+        goals = [self._goal(tmp_settings)]
+        with (
+            patch("luke.behaviors.db") as mock_db,
+            patch("luke.behaviors.bus"),
+            patch("luke.behaviors.memory") as mock_memory,
+            patch("luke.behaviors.attention") as mock_attention,
+            patch("luke.behaviors.run_agent", new_callable=AsyncMock) as mock_agent,
+            patch("luke.behaviors.send_long_message", new_callable=AsyncMock),
+        ):
+            mock_db.get_quality_blocked_goals.return_value = []
+            mock_db.get_recent_quality_scores.return_value = []
+            mock_memory.recall.return_value = goals
+            mock_attention.list_attention.return_value = [
+                {"id": "32", "content": "LETTA — build continues", "origin": "luke"}
+            ]
+            await run_deep_work(AsyncMock(), _SEM)
+
+        mock_agent.assert_not_called()
+        # And specifically NOT via the attention fallback: the pins point at the
+        # same goal, so falling back would re-enter the work we just yielded on.
+        mock_attention.list_attention.assert_not_called()
+        assert work_claim.current("g1") is not None, "the peer's claim must survive"
+
+    async def test_free_goal_runs_and_claim_is_released(self, tmp_settings: Any) -> None:
+        """Negative control: with no peer, the session runs and hands the goal back."""
+        from luke import work_claim
+        from luke.behaviors import run_deep_work
+
+        tmp_settings.store_dir.mkdir(parents=True, exist_ok=True)
+        goals = [self._goal(tmp_settings)]
+        held_during: list[dict[str, Any] | None] = []
+
+        async def _agent(*_a: Any, **_kw: Any) -> Any:
+            held_during.append(work_claim.current("g1"))
+            return MagicMock(texts=[])
+
+        with (
+            patch("luke.behaviors.db") as mock_db,
+            patch("luke.behaviors.bus"),
+            patch("luke.behaviors.memory") as mock_memory,
+            patch("luke.behaviors.run_agent", side_effect=_agent),
+            patch("luke.behaviors.send_long_message", new_callable=AsyncMock),
+        ):
+            mock_db.get_quality_blocked_goals.return_value = []
+            mock_db.get_recent_quality_scores.return_value = []
+            mock_memory.recall.return_value = goals
+            await run_deep_work(AsyncMock(), _SEM)
+
+        assert held_during and held_during[0] is not None, (
+            "the goal must be claimed WHILE the session runs — otherwise a build "
+            "cron walks straight into it"
+        )
+        assert work_claim.current("g1") is None, "claim must be released after the session"
+
+    async def test_claim_released_even_when_the_session_dies(self, tmp_settings: Any) -> None:
+        """A crashed session must not sit on the goal for the whole TTL."""
+        from luke import work_claim
+        from luke.behaviors import run_deep_work
+
+        tmp_settings.store_dir.mkdir(parents=True, exist_ok=True)
+        goals = [self._goal(tmp_settings)]
+        with (
+            patch("luke.behaviors.db") as mock_db,
+            patch("luke.behaviors.bus"),
+            patch("luke.behaviors.memory") as mock_memory,
+            patch("luke.behaviors.run_agent", side_effect=RuntimeError("boom")),
+            patch("luke.behaviors.send_long_message", new_callable=AsyncMock),
+        ):
+            mock_db.get_quality_blocked_goals.return_value = []
+            mock_db.get_recent_quality_scores.return_value = []
+            mock_memory.recall.return_value = goals
+            await run_deep_work(AsyncMock(), _SEM)
+
+        assert work_claim.current("g1") is None
+
+    async def test_unclaimed_goal_still_built_when_a_sibling_is_held(
+        self, tmp_settings: Any
+    ) -> None:
+        """A peer holding ONE goal must not stall the others."""
+        from luke import work_claim
+        from luke.behaviors import run_deep_work
+
+        tmp_settings.store_dir.mkdir(parents=True, exist_ok=True)
+        peer = work_claim.claim("g1", holder="cron 11:00 build")
+        assert peer is not None
+        goals = [self._goal(tmp_settings, "g1"), self._goal(tmp_settings, "g2")]
+
+        with (
+            patch("luke.behaviors.db") as mock_db,
+            patch("luke.behaviors.bus"),
+            patch("luke.behaviors.memory") as mock_memory,
+            patch("luke.behaviors.run_agent", new_callable=AsyncMock) as mock_agent,
+            patch("luke.behaviors.send_long_message", new_callable=AsyncMock) as mock_send,
+        ):
+            mock_db.get_quality_blocked_goals.return_value = []
+            mock_db.get_recent_quality_scores.return_value = []
+            mock_memory.recall.return_value = goals
+            mock_agent.return_value = MagicMock(texts=[])
+            await run_deep_work(AsyncMock(), _SEM)
+
+        mock_agent.assert_called_once()
+        starting = [c.args[2] for c in mock_send.call_args_list if "starting" in c.args[2]]
+        assert starting and "g2" in starting[0] and "g1" not in starting[0]
 
 
 # ---------------------------------------------------------------------------

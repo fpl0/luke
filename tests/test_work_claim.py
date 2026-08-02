@@ -181,3 +181,47 @@ def test_cli_status_reports_free_and_held(store: Any, capsys: Any) -> None:
     work_claim.claim("goal-x", holder="someone")
     assert work_claim._main(["work_claim", "status", "goal-x"]) == 0
     assert "someone" in capsys.readouterr().out
+
+
+def test_ttl_outlives_the_session_it_protects(store: Any) -> None:
+    """The TTL must cover the whole session ceiling.
+
+    The first cut hardcoded 2700s from "a session runs ~30 min". That assumption
+    expired inside a day (deep_work_timeout went to 5400) and the constant did not
+    move — so every claim quietly stopped covering the back half of its own session:
+    at minute 45 the goal reads FREE and a peer walks into the running session.
+    """
+    from luke.config import settings as live_settings
+
+    assert work_claim.default_ttl_seconds() > live_settings.deep_work_timeout, (
+        "a claim that expires before the session it protects re-opens the exact "
+        "collision this module exists to prevent"
+    )
+    c = work_claim.claim("goal-x", holder="deep work")
+    assert c is not None
+    assert c.seconds_left > live_settings.deep_work_timeout
+
+
+def test_ttl_tracks_a_raised_session_timeout(store: Any, monkeypatch: Any) -> None:
+    """Negative control: raise the session ceiling and the TTL follows it."""
+    from luke.config import settings as live_settings
+
+    monkeypatch.setattr(live_settings, "deep_work_timeout", 9000.0)
+    assert work_claim.default_ttl_seconds() > 9000
+
+
+def test_release_with_no_token_leaves_a_peers_claim_intact(store: Any) -> None:
+    """An empty token is a fail-open holder, not a master key.
+
+    release() used to read a falsy token as "force" and unlink whatever claim file
+    was present — so a session that got its claim from the fail-open path could
+    delete a LIVE peer's claim on the way out, turning the defensive fallback into
+    the collision the module prevents.
+    """
+    peer = work_claim.claim("goal-x", holder="real holder")
+    assert peer is not None
+    assert work_claim.release("goal-x", "") is False
+    still = work_claim.current("goal-x")
+    assert still is not None and still["holder"] == "real holder"
+    # The real holder can still release normally.
+    assert work_claim.release("goal-x", peer.token) is True
