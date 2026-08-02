@@ -666,6 +666,38 @@ HARNESS_CAP = 5
 # ...and never score a gate on a rump. Below this many genuinely-comparable rows there is no
 # result, only a small sample that happened to agree.
 MIN_MEASURED = 14
+# The agreement bar over the measured rows. Named rather than inline because these four values
+# ARE the go/no-go criterion — see `accept` and `cmd_feasibility`.
+MIN_AGREEMENT = 0.9
+
+
+def accept(n: int, ok: int, n_excluded: int, n_vetoes: int) -> tuple[str, int, int]:
+    """The gate's accept arithmetic, in one place so it can be asked questions.
+
+    Extracted from `cmd_score` so `feasibility` can interrogate the SAME arithmetic instead of
+    reimplementing it. A second copy of a bar is a bar that drifts — which is the failure family
+    this file has already produced four times (the qwen `context_window`, `recall(before=...)`,
+    the work-claim TTL, the `set_built` guards).
+
+    Returns (verdict, measured, threshold).
+    """
+    measured = n - n_excluded
+    void = n_excluded > HARNESS_CAP or measured < MIN_MEASURED
+    threshold = max(1, int(round(measured * MIN_AGREEMENT)))
+    passed = (not void) and ok >= threshold and not n_vetoes
+    return ("VOID" if void else ("PASS" if passed else "FAIL")), measured, threshold
+
+
+def memory_budget(n: int, n_excluded: int) -> int:
+    """How many MEMORY divergences a run may carry and still PASS, at this exclusion count.
+
+    Negative means PASS is unreachable — the run is decided by its structure before anyone
+    looks at what Letta remembered.
+    """
+    for m in range(0, n - n_excluded + 1):
+        if accept(n, n - n_excluded - m, n_excluded, 0)[0] != "PASS":
+            return m - 1
+    return n - n_excluded
 
 
 def _attributed_cause(j: dict) -> str:
@@ -776,15 +808,11 @@ def cmd_score(judgments_path: str) -> None:
             lines.append(f"  #{mid} FAIL (no judgment emitted)")
 
     excluded = sorted(m for ms in harness.values() for m in ms)
-    measured = n - len(excluded)
     # Excluding harness artefacts is only honest while there are few of them. Past the cap the
     # run stops being a measurement of anything: too much of the set was two different questions.
     # It reports VOID rather than PASS — excuses can never carry this gate, they can only kill it
     # and force the harness to be fixed.
-    void = len(excluded) > HARNESS_CAP or measured < MIN_MEASURED
-    threshold = max(1, int(round(measured * 0.9)))
-    passed = (not void) and ok >= threshold and not letta_wrong
-    verdict = "VOID" if void else ("PASS" if passed else "FAIL")
+    verdict, measured, threshold = accept(n, ok, len(excluded), len(letta_wrong))
     stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
     head = (
         f"5.1R {stamp} run={runs.get('run_id') or 'unstamped'} — "
@@ -799,7 +827,7 @@ def cmd_score(judgments_path: str) -> None:
         detail = "; ".join(f"{c}={len(m)}" for c, m in sorted(harness.items()) if m)
         note = f"5.1R   excluded as harness artefact: {detail}"
         print(note)
-        if void:
+        if verdict == "VOID":
             print("5.1R   VOID — too much of the set was not a like-for-like comparison. "
                   "Fix the harness and re-run; this is not a memory result either way.")
     os.makedirs(LOGS, exist_ok=True)
@@ -808,7 +836,63 @@ def cmd_score(judgments_path: str) -> None:
         if excluded:
             f.write(note + "\n")
     print(f"\nappended verdict to {VERDICT_LOG}")
-    sys.exit(0 if passed else 1)
+    sys.exit(0 if verdict == "PASS" else 1)
+
+
+def _last_observed_exclusions() -> tuple[int, int, str] | None:
+    """(excluded, n, verdict-line) from the most recent scored run that reported exclusions."""
+    if not os.path.exists(VERDICT_LOG):
+        return None
+    hit = None
+    with open(VERDICT_LOG) as f:
+        for line in f:
+            m = re.search(r"harness-excluded (\d+)/(\d+)", line)
+            if m:
+                hit = (int(m.group(1)), int(m.group(2)), line.strip())
+    return hit
+
+
+def cmd_feasibility(n: int = 20, asymmetric: int | None = None) -> None:
+    """Can this pack produce a PASS at all — asked BEFORE the run, not after.
+
+    `score` already refuses to launder a broken comparison into a green (it reports VOID). But
+    it can only say so once 20 live turns and a blind judge have been spent, and by then the
+    answer was fixed before the run started: past HARNESS_CAP the verdict is VOID whatever
+    Letta remembered. This reports the reachable region up front, from the same `accept`.
+
+    `asymmetric` is how many rows are expected to attribute to a harness cause. Read from the
+    last scored run when one exists; otherwise it must be supplied, and NOT guessed — an
+    unsupported number here would be a prediction dressed as a preflight.
+    """
+    print(f"5.1R accept region — n={n}, cap={HARNESS_CAP}, min_measured={MIN_MEASURED}, "
+          f"agreement={MIN_AGREEMENT}")
+    for e in range(0, HARNESS_CAP + 3):
+        budget = memory_budget(n, e)
+        if budget < 0:
+            v = accept(n, n - e, e, 0)[0]
+            print(f"  harness-excluded={e}: PASS UNREACHABLE ({v} regardless of memory)")
+        else:
+            print(f"  harness-excluded={e}: PASS needs <=" f"{budget} memory divergence(s), 0 vetoes")
+
+    observed = _last_observed_exclusions()
+    if asymmetric is None and observed:
+        asymmetric = observed[0]
+        print(f"\nusing last scored run's exclusion count: {observed[2]}")
+    if asymmetric is None:
+        print("\nNo scored run has reported exclusions yet and none supplied "
+              "(--asymmetric N). Reporting the region only; the pack's own count is unknown.")
+        sys.exit(0)
+
+    budget = memory_budget(n, asymmetric)
+    if budget < 0:
+        print(f"\nUNREACHABLE: {asymmetric} of {n} rows are not like-for-like comparisons, over "
+              f"the cap of {HARNESS_CAP}. This run is VOID before it starts — it cannot report "
+              f"anything about memory. Fix the comparison or adjudicate the rows out of the "
+              f"pack IN WRITING; do not raise the cap after seeing a number.")
+        sys.exit(1)
+    print(f"\nREACHABLE: with {asymmetric} excluded, PASS needs <={budget} memory divergence(s) "
+          f"and 0 vetoes.")
+    sys.exit(0)
 
 
 if __name__ == "__main__":
@@ -826,6 +910,10 @@ if __name__ == "__main__":
         cmd_pack()
     elif cmd == "score":
         cmd_score(sys.argv[2])
+    elif cmd == "feasibility":
+        argv = sys.argv[2:]
+        a = int(argv[argv.index("--asymmetric") + 1]) if "--asymmetric" in argv else None
+        cmd_feasibility(asymmetric=a)
     else:
         print(__doc__)
         sys.exit(2)
