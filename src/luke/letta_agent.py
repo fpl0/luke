@@ -236,18 +236,29 @@ def build_recall_injection(
 # runs the turn on core blocks alone). Returns a dict, never raises on a turn error.
 
 
+# A turn that never stops calling tools is worse than one that answers imperfectly. With
+# the read-tool surface attached (TOOL-SURFACE PARITY), a "diagnose the codebase and logs"
+# turn was observed burning 50 tool calls over 278 seconds and returning an EMPTY reply —
+# it exhausted the loop before ever emitting an assistant message, which in production is
+# an outage, not a slow answer. Bounding the loop turns that failure into a partial answer.
+# Sized well above the 1-6 calls a normal grounded turn uses, so it only bites runaways.
+_MAX_STEPS = 18
+
+
 def drive_letta_turn(
     user_msg: str,
     agent_id: str | None = None,
     *,
     inject_recall: bool = True,
     timeout: float = 300.0,
+    max_steps: int = _MAX_STEPS,
 ) -> dict[str, Any]:
     """Drive one Letta agent turn, prepending Luke's recall() context by default.
 
     Returns ``{seconds, reply, tools, injected, error}``. ``injected`` is True when a
     recall block was actually prepended (recall found something), False when the turn ran
     on core blocks alone. ``error`` is a short string on a transport/turn failure, else None.
+    ``max_steps`` bounds the agent's tool loop so a runaway cannot return nothing at all.
     """
     agent_id = agent_id or settings.letta_agent_id
     if not agent_id:
@@ -262,7 +273,9 @@ def drive_letta_turn(
     injected = msg is not user_msg
 
     url = f"{settings.letta_base_url}/v1/agents/{agent_id}/messages"
-    data = json.dumps({"messages": [{"role": "user", "content": msg}]}).encode()
+    data = json.dumps(
+        {"messages": [{"role": "user", "content": msg}], "max_steps": max_steps}
+    ).encode()
     t0 = _clock()
     try:
         req = urllib.request.Request(
@@ -292,18 +305,57 @@ def drive_letta_turn(
             reply += c or ""
         elif mt == "tool_call_message":
             tools.append((m.get("tool_call") or {}).get("name"))
+    # Exhausting the step budget mid-investigation leaves the turn with tool results and
+    # no assistant message — the agent researched hard and said nothing. Capping the loop
+    # bounds the cost but does not fix that: the observed "deep dive the codebase and logs"
+    # turn still returned empty after 18 calls. In production an empty reply is silence in
+    # Telegram, which is precisely the complaint that started this thread ("sometimes I
+    # don't even get an answer"), so it must degrade to a partial answer instead. One
+    # follow-up, no tools left to spend, asking it to answer from what it already gathered.
+    finalized = False
+    if not reply.strip() and tools:
+        log.warning("letta_turn_exhausted_steps", agent_id=agent_id, tool_calls=len(tools))
+        try:
+            nudge = json.dumps({
+                "messages": [{
+                    "role": "user",
+                    "content": "You used your entire tool budget on that and never actually "
+                               "answered. Do not call any more tools — answer now, from what "
+                               "you already found. If it is incomplete, say so and give what "
+                               "you have.",
+                }],
+                "max_steps": 1,
+            }).encode()
+            req = urllib.request.Request(
+                url, data=nudge, method="POST",
+                headers={"Content-Type": "application/json", "Accept": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                payload2 = json.load(resp)
+            for m in payload2.get("messages", []):
+                if m.get("message_type") == "assistant_message":
+                    c = m.get("content", "")
+                    if isinstance(c, list):
+                        c = " ".join(x.get("text", "") for x in c if isinstance(x, dict))
+                    reply += c or ""
+            finalized = bool(reply.strip())
+        except Exception as e:  # fail-safe: an empty reply is still returned, never a raise
+            log.warning("letta_turn_finalize_failed", agent_id=agent_id, error=str(e))
+
     log.info(
         "letta_turn",
         agent_id=agent_id,
         seconds=round(_clock() - t0, 2),
         injected=injected,
         tools=tools,
+        finalized=finalized,
     )
     return {
         "seconds": _clock() - t0,
         "reply": reply.strip(),
         "tools": tools,
         "injected": injected,
+        "finalized": finalized,
         "error": None,
     }
 
