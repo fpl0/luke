@@ -111,6 +111,17 @@ MAX_PROMPT_CHARS = 400
 # nothing about the memory substrate this gate exists to test. Excluded from 5.1R and
 # tracked as their own precondition (tool-surface parity) for Phase 6 Stage 2, where the
 # plan requires the tool surface to be carried over before any cutover.
+# ...but an ask to DRAFT something FILIPE will send needs no tool in either arm. It is pure
+# generation off the world model — who she is, what the thread was, what register to use —
+# which is exactly what this gate measures. The send belongs to the human. Checked before
+# _TOOL_DEPENDENT because "draft a message that I can send her" trips the send pattern on
+# the verb the human owns, not the one Luke does. Verified against the whole archive: this
+# carve-out admits exactly ONE row (#3328), so it is a filter bug fix, not a wider gate.
+_DRAFT_FOR_HUMAN = re.compile(
+    r"\b(draft|write|compose)\b(?!\w).{0,60}\b(that|which|so)?\s*i (can|could|will|'ll)\s*send\b",
+    re.I | re.S,
+)
+
 _TOOL_DEPENDENT = re.compile(
     r"\b(pull (the |up )?|search|google|look up|browse|scrape|fetch|reviews from|"
     r"remind\w* me|schedule|book|set (a |up )?(reminder|alarm)|"
@@ -173,7 +184,7 @@ def _excluded(prompt: str) -> str | None:
         return "too-long"
     if _ACK_ONLY.match(prompt):
         return "ack-only"
-    if _TOOL_DEPENDENT.search(prompt):
+    if _TOOL_DEPENDENT.search(prompt) and not _DRAFT_FOR_HUMAN.search(prompt):
         return "tool-dependent"
     return None
 

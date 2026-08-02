@@ -33,6 +33,8 @@ lettasync.log
 lettasync.err
 bgeembed.log
 bgeembed.err
+lettablockfresh.log
+lettablockfresh.err
 openapi_letta.json
 letta_server.out
 letta_server.err
