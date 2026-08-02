@@ -485,11 +485,43 @@ def cmd_run(limit: int | None = None, fresh: bool = False) -> None:
         # exactly like 20 rows replayed today. That is not hypothetical — it was the state on
         # disk when this was written.
         json.dump({"ran": datetime.now(timezone.utc).isoformat(),
-                   "set_built": set_built, "rows": rows}, f, indent=2)
+                   "set_built": set_built, "run_id": _run_id(set_built, rows),
+                   "rows": rows}, f, indent=2)
     os.remove(PARTIAL_PATH)
-    print(f"\nwrote {RUNS_PATH}")
+    print(f"\nwrote {RUNS_PATH}  run={_run_id(set_built, rows)}")
     print(f"  valid={len(rows) - n_inv}/{len(rows)}  invalid={n_inv} (count as failures)")
     print(f"  recall-injected={len(rows) - n_noinj}/{len(rows)}  (no-injection rows ran on core blocks alone)")
+
+
+def _run_id(set_built: str, rows: list[dict]) -> str:
+    """Identity of one RUN, not of the set.
+
+    Every provenance guard in this file keys on ``set_built`` — and the plan then froze the
+    set, on purpose, so that a fix shipped against a red gate can be re-measured against the
+    same 20 prompts. The moment it froze, ``set_built`` stopped distinguishing anything: the
+    13:07Z replies, the 13:31Z replies and tonight's replies all carry the identical stamp, so
+    `pack` and `score` wave through a runs file from an arbitrary earlier measurement while
+    reporting it as current. That is not hypothetical either — the 13:07Z runs file was sitting
+    on disk passing both guards when this was written, and the only thing standing between it
+    and a judged pack was a sentence of prose in a cron prompt.
+
+    Hash the replies instead. Same replies -> same id, which is the right equivalence class:
+    scoring judgments against byte-identical answers is harmless. Any reply moves -> new id.
+    """
+    h = hashlib.sha256(set_built.encode())
+    for r in sorted(rows, key=lambda r: r["msg_id"]):
+        h.update(str(r["msg_id"]).encode())
+        for arm in ("sdk_reply", "letta_reply"):
+            h.update(json.dumps(r.get(arm), sort_keys=True, default=str).encode())
+    return h.hexdigest()[:12]
+
+
+def _scored_run_ids() -> set[str]:
+    """Run ids that have already produced a verdict, read back out of the verdict log."""
+    if not os.path.exists(VERDICT_LOG):
+        return set()
+    with open(VERDICT_LOG) as f:
+        return set(re.findall(r"\brun=([0-9a-f]{12})\b", f.read()))
 
 
 def _arm_order(msg_id: int) -> tuple[str, str]:
@@ -533,6 +565,23 @@ def cmd_pack() -> None:
               f"re-run `run` (add --fresh if a journal from the old build is present).")
         sys.exit(1)
 
+    # Fourth guard, and the only one that survives the set being frozen. The three above all
+    # ask "which HARNESS produced these replies?" and answer it from `set_built`, which is now
+    # constant by design — so none of them can tell one measurement from the next against the
+    # same set. This one asks "have these exact replies already been judged?" and reads the
+    # answer out of the verdict log. Re-judging a scored run is how a stale number gets
+    # reported as current, and until now nothing but a sentence in a cron prompt prevented it.
+    run_id = runs.get("run_id")
+    if run_id and run_id in _scored_run_ids() and "--rejudge" not in sys.argv:
+        print(f"REFUSING: run {run_id} has already been scored (see {VERDICT_LOG}). Packing it "
+              f"again re-judges a measurement that is already on the record — re-run `run "
+              f"--fresh` for a current number, or pass --rejudge if you deliberately mean to "
+              f"re-judge these same replies.")
+        sys.exit(1)
+    if "--rejudge" in sys.argv:
+        print(f"!! --rejudge: re-packing already-scored run {run_id or '(unstamped)'} — the "
+              f"verdict this produces is NOT a new measurement.")
+
     key, parts = {}, []
     parts.append(
         "# 5.1R blind reply-diff judge pack\n\n"
@@ -574,7 +623,10 @@ def cmd_pack() -> None:
         "`cause_evidence` must be a short QUOTE or concrete pointer from the answers that "
         "justifies the cause — not a restatement of it. If you cannot point at evidence, the "
         "cause is `\"recall\"`.\n\n"
-        "Do NOT open `letta_reply_diff_key.json` until every judgment is written.\n\n---\n"
+        "Do NOT open `letta_reply_diff_key.json` until every judgment is written.\n\n"
+        f"Write your judgments as `{{\"run_id\": \"{run_id or ''}\", \"judgments\": [...]}}`. The "
+        "`run_id` identifies which replay you judged; `score` refuses judgments belonging to a "
+        "different one. It says nothing about which arm is which.\n\n---\n"
     )
     for i, r in enumerate(rows, 1):
         first, second = _arm_order(r["msg_id"])
@@ -596,8 +648,10 @@ def cmd_pack() -> None:
         # The key carries the same stamp so `score` can prove the judgments it is unblinding
         # belong to the runs on disk — a re-run that is judged against the PREVIOUS pack's key
         # is the same staleness bug one step further down the pipeline.
-        json.dump({"set_built": set_built, "arms": key}, f, indent=2)
+        json.dump({"set_built": set_built, "run_id": run_id, "arms": key}, f, indent=2)
     print(f"wrote {PACK_PATH} ({len(rows)} items)  +  {KEY_PATH} (do not read until judged)")
+    print(f"  run={run_id or '(unstamped)'} — put this in your judgments file as "
+          f"\"run_id\": \"{run_id or ''}\"")
 
 
 # Causes that describe a defect in the COMPARISON rather than in memory. A row attributed to
@@ -646,10 +700,33 @@ def cmd_score(judgments_path: str) -> None:
               f"from {runs.get('set_built')}. The judgments belong to a different pack — "
               f"re-run `pack` and re-judge.")
         sys.exit(1)
+    # set_built cannot tell two runs of the same frozen set apart; run_id can.
+    if keyfile.get("run_id") != runs.get("run_id"):
+        print(f"REFUSING: key was packed from run {keyfile.get('run_id') or '(unstamped)'}, "
+              f"runs on disk are {runs.get('run_id') or '(unstamped)'}. The A/B key belongs to "
+              f"a different replay — re-run `pack`.")
+        sys.exit(1)
     key = keyfile["arms"]
     with open(judgments_path) as f:
         raw = json.load(f)
     judgments = raw["judgments"] if isinstance(raw, dict) else raw
+    # The last unguarded hop. The set is frozen, so a judgments file from an earlier replay has
+    # the same 20 msg_ids as this one: every id resolves in the key, the coverage backstop below
+    # is satisfied, and a previous measurement is reported as the current one with nothing in
+    # the output looking wrong. Prefer the explicit stamp; fall back to the file clock, which
+    # needs no cooperation from whoever wrote the judgments and cannot false-positive on a file
+    # written after the pack it was judged from.
+    stamped = raw.get("run_id") if isinstance(raw, dict) else None
+    if stamped and runs.get("run_id") and stamped != runs["run_id"]:
+        print(f"REFUSING: judgments are stamped run {stamped}, runs on disk are "
+              f"{runs['run_id']}. These judgments were written about a different replay.")
+        sys.exit(1)
+    if not stamped and os.path.exists(KEY_PATH) and (
+            os.path.getmtime(judgments_path) < os.path.getmtime(KEY_PATH)):
+        print(f"REFUSING: {judgments_path} is older than {KEY_PATH} — it was written before the "
+              f"pack it would be scored against, so it judges an earlier replay. Re-judge the "
+              f"current pack (and stamp it with the run_id `pack` printed).")
+        sys.exit(1)
 
     n = len(rows)
     ok, memory_diverge, letta_wrong, lines = 0, [], [], []
@@ -710,7 +787,8 @@ def cmd_score(judgments_path: str) -> None:
     verdict = "VOID" if void else ("PASS" if passed else "FAIL")
     stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
     head = (
-        f"5.1R {stamp} — no-material-divergence {ok}/{measured} measured "
+        f"5.1R {stamp} run={runs.get('run_id') or 'unstamped'} — "
+        f"no-material-divergence {ok}/{measured} measured "
         f"(need >={threshold}); letta-wrong-where-sdk-right {len(letta_wrong)} (need 0); "
         f"harness-excluded {len(excluded)}/{n} (cap {HARNESS_CAP}) => {verdict}"
     )
@@ -744,6 +822,7 @@ if __name__ == "__main__":
         lim = int(argv[argv.index("--limit") + 1]) if "--limit" in argv else None
         cmd_run(limit=lim, fresh="--fresh" in argv)
     elif cmd == "pack":
+        # --rejudge is read inside cmd_pack; it is an escape hatch, not a routine flag.
         cmd_pack()
     elif cmd == "score":
         cmd_score(sys.argv[2])
