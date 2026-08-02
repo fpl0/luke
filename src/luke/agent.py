@@ -9,7 +9,7 @@ import re
 import time
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any, Literal, cast
 from zoneinfo import ZoneInfo
@@ -101,6 +101,92 @@ _COMMITMENT_VERBS = re.compile(
     r"will be ready|will deliver|consider it done"
     r")\b"
 )
+
+
+_MONTHS = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+}
+_WEEKDAYS = {
+    "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
+    "friday": 4, "saturday": 5, "sunday": 6,
+}
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+# A yearless date resolving within this many days of now is treated as a
+# near-term scheduling claim and pinned to that single year.
+_WEEKDAY_NEAR_TERM_DAYS = 120
+
+# "Tuesday Aug 7", "Friday, 7 August 2026", "Thu 6 Aug" — weekday adjacent to a
+# calendar date, in either order. Year optional.
+_WD_THEN_DATE = re.compile(
+    r"(?i)\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b[,\s]+"
+    r"(?:the\s+)?"
+    r"(?:(?P<m1>jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+(?P<d1>\d{1,2})"
+    r"|(?P<d2>\d{1,2})(?:st|nd|rd|th)?\s+(?P<m2>jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?)"
+    r"(?:[,\s]+(?P<y>\d{4}))?"
+)
+
+
+def _weekday_claim_error(text: str, today: date | None = None) -> str | None:
+    """Find a stated weekday that contradicts the date it is attached to.
+
+    Deterministic guard against shipping "Tuesday Aug 7" when Aug 7 is a Friday
+    (sent to Filipe 2026-07-31 about his US visa interview, while memory held the
+    correct day). Conservative by construction: when no year is given the claim is
+    only an error if it is wrong for *every* nearby year, so historical or
+    forward-looking dates never false-positive.
+    """
+    if not text:
+        return None
+    plain = _HTML_TAG_RE.sub(" ", text)
+    ref = today or datetime.now(UTC).date()
+
+    for m in _WD_THEN_DATE.finditer(plain):
+        claimed = _WEEKDAYS[m.group(1).lower()]
+        mon_raw = m.group("m1") or m.group("m2")
+        day_raw = m.group("d1") or m.group("d2")
+        if not mon_raw or not day_raw:
+            continue
+        month, day = _MONTHS[mon_raw.lower()], int(day_raw)
+        year_raw = m.group("y")
+        if year_raw:
+            candidates = [int(year_raw)]
+        else:
+            # Bare "Aug 7": resolve to the nearest occurrence. If that lands
+            # inside the near-term window this is a scheduling claim (the
+            # damaging class — appointments, deadlines, start dates), so it is
+            # checked against that year alone. Outside the window it may be
+            # loose historical prose, so any nearby year may vindicate it.
+            nearby = []
+            for y in (ref.year - 1, ref.year, ref.year + 1):
+                try:
+                    nearby.append(date(y, month, day))
+                except ValueError:
+                    continue  # e.g. Feb 29 on a non-leap year
+            if not nearby:
+                continue
+            nearest = min(nearby, key=lambda d: abs((d - ref).days))
+            near_term = abs((nearest - ref).days) <= _WEEKDAY_NEAR_TERM_DAYS
+            candidates = [nearest.year] if near_term else [d.year for d in nearby]
+
+        actual: list[str] = []
+        for y in candidates:
+            try:
+                d = date(y, month, day)
+            except ValueError:
+                continue
+            if d.weekday() == claimed:
+                break  # consistent for at least one plausible year → not an error
+            actual.append(f"{d.strftime('%A')} {d.isoformat()}")
+        else:
+            if not actual:
+                continue
+            return (
+                f"weekday/date mismatch: you wrote {m.group(0).strip()!r} but "
+                f"that date falls on {', '.join(actual)}. Verify with datetime "
+                f"and correct the weekday before sending."
+            )
+    return None
 
 
 def _check_outbound_quality(text: str) -> str | None:
@@ -2183,6 +2269,31 @@ async def run_agent(
                         "remove the commitment."
                     ),
                 }
+
+            # --- Weekday/date consistency gate (all runs) ---
+            # Deterministic. Blocks "Tuesday Aug 7" when Aug 7 is a Friday —
+            # the error shipped to Filipe 2026-07-31 about his visa interview
+            # while memory held the correct day. feedback-dates-accuracy was
+            # advisory only; this makes it enforced.
+            weekday_error = _weekday_claim_error(msg_text)
+            if weekday_error:
+                log.warning(
+                    "weekday_mismatch_blocked",
+                    chat_id=chat_id,
+                    tool=tool_name,
+                    reason=weekday_error,
+                    preview=msg_text[:100],
+                )
+                bus.emit(
+                    "weekday_mismatch_blocked",
+                    {
+                        "tool": tool_name,
+                        "reason": weekday_error,
+                        "preview": msg_text[:100],
+                    },
+                )
+                return {"decision": "block", "reason": weekday_error}
+
             # Global hourly attention budget for autonomous runs (behaviors + crons).
             # Urgent behaviors (e.g. proactive_scan) can draw from a small reserve
             # beyond the normal cap so they can still reach the user when the normal

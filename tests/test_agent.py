@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from datetime import date
 from pathlib import Path
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -1653,6 +1654,68 @@ class TestOvernightCommitmentGate:
         )
         assert result.get("decision") == "block"
         assert len(emitted) == 1
+
+
+class TestWeekdayClaimGate:
+    """Weekday/date consistency gate.
+
+    Regression coverage for 2026-07-31, when a scheduled reminder told Filipe his
+    US visa interview was "Tuesday Aug 7" — Aug 7 2026 is a Friday, and the
+    entity memory held the correct day. feedback-dates-accuracy was advisory
+    only; this gate makes it enforced on the send path.
+    """
+
+    REF = date(2026, 8, 2)  # a Sunday
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "Visa in 7 days — Tuesday Aug 7, 07:45, 42 Elgin Road.",  # the real one
+            "Interview is <b>Monday, 7 August 2026</b> at 07:45",  # HTML-wrapped
+            "Your interview is Sunday, Aug 7th",  # ordinal suffix
+            "CarGurus start Tuesday Aug 10",  # yearless, near-term
+            "We spoke on Friday Jul 27 about the loop",  # yearless, recent past
+            "Talk Saturday 2 Aug 2026",  # day-first with year
+        ],
+    )
+    def test_blocks_wrong_weekday(self, text: str) -> None:
+        from luke.agent import _weekday_claim_error
+
+        assert _weekday_claim_error(text, today=self.REF) is not None
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "Visa in 7 days — Friday Aug 7, 07:45, 42 Elgin Road.",  # corrected
+            "Interview is Fri 7 Aug 2026, 07:45",  # abbreviated weekday, ignored
+            "Interview is <b>Friday, 7 August 2026</b> at 07:45",
+            "Your interview is Friday, Aug 7th",
+            "CarGurus start Monday Aug 10",
+            "We spoke on Monday Jul 27 about the loop",
+            "Started at Clio on Monday Aug 4 2025",
+            "Christopher got his passport Monday, 16 March 2026",
+            "Portugal joined on Thursday Jan 1",  # far yearless → any year may vindicate
+            "Sunday weekly review",  # weekday with no date
+            "Deadline Aug 10 — no weekday here",  # date with no weekday
+            "meeting Friday, 29 Feb",  # impossible date must not raise
+        ],
+    )
+    def test_allows_consistent_or_unprovable(self, text: str) -> None:
+        from luke.agent import _weekday_claim_error
+
+        assert _weekday_claim_error(text, today=self.REF) is None
+
+    def test_reason_names_the_actual_day(self) -> None:
+        from luke.agent import _weekday_claim_error
+
+        reason = _weekday_claim_error("visa is Tuesday Aug 7", today=self.REF)
+        assert reason is not None
+        assert "Friday" in reason and "2026-08-07" in reason
+
+    def test_empty_text_is_safe(self) -> None:
+        from luke.agent import _weekday_claim_error
+
+        assert _weekday_claim_error("", today=self.REF) is None
 
 
 class TestOutboundQualityGate:
