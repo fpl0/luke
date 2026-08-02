@@ -42,6 +42,9 @@ answer is factually wrong where the sdk answer was right.
 Usage (the 23:00 cron drives these in order):
     python3 scripts/letta_reply_diff.py build            # select the 20-prompt replay set
     python3 scripts/letta_reply_diff.py run              # live Letta arm, 20 turns
+    #   resumable: each turn is journalled, so re-running `run` continues where a killed
+    #   session stopped. --fresh discards the journal; --limit N replays only N turns
+    #   (leaves the run incomplete on purpose, so it can never be packed as a gate).
     python3 scripts/letta_reply_diff.py pack             # blind judge pack (markdown)
     python3 scripts/letta_reply_diff.py score judgments.json
 """
@@ -65,6 +68,10 @@ RUNS_PATH = os.path.join(LOGS, "letta_reply_diff_runs.json")
 PACK_PATH = os.path.join(LOGS, "letta_reply_diff_pack.md")
 KEY_PATH = os.path.join(LOGS, "letta_reply_diff_key.json")
 VERDICT_LOG = os.path.join(LOGS, "letta_reply_diff.log")
+# Turn-by-turn journal. ``run`` appends each completed row here immediately, so a session
+# that dies mid-replay (timeout, bridge hiccup) loses one turn instead of twenty — the
+# failure that already cost this goal a session on 2026-08-02. Deleted on a full run.
+PARTIAL_PATH = os.path.join(LOGS, "letta_reply_diff_partial.jsonl")
 
 N_PROMPTS = 20
 LOOKBACK_DAYS = 45
@@ -330,14 +337,66 @@ def cmd_build() -> None:
         print(f"  [{c['bucket']:14}] #{c['msg_id']} {c['ts'][:16]}  {c['prompt'][:88]}")
 
 
-def cmd_run() -> None:
+def _load_partial(set_built: str, valid_ids: set[int]) -> list[dict]:
+    """Rows already completed for THIS set, from the journal.
+
+    Resume is keyed on the set's ``built`` stamp, not just msg_id. A row replayed against a
+    previous build of the pack was produced under a different harness (different as_of
+    anchoring, different conversation depth, different tool surface), and silently mixing
+    those into one pack is precisely the harness-artefact class that made the Aug-01 numbers
+    meaningless. Stale rows are dropped loudly, never reused.
+    """
+    if not os.path.exists(PARTIAL_PATH):
+        return []
+    kept, stale = [], 0
+    with open(PARTIAL_PATH) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                stale += 1  # torn final line from a hard kill — discard, replay that turn
+                continue
+            if row.get("set_built") == set_built and row.get("msg_id") in valid_ids:
+                kept.append(row)
+            else:
+                stale += 1
+    if stale:
+        print(f"  journal: dropped {stale} row(s) from a previous set build / torn write")
+    return kept
+
+
+def cmd_run(limit: int | None = None, fresh: bool = False) -> None:
     from luke.letta_agent import compose_letta_turn_input, drive_letta_turn
 
     with open(SET_PATH) as f:
-        prompts = json.load(f)["prompts"]
+        spec = json.load(f)
+    prompts, set_built = spec["prompts"], spec["built"]
+
+    if fresh and os.path.exists(PARTIAL_PATH):
+        os.remove(PARTIAL_PATH)
+        print("  journal: cleared (--fresh)")
+    done = {r["msg_id"]: r for r in _load_partial(set_built, {p["msg_id"] for p in prompts})}
+    if done:
+        # Age matters, and is reported rather than silently tolerated. Resuming minutes after
+        # a crash is what the journal is for. Resuming many hours later splits one gate across
+        # two different memory states (core blocks re-pack at 05:10, live write-through lands
+        # new memories all day), so the run stops being a single measurement. Judgement call
+        # for the operator — but it can only be made if the number is on screen.
+        age_h = (time.time() - os.path.getmtime(PARTIAL_PATH)) / 3600
+        note = "  <-- >4h old: consider --fresh, this splits the run across memory states" if age_h > 4 else ""
+        print(f"  journal: resuming with {len(done)}/{len(prompts)} turn(s) already replayed"
+              f" (last write {age_h:.1f}h ago){note}")
+
+    todo = [c for c in prompts if c["msg_id"] not in done]
+    if limit is not None:
+        todo = todo[:limit]
+        print(f"  --limit {limit}: replaying {len(todo)} of {len(prompts) - len(done)} remaining")
 
     out = []
-    for n, c in enumerate(prompts, 1):
+    for n, c in enumerate(todo, 1):
         t0 = time.time()
         # Compose recall on the CLEAN prompt (so retrieval is keyed on the real ask, not
         # on the conversation preamble), then prepend the buffer and drive with
@@ -366,32 +425,51 @@ def cmd_run() -> None:
             invalid = f"turn error: {r['error'][:120]}"
         elif len(reply) < 40:
             invalid = f"degenerate reply ({len(reply)} chars)"
-        out.append(
-            {
-                **c,
-                "letta_reply": reply,
-                "letta_seconds": round(r.get("seconds", time.time() - t0), 2),
-                "letta_tools": r.get("tools") or [],
-                "letta_injected": injected,
-                "letta_prior_turns": len(prior),
-                "invalid": invalid,
-            }
-        )
-        flag = "INVALID: " + invalid if invalid else f"ok {out[-1]['letta_seconds']}s"
-        inj = "inj" if out[-1]["letta_injected"] else "NO-INJECTION"
-        print(f"  [{n:2}/{len(prompts)}] {inj:12} {flag}  {c['prompt'][:60]}", flush=True)
+        row = {
+            **c,
+            "letta_reply": reply,
+            "letta_seconds": round(r.get("seconds", time.time() - t0), 2),
+            "letta_tools": r.get("tools") or [],
+            "letta_injected": injected,
+            "letta_prior_turns": len(prior),
+            "invalid": invalid,
+        }
+        out.append(row)
+        # Journal BEFORE the next turn starts: everything up to here survives a kill.
+        with open(PARTIAL_PATH, "a") as f:
+            f.write(json.dumps({**row, "set_built": set_built}) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        flag = "INVALID: " + invalid if invalid else f"ok {row['letta_seconds']}s"
+        inj = "inj" if row["letta_injected"] else "NO-INJECTION"
+        print(f"  [{n:2}/{len(todo)}] {inj:12} {flag}  {c['prompt'][:60]}", flush=True)
+
+    # Order by the set, not by completion, so a resumed run packs identically to a clean one.
+    have = {**done, **{r["msg_id"]: r for r in out}}
+    rows = [{k: v for k, v in have[c["msg_id"]].items() if k != "set_built"}
+            for c in prompts if c["msg_id"] in have]
+
+    n_inv = sum(1 for r in rows if r["invalid"])
+    n_noinj = sum(1 for r in rows if not r["letta_injected"])
+    secs = [r["letta_seconds"] for r in rows if not r["invalid"]]
+    if secs:
+        print(f"\n  letta latency: median {sorted(secs)[len(secs)//2]:.1f}s  max {max(secs):.1f}s"
+              f"  mean {sum(secs)/len(secs):.1f}s")
+
+    if len(rows) < len(prompts):
+        # Deliberately do NOT write RUNS_PATH. A partial replay must never leave behind an
+        # artefact that `pack` would happily turn into a judgeable pack — a gate scored on
+        # 12 of 20 rows reads exactly like a gate scored on 20.
+        print(f"\nINCOMPLETE — {len(rows)}/{len(prompts)} replayed, {RUNS_PATH} NOT written.")
+        print(f"  progress is safe in {PARTIAL_PATH}; re-run `run` to continue where it stopped.")
+        return
 
     with open(RUNS_PATH, "w") as f:
-        json.dump({"ran": datetime.now(timezone.utc).isoformat(), "rows": out}, f, indent=2)
-
-    n_inv = sum(1 for r in out if r["invalid"])
-    n_noinj = sum(1 for r in out if not r["letta_injected"])
-    secs = [r["letta_seconds"] for r in out if not r["invalid"]]
+        json.dump({"ran": datetime.now(timezone.utc).isoformat(), "rows": rows}, f, indent=2)
+    os.remove(PARTIAL_PATH)
     print(f"\nwrote {RUNS_PATH}")
-    print(f"  valid={len(out) - n_inv}/{len(out)}  invalid={n_inv} (count as failures)")
-    print(f"  recall-injected={len(out) - n_noinj}/{len(out)}  (no-injection rows ran on core blocks alone)")
-    if secs:
-        print(f"  letta latency: median {sorted(secs)[len(secs)//2]:.1f}s  max {max(secs):.1f}s")
+    print(f"  valid={len(rows) - n_inv}/{len(rows)}  invalid={n_inv} (count as failures)")
+    print(f"  recall-injected={len(rows) - n_noinj}/{len(rows)}  (no-injection rows ran on core blocks alone)")
 
 
 def _arm_order(msg_id: int) -> tuple[str, str]:
@@ -403,6 +481,16 @@ def _arm_order(msg_id: int) -> tuple[str, str]:
 def cmd_pack() -> None:
     with open(RUNS_PATH) as f:
         rows = json.load(f)["rows"]
+
+    # Second half of the partial-run guard. `run` refuses to write RUNS_PATH short, but an
+    # older or hand-edited runs file could still be short, and the accept clause (>=18/20) is
+    # only meaningful against a full 20. Refuse rather than silently rescale the denominator.
+    with open(SET_PATH) as f:
+        n_set = len(json.load(f)["prompts"])
+    if len(rows) != n_set:
+        print(f"REFUSING: runs has {len(rows)} row(s), set has {n_set}. "
+              f"The accept clause is defined over the whole set — re-run `run` to completion.")
+        sys.exit(1)
 
     key, parts = {}, []
     parts.append(
@@ -508,7 +596,11 @@ if __name__ == "__main__":
     if cmd == "build":
         cmd_build()
     elif cmd == "run":
-        cmd_run()
+        # --limit is for cheap harness checks (measure per-turn cost without burning 20
+        # OAuth turns); it always leaves the run INCOMPLETE, so it cannot produce a pack.
+        argv = sys.argv[2:]
+        lim = int(argv[argv.index("--limit") + 1]) if "--limit" in argv else None
+        cmd_run(limit=lim, fresh="--fresh" in argv)
     elif cmd == "pack":
         cmd_pack()
     elif cmd == "score":
