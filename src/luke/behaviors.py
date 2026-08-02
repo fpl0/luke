@@ -50,6 +50,7 @@ async def _run_behavior(
     max_turns: int | None = None,
     max_sends: int | None = None,
     urgent: bool = False,
+    timeout: float | None = None,
     **log_fields: Any,
 ) -> AgentResult | None:
     """Run an agent behavior with standard timeout, logging, and error handling."""
@@ -72,7 +73,7 @@ async def _run_behavior(
                     autonomous=True,
                     urgent=urgent,
                 ),
-                timeout=settings.agent_timeout,
+                timeout=timeout if timeout is not None else settings.agent_timeout,
             )
         log.info(
             f"{name}_done",
@@ -959,15 +960,24 @@ async def run_deep_work(bot: Bot, sem: asyncio.Semaphore) -> None:
         model=settings.deep_work_model,  # always opus for coding/building
         max_turns=settings.deep_work_max_turns,
         max_sends=1,
+        timeout=settings.deep_work_timeout,
         goals_reviewed=len(goals),
     )
 
-    mins = max(1, int((time.monotonic() - started_mono) / 60))
+    elapsed = time.monotonic() - started_mono
+    mins = max(1, int(elapsed / 60))
     if result is None:
-        await _notify(
-            bot,
-            f"⚠️ Deep work session failed after {mins}m — it will retry next cycle.",
-        )
+        # Distinguish "ran out of wall clock" from "actually broke" — they need
+        # very different responses, and conflating them hid a pure timeout as a
+        # crash (Filipe asked which it was, 2026-08-02).
+        if elapsed >= settings.deep_work_timeout * 0.95:
+            reason = (
+                f"hit its {int(settings.deep_work_timeout / 60)}m time ceiling after {mins}m "
+                "(work up to that point is saved)"
+            )
+        else:
+            reason = f"errored after {mins}m"
+        await _notify(bot, f"⚠️ Deep work session {reason} — it will retry next cycle.")
         return
 
     lines = [f"✅ Deep work session done ({mins}m)."]

@@ -102,6 +102,10 @@ class Settings(BaseSettings):
     deep_work_interval: float = 7200.0  # 2h between sessions
     deep_work_max_turns: int = 500
     deep_work_model: str = "opus"
+    # Deep work is the heaviest behavior (opus, 500 turns, real building work).
+    # The shared 30m agent_timeout was cutting real sessions off mid-flight —
+    # 500 turns cannot land in 30 minutes. 90m still fits inside the 2h cycle.
+    deep_work_timeout: float = 5400.0
 
     # Agent processing
     agent_timeout: float = 1800.0  # max seconds per agent run (30 min)

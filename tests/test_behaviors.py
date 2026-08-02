@@ -576,6 +576,7 @@ class TestRunDeepWork:
         ):
             mock_settings.chat_id = "12345"
             mock_settings.agent_timeout = 10
+            mock_settings.deep_work_timeout = 10
             mock_settings.deep_work_model = "opus"
             mock_settings.deep_work_max_turns = 300
             mock_settings.workspace_dir = Path("/tmp/test_workspace")
@@ -666,7 +667,33 @@ class TestDeepWorkLifecycleNotifications:
             await run_deep_work(AsyncMock(), _SEM)
 
         texts = [c.args[2] for c in mock_send.call_args_list]
-        assert any("session failed" in t for t in texts)
+        assert any("session errored" in t for t in texts)
+
+    async def test_timeout_is_reported_as_timeout_not_crash(self, tmp_settings: Any) -> None:
+        """A session that runs out of wall clock must not read as a crash."""
+        from luke.behaviors import run_deep_work
+
+        goals = self._goal_fixture(tmp_settings)
+        tmp_settings.deep_work_timeout = 0.05
+
+        async def _never_finishes(*_a: Any, **_kw: Any) -> None:
+            await asyncio.sleep(5)
+
+        with (
+            patch("luke.behaviors.db") as mock_db,
+            patch("luke.behaviors.bus"),
+            patch("luke.behaviors.memory") as mock_memory,
+            patch("luke.behaviors.run_agent", side_effect=_never_finishes),
+            patch("luke.behaviors.send_long_message", new_callable=AsyncMock) as mock_send,
+        ):
+            mock_db.get_quality_blocked_goals.return_value = []
+            mock_db.get_recent_quality_scores.return_value = []
+            mock_memory.recall.return_value = goals
+            await run_deep_work(AsyncMock(), _SEM)
+
+        texts = [c.args[2] for c in mock_send.call_args_list]
+        assert any("time ceiling" in t for t in texts)
+        assert not any("errored" in t for t in texts)
 
     async def test_notify_failure_never_raises(self, tmp_settings: Any) -> None:
         """A notification must not kill the session it narrates."""
