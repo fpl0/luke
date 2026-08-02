@@ -383,6 +383,7 @@ def _load_partial(set_built: str, valid_ids: set[int]) -> list[dict]:
 
 
 def cmd_run(limit: int | None = None, fresh: bool = False) -> None:
+    from luke import letta_agent
     from luke.letta_agent import compose_letta_turn_input, drive_letta_turn
 
     with open(SET_PATH) as f:
@@ -392,6 +393,30 @@ def cmd_run(limit: int | None = None, fresh: bool = False) -> None:
     if fresh and os.path.exists(PARTIAL_PATH):
         os.remove(PARTIAL_PATH)
         print("  journal: cleared (--fresh)")
+
+    # Clear the agent's conversation buffer before turn 1 of a fresh run. Letta carries the
+    # buffer across callers (message_buffer_autoclear is False), so without this every
+    # re-run of the frozen set replays prompts the arm has already answered, with its own
+    # earlier answers in context — contamination in the direction that flatters Letta, and
+    # invisible in an artefact that records replies but not buffer state.
+    #
+    # FATAL, not fail-open, and this is the one place in this file where that is right: a
+    # replay that continues on a dirty buffer produces a number indistinguishable from a
+    # clean one, which is the same class of defect as packing the wrong harness's runs.
+    # A resumed run deliberately does NOT reset — the buffer then holds this run's own
+    # earlier rows, which is the intended within-run condition.
+    buffer_at_start = None
+    if fresh:
+        before = letta_agent.agent_buffer_depth()
+        buffer_at_start = letta_agent.reset_agent_messages()
+        if buffer_at_start is None:
+            print("ABORT — could not reset the agent's conversation buffer.")
+            print("  a replay on a dirty buffer is not a measurement; fix the bridge and re-run.")
+            sys.exit(1)
+        print(f"  buffer: reset {before if before is not None else '?'} -> {buffer_at_start} message(s)")
+    else:
+        buffer_at_start = letta_agent.agent_buffer_depth()
+        print(f"  buffer: {buffer_at_start} message(s) at start (not reset — resume/partial run)")
     done = {r["msg_id"]: r for r in _load_partial(set_built, {p["msg_id"] for p in prompts})}
     if done:
         # Age matters, and is reported rather than silently tolerated. Resuming minutes after
@@ -484,8 +509,13 @@ def cmd_run(limit: int | None = None, fresh: bool = False) -> None:
         # rows replayed in August under a two-tool, unanchored, 2-message-buffer agent look
         # exactly like 20 rows replayed today. That is not hypothetical — it was the state on
         # disk when this was written.
+        # buffer_at_start makes the run's one previously-uncontrolled variable readable off
+        # the artefact. 0/1 means the arm started from a cleared conversation; anything
+        # larger means it began the set with prior turns in context, and a reader can see
+        # that without having to have been watching when it ran.
         json.dump({"ran": datetime.now(timezone.utc).isoformat(),
                    "set_built": set_built, "run_id": _run_id(set_built, rows),
+                   "buffer_at_start": buffer_at_start,
                    "rows": rows}, f, indent=2)
     os.remove(PARTIAL_PATH)
     print(f"\nwrote {RUNS_PATH}  run={_run_id(set_built, rows)}")

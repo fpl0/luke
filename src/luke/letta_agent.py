@@ -414,6 +414,78 @@ def drive_letta_turn(
     }
 
 
+# ---------------------------------------------------------------------------
+# Conversation-buffer control (the replay's uncontrolled variable)
+# ---------------------------------------------------------------------------
+#
+# A Letta agent keeps an in-context message buffer across turns and it is NOT cleared
+# between callers — ``message_buffer_autoclear`` is False on luke-agent-claude, verified
+# on the live agent rather than assumed. Nothing in the 5.1R replay ever touched it, so
+# every re-run of the frozen 20-prompt set started with the *previous* run's twenty turns
+# still in context: measured 2026-08-02 22:29Z, the live buffer held two full passes of
+# the set plus three probes, and two mid-run auto-compaction events.
+#
+# That contaminates in the direction that flatters Letta — the arm has already seen these
+# prompts and its own earlier answers. Observed directly: a re-drive of #3436 returned the
+# correct OAuth-token facts while calling ZERO tools, and opened "Checked the code before
+# answering" when it had checked nothing this turn; it was reading its own reply from two
+# minutes earlier. An artefact that records replies but not buffer state cannot show this.
+
+
+def agent_buffer_depth(agent_id: str | None = None, *, timeout: float = 10.0) -> int | None:
+    """Number of messages in the agent's in-context buffer. None on any failure.
+
+    Read from ``message_ids`` on the agent envelope — the buffer that actually enters the
+    prompt — not from ``/messages``, which pages the whole persisted history and reports
+    hundreds of rows for an agent whose live context holds one.
+    """
+    agent_id = agent_id or settings.letta_agent_id
+    if not agent_id:
+        return None
+    url = f"{settings.letta_base_url}/v1/agents/{agent_id}"
+    try:
+        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            state = json.load(resp)
+        ids = state.get("message_ids")
+        return len(ids) if isinstance(ids, list) else None
+    except Exception as e:
+        log.warning("letta_buffer_depth_failed", agent_id=agent_id, error=str(e))
+        return None
+
+
+def reset_agent_messages(agent_id: str | None = None, *, timeout: float = 60.0) -> int | None:
+    """Clear the agent's in-context message buffer. Returns the new depth, None on failure.
+
+    Core memory blocks are untouched — verified on the live agent before this shipped (all
+    seven blocks identical in length across a reset), which is what makes this safe to call
+    before a replay: it clears the conversation, not the memory the gate is measuring.
+
+    Returns None rather than raising so the caller decides. Callers that need a CLEAN
+    measurement must treat None as fatal: a replay that silently proceeds on a dirty buffer
+    produces a number nobody can tell apart from a clean one.
+    """
+    agent_id = agent_id or settings.letta_agent_id
+    if not agent_id:
+        return None
+    url = f"{settings.letta_base_url}/v1/agents/{agent_id}/reset-messages"
+    data = json.dumps({"add_default_initial_messages": False}).encode()
+    try:
+        req = urllib.request.Request(
+            url, data=data, method="PATCH",
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            state = json.load(resp)
+        ids = state.get("message_ids")
+        depth = len(ids) if isinstance(ids, list) else agent_buffer_depth(agent_id)
+        log.info("letta_buffer_reset", agent_id=agent_id, depth_after=depth)
+        return depth
+    except Exception as e:
+        log.warning("letta_buffer_reset_failed", agent_id=agent_id, error=str(e))
+        return None
+
+
 def compose_letta_turn_input(user_msg: str, *, k: int = 6, as_of: str | None = None) -> str:
     """Build the message body to send to the Letta agent for one turn.
 
