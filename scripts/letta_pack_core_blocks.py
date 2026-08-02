@@ -51,6 +51,14 @@ ANCHOR_IDS = [
 ]
 
 GUARDRAIL_IDS = [
+    # Both genuine 5.1R vetoes (2026-08-01 and 2026-08-02, unchanged between runs) were the
+    # same shape: a confident false claim about Luke's own code or spend, where the ground
+    # truth was sitting in the repo and the DB. Ten read tools were attached to the agent and
+    # it called zero across twenty turns — the capability was there, the reflex was not. This
+    # rule supplies the reflex, and it belongs in the read-only block rather than the turn
+    # prompt because a prompt-level "say so if you don't know" was already present in the
+    # as_of anchor and demonstrably did not fire.
+    "feedback-verify-self-claims-with-tools",
     "feedback-stay-on-sqlite",
     "feedback-no-internal-text-leak",
     "feedback-git-authorship",
