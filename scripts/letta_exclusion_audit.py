@@ -46,6 +46,7 @@ sys.path.insert(0, os.path.join(REPO, "src"))
 LETTA = os.environ.get("LETTA_BASE_URL", "http://localhost:8283")
 AGENT = os.environ.get("LETTA_AGENT_ID", "agent-36671c0b-a133-4bfb-a367-f23f7135071a")
 LOG_PATH = os.path.join(REPO, "logs", "letta_exclusion_audit.log")
+SET_PATH = os.path.join(REPO, "logs", "letta_reply_diff_set.json")
 
 # Capability domains, and the tools that would make an ask in that domain FAIR to include.
 # A domain with no attached tool means the SDK arm wins on capability, so the row stays out.
@@ -100,6 +101,41 @@ ADJUDICATED: dict[int, str] = {
           "so it measures conversation-buffer access, not the substrate. Excluded on the same "
           "grounds as the deictic penalty, not on tool surface.",
 }
+
+
+# ---------------------------------------------------------------------------
+# The OTHER half. This audit shipped asking only "are the DROPS fair?" — and a filter
+# audited in one direction can only ever be wrong in one direction. Every row the filter
+# drops gets checked against the live tool surface; every row it KEEPS was checked against
+# nothing at all. So a prompt that needs email, or a URL fetched, sails into the pack, the
+# Letta arm loses it on a capability it does not have, and the gate books that as a memory
+# failure. Same classifier, same live tool surface, pointed at the kept rows.
+#
+# A flagged row is NOT auto-dropped. Removing rows from a frozen pack after seeing a red
+# number is exactly the move that makes a gate meaningless, and it is not mine to make.
+# The disposition is recorded here instead, and `pending` is a red state, not a shrug:
+# the audit exits INCLUDE_PENDING_EXIT until someone decides, in writing, which of the two
+# things a capability-asymmetry row is — a fair test of the whole system, or noise in a
+# memory gate.
+INCLUDE_PENDING = "pending"
+ADJUDICATED_INCLUSIONS: dict[int, tuple[str, str]] = {
+    2935: (INCLUDE_PENDING,
+           "'Updated contract:' + a DocuSign signing URL. Domain=web, and no arm-agnostic "
+           "answer exists without fetching it. The archived SDK reply was produced by a Luke "
+           "that could browse; the Letta arm has ten tools and not one of them opens a URL. "
+           "Scored as a letta divergence in the 2026-08-02 run."),
+    3528: (INCLUDE_PENDING,
+           "'The email draft is completely off. Why would I send back a summary of...' — the "
+           "critique is of an email body neither arm can read. Domain=email, uncovered. Also "
+           "scored as a letta divergence in the 2026-08-02 run."),
+}
+
+# Exit codes, kept distinct because the two halves mean different things to a caller.
+# 1 = the pack is unfairly NARROW (a dropped row is now answerable) — do not run the gate,
+#     the number would understate the substrate.
+# 4 = the pack contains rows whose fairness is undecided. The run itself is still valid;
+#     what is in question is the ACCEPT BAR applied to it. A caller may proceed and report.
+INCLUDE_PENDING_EXIT = 4
 
 
 def attached_tools() -> set[str]:
@@ -194,7 +230,55 @@ def main() -> int:
     print("\nPASS: every tool-dependent exclusion still names a capability the Letta arm lacks. "
           "The pack is fairly narrow, not conveniently narrow.")
     _log(f"{stamp}  PASS  {total} exclusions all uncovered; tools={len(tools)}")
-    return 0
+    return audit_included(covered, stamp)
+
+
+def audit_included(covered: set[str], stamp: str) -> int:
+    """Do any KEPT rows need a capability the Letta arm lacks? Same classifier, other half."""
+    if not os.path.exists(SET_PATH):
+        print("\nINCLUSION AUDIT SKIPPED: no frozen set on disk — run `letta_reply_diff.py build`.")
+        return 0
+    with open(SET_PATH) as fh:
+        spec = json.load(fh)
+
+    flagged = []
+    print(f"\n--- inclusion audit: the {len(spec['prompts'])} rows the filter KEPT ---")
+    for c in spec["prompts"]:
+        domain, trigger = domain_of(c["prompt"])
+        # `unclassified` is deliberately NOT flagged here. On the exclusion side an unknown
+        # row is a red state because the filter is making a claim about it; on this side the
+        # filter made no claim, and treating every unclassifiable prompt as suspect would
+        # flag most of a conversational pack and mean nothing. The cost is real and worth
+        # naming: this half catches only the asymmetries the regexes can see.
+        if domain in covered or domain in ("none-needed", "unclassified"):
+            continue
+        flagged.append((c["msg_id"], domain, trigger, c["prompt"]))
+        disp = ADJUDICATED_INCLUSIONS.get(c["msg_id"], (None, ""))[0]
+        mark = "!!" if disp != INCLUDE_PENDING else "??"
+        print(f"{mark} #{c['msg_id']:<5} {domain:15} {trigger[:22]:24} "
+              f"{'[' + (disp or 'UNADJUDICATED') + ']':17} {c['prompt'][:60]}")
+
+    if not flagged:
+        print("PASS: no kept row needs an uncovered capability domain.")
+        _log(f"{stamp}  INCLUDE-PASS  0 flagged of {len(spec['prompts'])}")
+        return 0
+
+    new = [f for f in flagged if f[0] not in ADJUDICATED_INCLUSIONS]
+    pending = [f for f in flagged
+               if ADJUDICATED_INCLUSIONS.get(f[0], (None,))[0] == INCLUDE_PENDING]
+    if new:
+        print(f"\nFAIL: {len(new)} kept row(s) need an uncovered capability and are not "
+              f"adjudicated. The Letta arm cannot win them on memory — record a disposition:")
+        for mid, domain, _t, prompt in new:
+            print(f"  #{mid} [{domain}] {prompt[:110]}")
+        _log(f"{stamp}  INCLUDE-FAIL  new={','.join(str(f[0]) for f in new)}")
+        return 1
+    print(f"\n{len(pending)} kept row(s) are capability-asymmetric and awaiting a written "
+          f"decision — the replay is valid, the ACCEPT BAR over it is what is undecided:")
+    for mid, domain, _t, _p in pending:
+        print(f"  #{mid} [{domain}] {ADJUDICATED_INCLUSIONS[mid][1][:150]}")
+    _log(f"{stamp}  INCLUDE-PENDING  {','.join(str(f[0]) for f in pending)}")
+    return INCLUDE_PENDING_EXIT
 
 
 def _log(line: str) -> None:

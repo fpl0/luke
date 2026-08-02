@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import contextlib
 import importlib.util
+import json
 import io
 import os
 import sys
@@ -65,7 +66,24 @@ def audit(monkeypatch):
     monkeypatch.setattr(mod.importlib.util, "module_from_spec", lambda _s: rd)
     monkeypatch.setattr(mod.sqlite3, "connect", lambda *_a, **_k: _FakeCon())
     monkeypatch.setattr(mod, "_log", lambda _line: None)
+    # The inclusion half reads the frozen 5.1R set. Point it at nothing by default so the
+    # exclusion tests stay about exclusions; the inclusion tests write their own set.
+    monkeypatch.setattr(mod, "SET_PATH", "/nonexistent/letta_reply_diff_set.json")
+    # Start from an empty adjudication table so these tests assert the MECHANISM rather
+    # than today's two real entries — which are a decision, and will change.
+    monkeypatch.setattr(mod, "ADJUDICATED_INCLUSIONS", {})
     return mod
+
+
+def _write_set(tmp_path, prompts):
+    """A minimal frozen set — only msg_id/prompt/ts/bucket are read by the audit."""
+    path = tmp_path / "set.json"
+    path.write_text(json.dumps({
+        "built": "2026-08-02T07:12:47+00:00",
+        "prompts": [{"msg_id": mid, "prompt": text, "ts": "2026-07-01T10:00:00+00:00",
+                     "bucket": "conversational"} for mid, text in prompts],
+    }))
+    return str(path)
 
 
 class _FakeCon:
@@ -148,3 +166,61 @@ def test_draft_for_human_is_not_a_send(audit):
     domain, _trigger = audit.domain_of("Now draft a message that I can send her")
     assert domain == "none-needed"
     assert audit.domain_of("Send her the message we discussed")[0] == "write-send"
+
+
+# --- the inclusion half: the rows the filter KEPT -------------------------------------
+
+
+def test_kept_row_needing_an_uncovered_domain_fails_until_adjudicated(audit, monkeypatch, tmp_path):
+    """The whole point. A filter audited in one direction is wrong in one direction."""
+    monkeypatch.setattr(audit, "SET_PATH", _write_set(tmp_path, [
+        (2935, "Updated contract: https://apps.docusign.com/api/esign/Signing/Envelope"),
+        (2973, "Look at our exchange as Karl Jung would. What is your analysis?"),
+    ]))
+    rc, out = _run(audit, REAL_SURFACE)
+    assert rc == 1, out
+    assert "#2935 [web]" in out
+    assert "#2973" not in out.split("inclusion audit")[1]  # unclassified is not flagged
+
+    audit.ADJUDICATED_INCLUSIONS[2935] = (audit.INCLUDE_PENDING, "no arm can open the URL")
+    rc, out = _run(audit, REAL_SURFACE)
+    assert rc == audit.INCLUDE_PENDING_EXIT, out
+    assert "awaiting a written decision" in out
+
+
+def test_attaching_the_covering_tool_clears_the_kept_row(audit, monkeypatch, tmp_path):
+    """Negative control: the flag tracks the live tool surface, not a hardcoded row list."""
+    monkeypatch.setattr(audit, "SET_PATH", _write_set(tmp_path, [
+        (2935, "Updated contract: https://apps.docusign.com/api/esign/Signing/Envelope"),
+    ]))
+    # The exclusion half fails on a web tool (its fixture has a web row), so drive the
+    # inclusion half directly — it is the assertion under test.
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = audit.audit_included({"web", "repo-read"}, "stamp")
+    assert rc == 0
+    assert "no kept row needs an uncovered capability" in buf.getvalue()
+
+
+def test_pending_exit_is_distinct_from_the_narrow_pack_failure(audit, monkeypatch, tmp_path):
+    """A caller must be able to tell 'do not run' from 'run, but the bar is undecided'."""
+    assert audit.INCLUDE_PENDING_EXIT != 1
+    monkeypatch.setattr(audit, "SET_PATH", _write_set(tmp_path, [
+        (3528, "The email draft is completely off. Why would I send back a summary?"),
+    ]))
+    audit.ADJUDICATED_INCLUSIONS[3528] = (audit.INCLUDE_PENDING, "no arm can read the body")
+    rc, _out = _run(audit, REAL_SURFACE)
+    assert rc == audit.INCLUDE_PENDING_EXIT
+    # ...and the same corpus with a web tool attached fails on the OTHER half first,
+    # proving the two codes are not interchangeable.
+    rc2, _ = _run(audit, REAL_SURFACE | {"luke_web_search"})
+    assert rc2 == 1
+
+
+def test_missing_set_skips_rather_than_silently_passing(audit):
+    """No frozen set means no claim — say so on screen instead of printing a green PASS."""
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = audit.audit_included({"repo-read"}, "stamp")
+    assert rc == 0
+    assert "INCLUSION AUDIT SKIPPED" in buf.getvalue()
