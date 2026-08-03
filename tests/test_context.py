@@ -1313,3 +1313,132 @@ class TestBudgetIsHonoured:
         # No memory fits at budget=1, but the standing block still exists if
         # there is anything pinned for this chat.
         assert isinstance(ctx.system_block, str)
+
+
+class TestTurnTypeCap:
+    """Procedures were 28% of the corpus but 64% of every injected set."""
+
+    @staticmethod
+    def _procs(n: int) -> list[dict[str, Any]]:
+        return [
+            {"id": f"proc-{i}", "type": "procedure", "title": f"P{i}", "score": 0.9 - i * 0.01}
+            for i in range(n)
+        ]
+
+    def test_procedures_are_capped(self, tmp_settings: Any) -> None:
+        from unittest.mock import patch
+
+        with (
+            patch("luke.context._memory_module.recall", return_value=self._procs(20)),
+            patch("luke.context._memory_module.get_trigger_matched_skills", return_value=[]),
+            patch("luke.context._memory_module.get_graph_neighbors", return_value=[]),
+        ):
+            out = context._rank_turn_candidates("do the thing", set())
+        assert len(out) == context._TURN_TYPE_CAP["procedure"]
+
+    def test_cap_keeps_the_highest_scoring(self, tmp_settings: Any) -> None:
+        from unittest.mock import patch
+
+        with (
+            patch("luke.context._memory_module.recall", return_value=self._procs(20)),
+            patch("luke.context._memory_module.get_trigger_matched_skills", return_value=[]),
+            patch("luke.context._memory_module.get_graph_neighbors", return_value=[]),
+        ):
+            out = context._rank_turn_candidates("do the thing", set())
+        assert [c["id"] for c in out] == ["proc-0", "proc-1", "proc-2"]
+
+    def test_trigger_skills_are_exempt(self, tmp_settings: Any) -> None:
+        """A trigger match is an explicit answer signal; the cap exists to
+        stop incidental procedures, not chosen ones."""
+        from unittest.mock import patch
+
+        skills = [
+            {"id": "skill-a", "type": "procedure", "title": "A", "score": 1.0},
+            {"id": "skill-b", "type": "procedure", "title": "B", "score": 1.0},
+        ]
+        with (
+            patch("luke.context._memory_module.recall", return_value=self._procs(20)),
+            patch("luke.context._memory_module.get_trigger_matched_skills", return_value=skills),
+            patch("luke.context._memory_module.get_graph_neighbors", return_value=[]),
+        ):
+            out = context._rank_turn_candidates("deploy", set())
+        ids = [c["id"] for c in out]
+        # Never blocked...
+        assert "skill-a" in ids and "skill-b" in ids
+        # ...but they still count toward the tally, so total procedure share
+        # stays bounded. Exempting them from the count too would let a turn
+        # carry cap + skills procedures and defeat the cap.
+        assert len(ids) == context._TURN_TYPE_CAP["procedure"]
+
+    def test_skills_admitted_even_when_cap_already_full(self, tmp_settings: Any) -> None:
+        """A trigger match must land even if procedures are already at cap."""
+        from unittest.mock import patch
+
+        skills = [{"id": "skill-a", "type": "procedure", "title": "A", "score": 1.0}]
+        with (
+            patch("luke.context._memory_module.recall", return_value=self._procs(20)),
+            patch("luke.context._memory_module.get_trigger_matched_skills", return_value=skills),
+            patch("luke.context._memory_module.get_graph_neighbors", return_value=[]),
+        ):
+            out = context._rank_turn_candidates("deploy", set())
+        assert "skill-a" in [c["id"] for c in out]
+
+    def test_uncapped_types_are_unaffected(self, tmp_settings: Any) -> None:
+        from unittest.mock import patch
+
+        ents = [
+            {"id": f"e{i}", "type": "entity", "title": f"E{i}", "score": 0.5} for i in range(10)
+        ]
+        with (
+            patch("luke.context._memory_module.recall", return_value=ents),
+            patch("luke.context._memory_module.get_trigger_matched_skills", return_value=[]),
+            patch("luke.context._memory_module.get_graph_neighbors", return_value=[]),
+        ):
+            out = context._rank_turn_candidates("who are they", set())
+        assert len(out) == 10
+
+
+class TestAgeLabel:
+    """The ranker decays by recency; the model could not see it. Every memory
+    rendered identically, so a March episode read as current fact."""
+
+    @staticmethod
+    def _ago(days: float) -> str:
+        return (datetime.now(UTC) - timedelta(days=days)).isoformat()
+
+    def test_today(self) -> None:
+        assert context._age_label(self._ago(0.2)) == "today"
+
+    def test_yesterday(self) -> None:
+        assert context._age_label(self._ago(1.5)) == "yesterday"
+
+    def test_days(self) -> None:
+        assert context._age_label(self._ago(5)) == "5d ago"
+
+    def test_weeks(self) -> None:
+        assert context._age_label(self._ago(30)) == "4 weeks ago"
+
+    def test_months(self) -> None:
+        assert context._age_label(self._ago(120)) == "4 months ago"
+
+    def test_missing_or_malformed(self) -> None:
+        assert context._age_label("") == ""
+        assert context._age_label("not-a-date") == ""
+
+    def test_rendered_into_the_turn_block(self, tmp_settings: Any) -> None:
+        cands = [
+            {
+                "id": "ep-old",
+                "type": "episode",
+                "title": "Old thing",
+                "score": 0.5,
+                "updated": self._ago(120),
+            }
+        ]
+        block, _spent, _rendered = context._render_turn_block(cands, 5000)
+        assert "(episode, 4 months ago)" in block
+
+    def test_absent_timestamp_still_renders(self, tmp_settings: Any) -> None:
+        cands = [{"id": "m1", "type": "entity", "title": "T", "score": 0.5}]
+        block, _spent, _rendered = context._render_turn_block(cands, 5000)
+        assert "[m1] (entity)" in block

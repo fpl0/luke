@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import math
 import re
+from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -786,6 +787,16 @@ _TURN_BODY_CHARS = 1_200
 # never starve standing context to nothing.
 _TURN_BUDGET_SHARE = 0.6
 
+# Per-type ceilings on turn evidence. Procedures were 28% of the corpus but
+# took 64% of every injected set, because they are numerous, high-access and
+# were minted at the importance ceiling. Trigger-matched skills are exempt: a
+# trigger match is an explicit "this procedure is the answer" signal, so it
+# should not have to fight the cap that exists to stop incidental ones.
+_TURN_TYPE_CAP: dict[str, int] = {"procedure": 3}
+
+# Trigger-matched skills admitted per turn, regardless of type caps.
+_MAX_TRIGGER_SKILLS = 2
+
 _TRIVIAL_WORDS = frozenset(
     {
         "ok", "okay", "yes", "no", "yeah", "yep", "nope", "sure", "thanks",
@@ -915,6 +926,31 @@ def _pin_conversation_state(chat_id: str) -> str:
     )
 
 
+def _age_label(updated_iso: str) -> str:
+    """Human-readable age, e.g. "today", "3d ago", "4 months ago".
+
+    The ranker decays by recency but the model could not see it: every injected
+    memory rendered identically, so a March episode read as current fact. This
+    is what lets it say "as of May" instead of asserting stale state.
+    """
+    if not updated_iso:
+        return ""
+    try:
+        updated = ensure_utc(datetime.fromisoformat(updated_iso))
+    except ValueError, AttributeError:
+        return ""
+    days = (datetime.now(UTC) - updated).total_seconds() / 86400
+    if days < 1:
+        return "today"
+    if days < 2:
+        return "yesterday"
+    if days < 14:
+        return f"{int(days)}d ago"
+    if days < 60:
+        return f"{int(days / 7)} weeks ago"
+    return f"{int(days / 30)} months ago"
+
+
 def _rank_turn_candidates(query: str, exclude: set[str]) -> list[dict[str, Any]]:
     """Query-ranked evidence for this turn: recall hits, guaranteed skills,
     ranked graph neighbours — deduped against *exclude* and against each other.
@@ -932,26 +968,42 @@ def _rank_turn_candidates(query: str, exclude: set[str]) -> list[dict[str, Any]]
     )
 
     candidates: list[dict[str, Any]] = []
+    per_type: dict[str, int] = {}
 
-    # Trigger-matched skills are admitted first and unconditionally: a trigger
-    # match is already the authoritative "this procedure is the right answer"
-    # signal, so it does not need to win on score too.
-    for skill in trigger_skills:
-        if skill["id"] not in seen:
-            seen.add(skill["id"])
-            candidates.append({**skill, "source": "skill"})
+    def admit(m: Mapping[str, Any], source: str, *, exempt: bool = False) -> None:
+        """Admit a candidate unless its type is full.
+
+        *exempt* skips the check for THIS memory but still counts it toward the
+        type's tally. So a trigger-matched skill is never blocked, while total
+        procedure share stays bounded — exempting them from the count too would
+        let a turn carry cap + skills procedures and defeat the cap.
+        """
+        if m["id"] in seen:
+            return
+        mem_type = m["type"]
+        cap = _TURN_TYPE_CAP.get(mem_type)
+        if not exempt and cap is not None and per_type.get(mem_type, 0) >= cap:
+            return
+        seen.add(m["id"])
+        per_type[mem_type] = per_type.get(mem_type, 0) + 1
+        candidates.append({**m, "source": source})
+
+    # Trigger-matched skills go first and are exempt from the type cap: a
+    # trigger match is already the authoritative "this procedure is the right
+    # answer" signal, so it does not need to win on score too. This replaces the
+    # old displace-the-lowest-scoring-non-skill dance, which also had to probe
+    # frontmatter from disk for every candidate to decide what counted as a
+    # skill — work a trigger match already answers.
+    for skill in trigger_skills[:_MAX_TRIGGER_SKILLS]:
+        admit(skill, "skill", exempt=True)
 
     for m in memories:
-        if m["id"] not in seen:
-            seen.add(m["id"])
-            candidates.append({**m, "source": "recall"})
+        admit(m, "recall")
 
     if candidates:
         neighbours = _memory_module.get_graph_neighbors([c["id"] for c in candidates], limit=3)
         for n in neighbours:
-            if n["id"] not in seen:
-                seen.add(n["id"])
-                candidates.append({**n, "source": "neighbor"})
+            admit(n, "neighbor")
 
     return candidates
 
@@ -972,7 +1024,9 @@ def _render_turn_block(
     used = 0
     for c in candidates:
         body = _memory_module.read_memory_body(c["type"], c["id"], _TURN_BODY_CHARS)
-        line = f"[{c['id']}] ({c['type']}) {body or c.get('title', '')}"
+        age = _age_label(c.get("updated", ""))
+        label = f"{c['type']}, {age}" if age else c["type"]
+        line = f"[{c['id']}] ({label}) {body or c.get('title', '')}"
         cost = _estimate_tokens(line)
         if used + cost > budget_tokens:
             continue

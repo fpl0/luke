@@ -2360,7 +2360,7 @@ def get_trigger_matched_skills(text: str) -> list[MemoryResult]:
     results: list[MemoryResult] = []
     for m in matches:
         row = db.execute(
-            """SELECT m.id, m.type, f.title
+            """SELECT m.id, m.type, f.title, m.updated
                FROM memory_meta m
                JOIN memory_fts f ON m.id = f.id
                WHERE m.id = ? AND m.status = 'active'""",
@@ -2375,6 +2375,9 @@ def get_trigger_matched_skills(text: str) -> list[MemoryResult]:
                         "type": row["type"],
                         "title": row["title"],
                         "score": m["confidence"],
+                        # Callers date what they render; without this a skill
+                        # last touched in March looks as fresh as yesterday's.
+                        "updated": row["updated"],
                     },
                 )
             )
