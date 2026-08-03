@@ -42,6 +42,7 @@ from claude_agent_sdk import (
     SubagentStopHookInput,
     ToolAnnotations,
     UserPromptSubmitHookInput,
+    _python_type_to_json_schema,
     create_sdk_mcp_server,
     tool,
 )
@@ -328,6 +329,27 @@ _VALID_MEMORY_TYPES: frozenset[str] = frozenset(MEMORY_DIRS)
 _OPEN_WORLD = ToolAnnotations(openWorldHint=True)
 _READ_ONLY = ToolAnnotations(readOnlyHint=True)
 _DESTRUCTIVE = ToolAnnotations(destructiveHint=True)
+
+
+def _schema(props: dict[str, Any], optional: Sequence[str] = ()) -> dict[str, Any]:
+    """Build an explicit JSON Schema so optional params stay optional.
+
+    The SDK's dict-shorthand builder sets ``required = list(properties)`` — every
+    declared param becomes mandatory regardless of whether the handler reads it
+    with ``args.get()``. That forced values for params the handler defaults
+    anyway (``chat_id`` resolves to the current chat; ``supersedes_rel`` only
+    invalidates an old edge), so calls either failed validation or shipped a
+    guessed value. Emitting the full schema takes the SDK's passthrough branch.
+    """
+    unknown = set(optional) - set(props)
+    if unknown:
+        raise ValueError(f"optional params not in schema: {sorted(unknown)}")
+    return {
+        "type": "object",
+        "properties": {k: _python_type_to_json_schema(v) for k, v in props.items()},
+        "required": [k for k in props if k not in set(optional)],
+    }
+
 
 # Tools that send outbound Telegram messages (rate-limited by PreToolUse hook)
 _SEND_TOOLS: frozenset[str] = frozenset(
@@ -852,7 +874,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
     @tool(
         "send_message",
         "Send text. HTML tags (<b>,<i>,<code>,<pre>), NOT markdown. Auto-splits at 4096.",
-        {"chat_id": str, "text": str, "silent": bool},
+        _schema({"chat_id": str, "text": str, "silent": bool}, ['chat_id', 'silent']),
         annotations=_OPEN_WORLD,
     )
     async def t_send(args: dict[str, Any]) -> dict[str, Any]:
@@ -867,7 +889,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
     @tool(
         "send_photo",
         "Send photo from local path",
-        {"chat_id": str, "path": str, "caption": str},
+        _schema({"chat_id": str, "path": str, "caption": str}, ['chat_id', 'caption']),
         annotations=_OPEN_WORLD,
     )
     async def t_photo(args: dict[str, Any]) -> dict[str, Any]:
@@ -884,7 +906,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
     @tool(
         "send_document",
         "Send file/document from local path",
-        {"chat_id": str, "path": str, "caption": str},
+        _schema({"chat_id": str, "path": str, "caption": str}, ['chat_id', 'caption']),
         annotations=_OPEN_WORLD,
     )
     async def t_doc(args: dict[str, Any]) -> dict[str, Any]:
@@ -901,7 +923,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
     @tool(
         "send_voice",
         "Send voice from local .ogg file",
-        {"chat_id": str, "path": str},
+        _schema({"chat_id": str, "path": str}, ['chat_id']),
         annotations=_OPEN_WORLD,
     )
     async def t_voice(args: dict[str, Any]) -> dict[str, Any]:
@@ -914,7 +936,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
     @tool(
         "send_video",
         "Send video from local path",
-        {"chat_id": str, "path": str, "caption": str},
+        _schema({"chat_id": str, "path": str, "caption": str}, ['chat_id', 'caption']),
         annotations=_OPEN_WORLD,
     )
     async def t_video(args: dict[str, Any]) -> dict[str, Any]:
@@ -931,7 +953,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
     @tool(
         "send_location",
         "Send GPS location",
-        {"chat_id": str, "latitude": float, "longitude": float},
+        _schema({"chat_id": str, "latitude": float, "longitude": float}, ['chat_id']),
         annotations=_OPEN_WORLD,
     )
     async def t_loc(args: dict[str, Any]) -> dict[str, Any]:
@@ -945,7 +967,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
     @tool(
         "send_poll",
         "Create poll. options: list of strings e.g. ['Yes','No']",
-        {"chat_id": str, "question": str, "options": list, "is_anonymous": bool},
+        _schema({"chat_id": str, "question": str, "options": list, "is_anonymous": bool}, ['chat_id', 'is_anonymous']),
         annotations=_OPEN_WORLD,
     )
     async def t_poll(args: dict[str, Any]) -> dict[str, Any]:
@@ -968,7 +990,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
         "send_buttons",
         "Send message with inline buttons. buttons: rows of [{text,data}]. "
         "Pressed button sends '[Button pressed: data]' as new message.",
-        {"chat_id": str, "text": str, "buttons": list},
+        _schema({"chat_id": str, "text": str, "buttons": list}, ['chat_id']),
         annotations=_OPEN_WORLD,
     )
     async def t_buttons(args: dict[str, Any]) -> dict[str, Any]:
@@ -993,7 +1015,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
     @tool(
         "reply",
         "Reply to msg:{id} from prompt. HTML tags, NOT markdown.",
-        {"chat_id": str, "message_id": str, "text": str},
+        _schema({"chat_id": str, "message_id": str, "text": str}, ['chat_id']),
         annotations=_OPEN_WORLD,
     )
     async def t_reply(args: dict[str, Any]) -> dict[str, Any]:
@@ -1024,7 +1046,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
     @tool(
         "react",
         "React with emoji",
-        {"chat_id": str, "message_id": str, "emoji": str},
+        _schema({"chat_id": str, "message_id": str, "emoji": str}, ['chat_id']),
         annotations=_OPEN_WORLD,
     )
     async def t_react(args: dict[str, Any]) -> dict[str, Any]:
@@ -1040,7 +1062,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
         "Query emoji reactions received on messages. "
         "Filter by msg_id, sender_id, or sentiment (positive/negative/neutral). "
         "Returns newest first with message previews.",
-        {"msg_id": int, "sender_id": str, "sentiment": str, "limit": int},
+        _schema({"msg_id": int, "sender_id": str, "sentiment": str, "limit": int}, ['msg_id', 'sender_id', 'sentiment', 'limit']),
         annotations=_READ_ONLY,
     )
     async def t_get_reactions(args: dict[str, Any]) -> dict[str, Any]:
@@ -1067,7 +1089,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
     @tool(
         "edit_message",
         "Edit sent message. HTML tags, NOT markdown.",
-        {"chat_id": str, "message_id": str, "text": str},
+        _schema({"chat_id": str, "message_id": str, "text": str}, ['chat_id']),
         annotations=_DESTRUCTIVE,
     )
     async def t_edit(args: dict[str, Any]) -> dict[str, Any]:
@@ -1081,7 +1103,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
     @tool(
         "delete_message",
         "Delete message",
-        {"chat_id": str, "message_id": str},
+        _schema({"chat_id": str, "message_id": str}, ['chat_id']),
         annotations=_DESTRUCTIVE,
     )
     async def t_del(args: dict[str, Any]) -> dict[str, Any]:
@@ -1091,7 +1113,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
     @tool(
         "pin",
         "Pin message",
-        {"chat_id": str, "message_id": str},
+        _schema({"chat_id": str, "message_id": str}, ['chat_id']),
         annotations=_OPEN_WORLD,
     )
     async def t_pin(args: dict[str, Any]) -> dict[str, Any]:
@@ -1433,7 +1455,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
         "Link two memories. Labels: related, involves, contributes_to, derived_from, "
         "uses, about, informed_by, supports, caused, supersedes, contradicts, "
         "blocked_by, enables. Set supersedes_rel to invalidate an old relationship.",
-        {"from_id": str, "to_id": str, "relationship": str, "supersedes_rel": str},
+        _schema({"from_id": str, "to_id": str, "relationship": str, "supersedes_rel": str}, ['supersedes_rel']),
     )
     async def mem_link(args: dict[str, Any]) -> dict[str, Any]:
         note = ""
@@ -1466,13 +1488,16 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
         "bulk_memory",
         "Bulk ops on memories. action: retag|relink|archive. "
         "ids: memory IDs. tags (retag), link_to+relationship (relink).",
-        {
-            "action": str,
-            "ids": list,
-            "tags": list,
-            "link_to": str,
-            "relationship": str,
-        },
+        _schema(
+            {
+                "action": str,
+                "ids": list,
+                "tags": list,
+                "link_to": str,
+                "relationship": str,
+            },
+            ["ids", "tags", "link_to", "relationship"],
+        ),
     )
     async def mem_bulk(args: dict[str, Any]) -> dict[str, Any]:
         action: str = args["action"]
@@ -1522,7 +1547,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
         "Review pending memory corrections detected automatically. "
         "Returns pending corrections with original content, proposed correction, "
         "and confidence score. Use action: approve, reject, or modify with corrected_content.",
-        {"action": str, "correction_id": int, "corrected_content": str},
+        _schema({"action": str, "correction_id": int, "corrected_content": str}, ['action', 'correction_id', 'corrected_content']),
         annotations=_DESTRUCTIVE,
     )
     async def mem_review_corrections(args: dict[str, Any]) -> dict[str, Any]:
@@ -1578,7 +1603,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
         "across sessions. Use when the user says something matters or asks you "
         "to track something. Examples: 'track the Fanatics prep', 'watch for "
         "Naiara's email', 'remember I want to focus on deep work this week'.",
-        {"content": str, "related_id": str},
+        _schema({"content": str, "related_id": str}, ['related_id']),
         annotations=_OPEN_WORLD,
     )
     async def t_pin_attention(args: dict[str, Any]) -> dict[str, Any]:
@@ -1612,7 +1637,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
     @tool(
         "get_cost_report",
         "Cost/usage stats. period: today|week|month|all",
-        {"period": str},
+        _schema({"period": str}, ['period']),
         annotations=_READ_ONLY,
     )
     async def t_cost(args: dict[str, Any]) -> dict[str, Any]:
@@ -1644,7 +1669,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
         "browse",
         "Open a URL and extract page content. Returns title + text. "
         "Optional: CSS selector to narrow extraction, screenshot to save a PNG.",
-        {"url": str, "selector": str, "screenshot": bool},
+        _schema({"url": str, "selector": str, "screenshot": bool}, ['selector', 'screenshot']),
         annotations=_OPEN_WORLD,
     )
     async def t_browse(args: dict[str, Any]) -> dict[str, Any]:
@@ -1703,7 +1728,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
             "prompt must be fully self-contained (no shared context from this turn). "
             "Use for: research that takes >30s, file builds, multi-step analysis."
         ),
-        {"prompt": str, "trigger_msg_id": int},
+        _schema({"prompt": str, "trigger_msg_id": int}, ['trigger_msg_id']),
         annotations=_OPEN_WORLD,
     )
     async def t_delegate(args: dict[str, Any]) -> dict[str, Any]:
