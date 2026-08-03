@@ -221,10 +221,33 @@ def _is_feedback(mem_id: str, tags_json: str) -> bool:
     return mem_id.startswith("feedback-") or '"feedback"' in (tags_json or "")
 
 
+def _truncate(text: str, limit: int) -> str:
+    """Cut at a word boundary and say what was lost.
+
+    A bare ``text[:limit]`` lands mid-word, which is worse than it looks:
+    memory files ACCUMULATE — new detail is appended to the end — so the
+    amputated tail is reliably the most recent information. Luke's own audit of
+    an injected block put it exactly right: "I have the top of you, the top of
+    Christopher, the top of the visa file, and none of the ends. So what I
+    mostly lose is whatever got added most recently."
+
+    Flipping to the tail would trade the headline for the updates, so instead
+    this keeps the head, cuts cleanly, and makes the gap visible — a signal to
+    Read the file rather than a silent hole.
+    """
+    if len(text) <= limit:
+        return text
+    head = text[:limit]
+    cut = head.rfind(" ")
+    if cut > limit * 0.6:  # only honour the boundary if it isn't a huge loss
+        head = head[:cut]
+    return f"{head}… [+{len(text) - len(head)} more chars — Read the file for the rest]"
+
+
 def _render_line(memory: dict[str, Any], spec: RenderSpec) -> str:
     """The exact text this memory contributes. The only place cost is defined."""
     value = memory["title"] if spec.field == "title" else memory["content"]
-    return f"  [{memory['id']}] {(value or '')[: spec.chars]}"
+    return f"  [{memory['id']}] {_truncate(value or '', spec.chars)}"
 
 
 def _recency_score(updated_iso: str, half_life_days: float = 14.0) -> float:
@@ -1023,7 +1046,10 @@ def _render_turn_block(
     rendered: list[str] = []
     used = 0
     for c in candidates:
-        body = _memory_module.read_memory_body(c["type"], c["id"], _TURN_BODY_CHARS)
+        # Over-read then truncate, so the cut lands on a word boundary and
+        # announces the gap instead of amputating mid-word.
+        raw = _memory_module.read_memory_body(c["type"], c["id"], _TURN_BODY_CHARS * 3)
+        body = _truncate(raw, _TURN_BODY_CHARS)
         age = _age_label(c.get("updated", ""))
         label = f"{c['type']}, {age}" if age else c["type"]
         line = f"[{c['id']}] ({label}) {body or c.get('title', '')}"

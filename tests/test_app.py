@@ -1296,3 +1296,62 @@ class TestEnsureDirsSeedsVoice:
         _ensure_dirs()
 
         assert cfg.read_text() == '{"outputStyle": "custom"}'
+
+
+class TestConvStateNoDuplicateReply:
+    """Every non-trivial turn wrote the agent's reply twice.
+
+    _save_conv_state dedups the user's messages against recent history but
+    appended the agent reply unconditionally — and the reply is already in
+    `messages` by the time this runs. Luke found it auditing its own context:
+    "My answer to the mission question is in there twice, which made the
+    morning look fresher than it was."
+    """
+
+    @staticmethod
+    def _seed(test_db: Any, reply: str) -> None:
+        from luke.config import settings
+
+        now = datetime.now(UTC).isoformat()
+        test_db.store_message(
+            chat_id="12345", sender_name="Filipe Lima", content="what's the mission?", timestamp=now
+        )
+        test_db.store_message(
+            chat_id="12345", sender_name=settings.assistant_name, content=reply, timestamp=now
+        )
+
+    def test_reply_not_duplicated(self, test_db: Any) -> None:
+        from luke.config import settings
+
+        reply = "To be your best virtual friend, not an ops bot."
+        self._seed(test_db, reply)
+        msgs = test_db.get_pending_messages("12345")
+        app_mod._save_conv_state(msgs, [reply])
+
+        body = (settings.memory_dir / "episodes" / "conversation-state-latest.md").read_text()
+        assert body.count(reply) == 1, "agent reply written twice"
+
+    def test_novel_reply_is_still_added(self, test_db: Any) -> None:
+        """A reply not yet in the messages table must still be recorded."""
+        from luke.config import settings
+
+        self._seed(test_db, "an older reply")
+        msgs = test_db.get_pending_messages("12345")
+        app_mod._save_conv_state(msgs, ["a brand new reply not yet stored"])
+
+        body = (settings.memory_dir / "episodes" / "conversation-state-latest.md").read_text()
+        assert "a brand new reply not yet stored" in body
+
+    def test_last_exchange_is_real_not_now(self, test_db: Any) -> None:
+        """The header claimed `now`, making the conversation read fresher."""
+        from luke.config import settings
+
+        self._seed(test_db, "some reply")
+        conn = test_db._db()
+        conn.execute("UPDATE messages SET ts = '2026-08-03T09:41:00+00:00'")
+        conn.commit()
+        msgs = test_db.get_pending_messages("12345")
+        app_mod._save_conv_state(msgs, ["some reply"])
+
+        body = (settings.memory_dir / "episodes" / "conversation-state-latest.md").read_text()
+        assert "**Last exchange:** 2026-08-03T09:41" in body

@@ -1442,3 +1442,54 @@ class TestAgeLabel:
         cands = [{"id": "m1", "type": "entity", "title": "T", "score": 0.5}]
         block, _spent, _rendered = context._render_turn_block(cands, 5000)
         assert "[m1] (entity)" in block
+
+
+class TestTruncate:
+    """Silent mid-word amputation, found by asking Luke to audit its own context.
+
+    Memory files ACCUMULATE — new detail is appended — so a bare text[:limit]
+    reliably drops the most recent information. Luke: "I have the top of you,
+    the top of Christopher, the top of the visa file, and none of the ends."
+    """
+
+    def test_short_text_untouched(self) -> None:
+        assert context._truncate("hello", 100) == "hello"
+
+    def test_exact_length_untouched(self) -> None:
+        assert context._truncate("x" * 50, 50) == "x" * 50
+
+    def test_does_not_cut_mid_word(self) -> None:
+        text = "the quick brown fox jumps over the lazy dog " * 20
+        out = context._truncate(text, 100)
+        head = out.split("…")[0]
+        assert text.startswith(head)
+        assert not head.endswith(" ")
+        # the char right after the kept head must be a boundary
+        assert text[len(head)] == " "
+
+    def test_announces_what_was_lost(self) -> None:
+        text = "word " * 200
+        out = context._truncate(text, 100)
+        assert "more chars" in out
+        assert "Read the file" in out
+
+    def test_reported_count_is_accurate(self) -> None:
+        text = "alpha beta gamma delta " * 40
+        out = context._truncate(text, 120)
+        head = out.split("…")[0]
+        reported = int(out.split("[+")[1].split(" ")[0])
+        assert reported == len(text) - len(head)
+
+    def test_unbroken_run_still_truncates(self) -> None:
+        """No space to cut on — must still bound the output."""
+        out = context._truncate("x" * 500, 100)
+        assert out.startswith("x" * 100)
+        assert "more chars" in out
+
+    def test_applies_to_rendered_lines(self, tmp_settings: Any) -> None:
+        spec = context.RenderSpec(10, "content", 80)
+        line = context._render_line(
+            {"id": "m1", "title": "T", "content": "some words here " * 40}, spec
+        )
+        assert "more chars" in line
+        assert not line.endswith("wor")

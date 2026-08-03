@@ -720,13 +720,17 @@ def _save_conv_state(
     Captures structured context + message history for seamless continuity.
     """
     now = datetime.now(UTC).isoformat(timespec="minutes")
+    assistant = settings.assistant_name
     # Pull recent messages for broader context (not just current batch)
     recent = db.get_recent_messages(settings.chat_id, limit=20) if messages else []
 
     # Extract structured metadata
     topics = _extract_topics(messages, agent_texts)
-    user_msgs = [m for m in messages if m.sender_name != settings.assistant_name]
+    user_msgs = [m for m in messages if m.sender_name != assistant]
     last_user_active = user_msgs[-1].timestamp[:16] if user_msgs else "unknown"
+    # When the exchange actually happened — not when this function ran. `now`
+    # made the block claim a freshness the conversation didn't have.
+    last_exchange = recent[-1]["timestamp"][:16] if recent else now
 
     # Build conversation thread: recent history + current exchange
     lines: list[str] = []
@@ -740,9 +744,14 @@ def _save_conv_state(
         if msg.content[:50] not in recent_contents:
             lines.append(f"**{msg.sender_name}** ({msg.timestamp[:16]}): {msg.content[:500]}")
 
-    # Add agent response
-    if agent_texts:
-        lines.append(f"**Luke** ({now}): {agent_texts[-1][:800]}")
+    # Add the agent response — but only if it isn't already in `recent`.
+    # It usually IS: the reply is stored to `messages` by the send path before
+    # this runs. Without the guard every non-trivial turn wrote the reply twice
+    # and stamped it `now`, which made the newest turn look like two turns and
+    # the conversation read ~20 minutes fresher than it was. The user batch
+    # above has always had this guard; the agent side never did.
+    if agent_texts and agent_texts[-1][:50] not in recent_contents:
+        lines.append(f"**{assistant}** ({now}): {agent_texts[-1][:800]}")
 
     # Structured header + message thread
     structured = ""
@@ -755,7 +764,7 @@ def _save_conv_state(
     if pending:
         structured += f"**Pending actions:** {' | '.join(pending)}\n"
 
-    body = f"**Last exchange:** {now}\n{structured}" + "\n".join(lines)
+    body = f"**Last exchange:** {last_exchange}\n{structured}" + "\n".join(lines)
     # Write memory file
     import yaml
 
