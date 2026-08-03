@@ -27,6 +27,7 @@ Single Python process: aiogram dispatches Telegram messages → Claude Agent SDK
 | `src/luke/app.py` | Orchestrator: Telegram handlers, `_store` helper, `process` + `_dispatch`, main loop |
 | `src/luke/agent.py` | Claude SDK client + 27 MCP tools (Telegram, memory, scheduling, monitoring) + model routing |
 | `src/luke/memory.py` | Memory subsystem: FTS5 indexing, semantic search, graph traversal, scoring, decay |
+| `src/luke/context.py` | Context assembly: `assemble_context()` — one budget across pinned continuity, turn evidence and standing memory |
 | `src/luke/db.py` | SQLite: messages, sessions, tasks, cost tracking |
 | `src/luke/config.py` | Settings from `.env` via pydantic-settings (`SecretStr` for token) |
 | `src/luke/scheduler.py` | Cron/interval/once task execution + hourly maintenance |
@@ -192,11 +193,11 @@ Memories are markdown files with YAML frontmatter in `$LUKE_DIR/memory/`. Indexe
 
 Key behaviors:
 - **Hybrid retrieval** — FTS5 (lexical, OR semantics) + semantic search (bge embed server + sqlite-vec), merged via Reciprocal Rank Fusion
-- **Composite scoring** — relevance gates context quality (importance × recency × access × utility); non-query results dampened; importance clamped to [0,1] in scoring
-- **Utility tracking** — distinguishes intentional access (agent tools) from speculative (auto-injection); utility rate modulates access score to penalize frequently-surfaced-but-unused memories
+- **Composite scoring** — relevance gates context quality (importance × recency × access), then a utility gate multiplies the final score; non-query results dampened; importance normalized 0.1–2.0 → [0,1] by the shared `importance_score()`
+- **Utility tracking** — distinguishes intentional access (agent tools) from speculative (injection); `utility_factor()` gates the final score in [0.5, 1.0], shrunk toward a prior so new memories are neutral and only sustained non-use demotes
 - **Multi-hop graph** — BFS up to depth 2 with exponential weight decay per hop; Hebbian co-access strengthening evolves link weights over time
 - **Adaptive forgetting** — hourly type-aware importance decay modulated by access count (spaced repetition)
-- **Auto-injection** — `process()` recalls relevant memories + 1-hop graph neighbors concurrently with prompt building, plus conversation state injection for continuity
+- **Injection** — `context.assemble_context()` is the single call site (from `run_agent`): one budget, one dedup pass, type quotas. Emits a system block (pinned continuity + standing memory, replaced per run) and a turn block (query-ranked evidence). Never raises
 - **Conflict detection** — entity updates detect and report changes; history recorded in `memory_history` table
 - **Consolidation** — daily scheduler task clusters related episodes (≥2 shared tags) and synthesizes insights via agent
 - **Self-healing** — `sync_memory_index()` on startup detects unindexed files and indexes them (with embeddings)

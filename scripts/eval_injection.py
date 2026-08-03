@@ -573,9 +573,9 @@ def main() -> None:
     else:
         cases = queries_from_messages(dest / "luke.db")
 
-    from luke.app import _needs_recall  # moves to context.py in the assembler commit
+    from luke.context import needs_recall
 
-    cases = [c for c in cases if _needs_recall(c["query"])]
+    cases = [c for c in cases if needs_recall(c["query"])]
     print(f"queries: {len(cases)} ({args.source} source, after _needs_recall)")
 
     report(run(cases, args.limit), args.out)
