@@ -1386,7 +1386,14 @@ def invalidate_link(from_id: str, to_id: str, relationship: str) -> bool:
 
 
 def cleanup_archived_fts() -> None:
-    """Remove archived memories from FTS5 index."""
+    """Drop archived memories from both search indexes (FTS5 and sqlite-vec).
+
+    Archiving flips ``memory_meta.status`` but historically only pruned FTS, so
+    ``memory_vec`` grew a tail of dead vectors that still competed for KNN slots
+    on the fallback recall path. Restoring is unaffected: ``restore_memory``
+    re-inserts the FTS row and the hourly ``backfill_missing_embeddings`` pass
+    re-embeds it.
+    """
     db = _db()
     try:
         db.execute(
@@ -1396,6 +1403,22 @@ def cleanup_archived_fts() -> None:
         _commit(db)
     except sqlite3.OperationalError:
         db.rollback()  # release the lock, retry next cycle
+
+    # Mirror the prune into the vector index. Kept in its own transaction so a
+    # missing/locked vec0 table can never roll back the FTS cleanup above.
+    # Meta is written before the vector in index_memory(), so a row with no meta
+    # is a leftover of a hard delete, never a half-finished insert.
+    try:
+        db.execute(
+            "DELETE FROM memory_vec WHERE memory_id IN "
+            "(SELECT id FROM memory_meta WHERE status = 'archived')"
+        )
+        db.execute(
+            "DELETE FROM memory_vec WHERE memory_id NOT IN (SELECT id FROM memory_meta)"
+        )
+        _commit(db)
+    except sqlite3.OperationalError:
+        db.rollback()
 
 
 def backfill_missing_embeddings(limit: int = 64) -> int:

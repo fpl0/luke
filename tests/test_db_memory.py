@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 
 from luke import db, memory
+from luke.config import settings
 from luke.memory import _recency_score, strip_frontmatter
 
 # ---------------------------------------------------------------------------
@@ -395,6 +396,67 @@ class TestDecayAndArchiving:
         # FTS entry should be gone
         row = db._db().execute("SELECT id FROM memory_fts WHERE id = ?", ("e1",)).fetchone()
         assert row is None
+
+    def test_cleanup_prunes_archived_vectors(self, test_db: Any) -> None:
+        """Archived memories must leave the vector index too, not just FTS.
+
+        Dead vectors crowd the sqlite-vec KNN candidate set on the fallback
+        recall path — the live DB had reached 49% dead rows before this landed.
+        """
+        memory.index_memory("keep", "entity", "Keep", "kept content")
+        memory.index_memory("drop", "entity", "Drop", "dropped content")
+        conn = db._db()
+        before = {
+            r["memory_id"] for r in conn.execute("SELECT memory_id FROM memory_vec").fetchall()
+        }
+        assert {"keep", "drop"} <= before
+
+        memory.archive_memory("drop")
+        memory.cleanup_archived_fts()
+
+        after = {
+            r["memory_id"] for r in conn.execute("SELECT memory_id FROM memory_vec").fetchall()
+        }
+        assert "drop" not in after
+        assert "keep" in after
+
+    def test_cleanup_prunes_orphan_vectors(self, test_db: Any) -> None:
+        """A vector whose memory_meta row is gone is a hard-delete leftover."""
+        memory.index_memory("orphan", "entity", "Orphan", "content")
+        conn = db._db()
+        conn.execute("DELETE FROM memory_meta WHERE id = ?", ("orphan",))
+        conn.commit()
+
+        memory.cleanup_archived_fts()
+
+        row = conn.execute(
+            "SELECT memory_id FROM memory_vec WHERE memory_id = ?", ("orphan",)
+        ).fetchone()
+        assert row is None
+
+    def test_restore_after_cleanup_recovers_vector(self, test_db: Any) -> None:
+        """Pruning is safe: restore re-indexes FTS and the backfill re-embeds."""
+        # restore_memory rebuilds the FTS row from the file on disk
+        mem_file = settings.memory_dir / "entities" / "e1.md"
+        mem_file.parent.mkdir(parents=True, exist_ok=True)
+        mem_file.write_text("---\ntitle: Restorable\n---\n\ncontent\n")
+
+        memory.index_memory("e1", "entity", "Restorable", "content")
+        memory.archive_memory("e1")
+        memory.cleanup_archived_fts()
+        conn = db._db()
+        assert (
+            conn.execute("SELECT 1 FROM memory_vec WHERE memory_id = ?", ("e1",)).fetchone()
+            is None
+        )
+
+        memory.restore_memory("e1")
+        memory.backfill_missing_embeddings()
+
+        assert (
+            conn.execute("SELECT 1 FROM memory_vec WHERE memory_id = ?", ("e1",)).fetchone()
+            is not None
+        )
 
 
 # ---------------------------------------------------------------------------
