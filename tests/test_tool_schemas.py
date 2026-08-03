@@ -113,17 +113,21 @@ def test_no_tool_requires_a_param_its_handler_treats_as_optional() -> None:
             continue
         if not isinstance(schema_arg, ast.Dict):
             continue
-        params = [k.value for k in schema_arg.keys if isinstance(k, ast.Constant)]
+        params = [str(k.value) for k in schema_arg.keys if isinstance(k, ast.Constant)]
         if "properties" in params:  # hand-written full JSON Schema
             continue
 
+        name_node = deco.args[0]
+        if not isinstance(name_node, ast.Constant):
+            continue  # non-literal tool name — nothing to attribute an offender to
+        name = str(name_node.value)
+
         body = ast.dump(ast.Module(body=node.body, type_ignores=[]))
-        name = deco.args[0].value
         for p in params:
             hard = (
                 f"Subscript(value=Name(id='args', ctx=Load()), slice=Constant(value='{p}')" in body
             )
-            soft = f"attr='get'" in body and f"Constant(value='{p}')" in body
+            soft = "attr='get'" in body and f"Constant(value='{p}')" in body
             if soft and not hard:
                 offenders.append(f"{name}.{p}")
 

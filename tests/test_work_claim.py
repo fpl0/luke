@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -56,9 +57,9 @@ def test_expired_claim_is_reclaimable(store: Any) -> None:
     first = work_claim.claim("goal-x", ttl_seconds=60, holder="crashed")
     assert first is not None
     path = work_claim._claim_path("goal-x")
-    rec = json.loads(open(path).read())
+    rec = json.loads(Path(path).read_text())
     rec["expires_at"] = time.time() - 1
-    open(path, "w").write(json.dumps(rec))
+    Path(path).write_text(json.dumps(rec))
 
     assert work_claim.current("goal-x") is None, "an expired claim is not a live claim"
     assert work_claim.claim("goal-x", holder="next") is not None
@@ -69,10 +70,10 @@ def test_dead_holder_is_reclaimed_before_ttl(store: Any) -> None:
     first = work_claim.claim("goal-x", ttl_seconds=99999, holder="dead")
     assert first is not None
     path = work_claim._claim_path("goal-x")
-    rec = json.loads(open(path).read())
+    rec = json.loads(Path(path).read_text())
     # A pid that cannot be alive; host already matches (recorded from this machine).
     rec["pid"] = 2**31 - 1
-    open(path, "w").write(json.dumps(rec))
+    Path(path).write_text(json.dumps(rec))
 
     assert work_claim.claim("goal-x", holder="next") is not None
 
@@ -82,25 +83,27 @@ def test_live_holder_on_another_host_is_not_reclaimed_early(store: Any) -> None:
     first = work_claim.claim("goal-x", ttl_seconds=99999, holder="remote")
     assert first is not None
     path = work_claim._claim_path("goal-x")
-    rec = json.loads(open(path).read())
+    rec = json.loads(Path(path).read_text())
     rec["pid"] = 2**31 - 1
     rec["host"] = "some-other-machine"
-    open(path, "w").write(json.dumps(rec))
+    Path(path).write_text(json.dumps(rec))
 
     assert work_claim.claim("goal-x", holder="next") is None
 
 
 def test_corrupt_claim_file_does_not_block(store: Any) -> None:
     os.makedirs(work_claim._claims_dir(), exist_ok=True)
-    open(work_claim._claim_path("goal-x"), "w").write("{not json")
+    Path(work_claim._claim_path("goal-x")).write_text("{not json")
     assert work_claim.claim("goal-x", holder="next") is not None
 
 
 def test_fails_open_when_the_store_is_broken(store: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     """The property that matters most: a bug in here must never stall a goal."""
-    monkeypatch.setattr(
-        work_claim.os, "makedirs", lambda *a, **k: (_ for _ in ()).throw(OSError("disk gone"))
-    )
+
+    def _boom(*_a: Any, **_k: Any) -> None:
+        raise OSError("disk gone")
+
+    monkeypatch.setattr("luke.work_claim.os.makedirs", _boom)
     granted = work_claim.claim("goal-parity-build", holder="deadline work")
     assert granted is not None, "an internal error must GRANT, never deny"
     assert granted.token == "", "a fail-open grant holds no releasable token"
@@ -112,10 +115,9 @@ def test_goal_id_cannot_escape_the_claims_dir(store: Any) -> None:
 
 
 def test_context_manager_releases_on_exception(store: Any) -> None:
-    with pytest.raises(RuntimeError):
-        with work_claim.claimed("goal-x", holder="a") as c:
-            assert c is not None
-            raise RuntimeError("session died mid-build")
+    with pytest.raises(RuntimeError), work_claim.claimed("goal-x", holder="a") as c:
+        assert c is not None
+        raise RuntimeError("session died mid-build")
     assert work_claim.current("goal-x") is None
     assert work_claim.claim("goal-x", holder="b") is not None
 

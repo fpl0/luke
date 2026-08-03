@@ -59,8 +59,9 @@ import os
 import re
 import secrets
 import time
+from collections.abc import Generator
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import structlog
@@ -206,14 +207,15 @@ def claim(
         path = _claim_path(goal_id)
         token = secrets.token_hex(8)
         now = time.time()
+        expires_at = now + max(60, int(ttl_seconds))
         rec = {
             "goal_id": goal_id,
             "token": token,
             "holder": holder,
             "pid": os.getpid() if pid == _AUTO_PID else pid,
             "host": os.uname().nodename,
-            "claimed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "expires_at": now + max(60, int(ttl_seconds)),
+            "claimed_at": datetime.now(UTC).isoformat(timespec="seconds"),
+            "expires_at": expires_at,
         }
 
         if not _write_claim(path, rec):
@@ -254,7 +256,7 @@ def claim(
             return None
 
         log.info("work_claim_granted", goal_id=goal_id, holder=holder, ttl=ttl_seconds)
-        return Claim(goal_id=goal_id, token=token, holder=holder, expires_at=rec["expires_at"])
+        return Claim(goal_id=goal_id, token=token, holder=holder, expires_at=expires_at)
     except Exception as e:
         # Fail OPEN — never let a bug here stall a goal with a deadline.
         log.warning("work_claim_error_failing_open", goal_id=goal_id, error=str(e))
@@ -302,14 +304,14 @@ def current(goal_id: str) -> dict[str, Any] | None:
     rec = _read(_claim_path(goal_id))
     if not rec:
         return None
-    stale, why = _is_stale(rec)
+    stale, _why = _is_stale(rec)
     if stale:
         return None
     return rec
 
 
 @contextlib.contextmanager
-def claimed(goal_id: str, **kw: Any):
+def claimed(goal_id: str, **kw: Any) -> Generator[Claim | None]:
     """Context manager: yields a Claim, or None when a peer holds the goal."""
     c = claim(goal_id, **kw)
     try:
@@ -350,8 +352,8 @@ def _main(argv: list[str]) -> int:
         token = argv[3] if len(argv) > 3 else ""
         return 0 if release(goal_id, token) else 1
     if cmd == "status":
-        held = current(goal_id)
-        print(json.dumps(held, indent=2) if held else f"FREE {goal_id}")
+        snapshot = current(goal_id)
+        print(json.dumps(snapshot, indent=2) if snapshot else f"FREE {goal_id}")
         return 0
     print(__doc__)
     return 2

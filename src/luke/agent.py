@@ -172,7 +172,7 @@ def _weekday_claim_error(text: str, today: date | None = None) -> str | None:
             # damaging class — appointments, deadlines, start dates), so it is
             # checked against that year alone. Outside the window it may be
             # loose historical prose, so any nearby year may vindicate it.
-            nearby = []
+            nearby: list[date] = []
             for y in (ref.year - 1, ref.year, ref.year + 1):
                 try:
                     nearby.append(date(y, month, day))
