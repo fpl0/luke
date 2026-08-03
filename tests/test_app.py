@@ -1168,12 +1168,51 @@ class TestExtractTopics:
         topics = _extract_topics(msgs, [])
         assert topics == []
 
-    def test_includes_agent_texts(self) -> None:
+    # --- topics must come from what the USER said -------------------------
+    # Including the agent's reply meant reporting word-frequency over Luke's
+    # own prose: a live block produced "Active topics: top, mostly, mission,
+    # two" — four sentence-openers from its previous message. Luke called it
+    # "noise being presented as signal — worse than empty, because it looks
+    # like a summary."
+
+    def test_ignores_the_agent_reply(self) -> None:
+        from luke.app import _extract_topics
+
+        reply = (
+            "Mostly it was there. Mostly. The mission question, the mission. "
+            "Two things I noticed, two. The top of you, the top."
+        )
+        topics = _extract_topics([_make_msg("how did the visa scheduling go?")], [reply])
+        for noise in ("mostly", "mission", "two", "top"):
+            assert noise not in topics, f"leaked {noise!r} from the agent reply"
+
+    def test_agent_messages_in_the_batch_are_excluded(self) -> None:
+        from luke.app import _extract_topics
+        from luke.config import settings
+
+        agent_msg = _make_msg("kubernetes kubernetes kubernetes")
+        agent_msg.sender_name = settings.assistant_name
+        topics = _extract_topics([_make_msg("visa visa"), agent_msg], [])
+        assert "kubernetes" not in topics
+
+    def test_empty_rather_than_noise(self) -> None:
+        """One-off words are not topics; empty beats a fake summary."""
+        from luke.app import _extract_topics
+
+        assert _extract_topics([_make_msg("hey quick question")], []) == []
+
+    def test_excludes_agent_texts(self) -> None:
+        """Inverted 2026-08-03: including the reply was the defect.
+
+        Luke's reply is an order of magnitude longer than the message that
+        prompted it, so folding it in meant the field summarised Luke rather
+        than the conversation.
+        """
         from luke.app import _extract_topics
 
         msgs = [_make_msg("something unrelated")]
         topics = _extract_topics(msgs, ["deployment deployment deployment pipeline pipeline"])
-        assert "deployment" in topics
+        assert "deployment" not in topics
 
     def test_requires_frequency_2(self) -> None:
         from luke.app import _extract_topics

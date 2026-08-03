@@ -540,13 +540,23 @@ async def process(chat_id: str) -> None:
 
 
 def _extract_topics(messages: list[db.StoredMessage], agent_texts: list[str]) -> list[str]:
-    """Extract active topics from conversation using keyword frequency."""
+    """Extract active topics from what the USER said.
+
+    Deliberately ignores ``agent_texts``. Luke's reply is an order of magnitude
+    longer than the message that prompted it, so including it meant the field
+    reported word-frequency over Luke's own prose: an audit of a live block
+    produced "Active topics: top, mostly, mission, two" — four sentence-openers
+    lifted from its previous message. As Luke put it, that is "noise being
+    presented as signal — worse than empty, because it looks like a summary".
+
+    ``agent_texts`` is kept in the signature because the caller passes it and
+    the symmetry with _extract_pending_actions is worth more than the argument.
+    """
     from collections import Counter
 
-    # Combine all text
-    all_text = " ".join(m.content.lower() for m in messages)
-    if agent_texts:
-        all_text += " " + " ".join(t.lower() for t in agent_texts)
+    all_text = " ".join(
+        m.content.lower() for m in messages if m.sender_name != settings.assistant_name
+    )
     # Simple stopword filter + word frequency
     stopwords = {
         "the",
@@ -732,17 +742,19 @@ def _save_conv_state(
     # made the block claim a freshness the conversation didn't have.
     last_exchange = recent[-1]["timestamp"][:16] if recent else now
 
-    # Build conversation thread: recent history + current exchange
-    lines: list[str] = []
-    for m in recent[-10:]:
-        preview = m["content"][:500]
-        lines.append(f"**{m['sender_name']}** ({m['timestamp'][:16]}): {preview}")
+    # Build conversation thread: recent history + current exchange.
+    # Truncate on a word boundary and mark the gap — a bare [:500] cut mid-word
+    # and, on a multi-line message, left orphan fragments with no speaker label.
+    def _line(sender: str, ts: str, content: str) -> str:
+        return f"**{sender}** ({ts[:16]}): {context._truncate(content, 500, hint='')}"
+
+    lines: list[str] = [_line(m["sender_name"], m["timestamp"], m["content"]) for m in recent[-10:]]
 
     # Add current batch messages if not already in recent
     recent_contents = {r["content"][:50] for r in recent}
     for msg in messages[-5:]:
         if msg.content[:50] not in recent_contents:
-            lines.append(f"**{msg.sender_name}** ({msg.timestamp[:16]}): {msg.content[:500]}")
+            lines.append(_line(msg.sender_name, msg.timestamp, msg.content))
 
     # Add the agent response — but only if it isn't already in `recent`.
     # It usually IS: the reply is stored to `messages` by the send path before
@@ -751,7 +763,7 @@ def _save_conv_state(
     # the conversation read ~20 minutes fresher than it was. The user batch
     # above has always had this guard; the agent side never did.
     if agent_texts and agent_texts[-1][:50] not in recent_contents:
-        lines.append(f"**{assistant}** ({now}): {agent_texts[-1][:800]}")
+        lines.append(f"**{assistant}** ({now}): {context._truncate(agent_texts[-1], 800, hint='')}")
 
     # Structured header + message thread
     structured = ""

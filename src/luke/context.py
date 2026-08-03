@@ -221,7 +221,7 @@ def _is_feedback(mem_id: str, tags_json: str) -> bool:
     return mem_id.startswith("feedback-") or '"feedback"' in (tags_json or "")
 
 
-def _truncate(text: str, limit: int) -> str:
+def _truncate(text: str, limit: int, *, hint: str = " — Read the file for the rest") -> str:
     """Cut at a word boundary and say what was lost.
 
     A bare ``text[:limit]`` lands mid-word, which is worse than it looks:
@@ -241,7 +241,7 @@ def _truncate(text: str, limit: int) -> str:
     cut = head.rfind(" ")
     if cut > limit * 0.6:  # only honour the boundary if it isn't a huge loss
         head = head[:cut]
-    return f"{head}… [+{len(text) - len(head)} more chars — Read the file for the rest]"
+    return f"{head}… [+{len(text) - len(head)} more chars{hint}]"
 
 
 def _render_line(memory: dict[str, Any], spec: RenderSpec) -> str:
