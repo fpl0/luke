@@ -9,7 +9,6 @@ Provides runtime context management for the agent:
 from __future__ import annotations
 
 import math
-import struct
 from contextlib import suppress
 from datetime import UTC, datetime
 from typing import Any, NamedTuple
@@ -230,29 +229,22 @@ def _recency_score(updated_iso: str, half_life_days: float = 14.0) -> float:
     return math.exp(-math.log(2) * age_days / half_life_days)
 
 
-def _cosine_similarity(a: list[float], b_blob: bytes) -> float:
-    """Cosine similarity between a list[float] and a packed-float blob."""
-    dim = len(a)
-    try:
-        b: tuple[float, ...] = struct.unpack(f"{dim}f", b_blob)
-    except struct.error:
-        return 0.0
-    dot = sum(x * y for x, y in zip(a, b, strict=True))
-    norm_a = math.sqrt(sum(x * x for x in a))
-    norm_b = math.sqrt(sum(y * y for y in b))
-    if norm_a == 0 or norm_b == 0:
-        return 0.0
-    return dot / (norm_a * norm_b)
-
-
-def _load_priority_memories(query: str = "") -> list[dict[str, Any]]:
+def _load_priority_memories() -> list[dict[str, Any]]:
     """Load active memories scored for context injection priority.
 
-    When *query* is non-empty, embeds it and adds semantic similarity as a
-    scoring factor (25% weight). Falls back to static scoring when empty.
+    Deliberately NOT query-aware. This layer's job is standing context — what
+    is true regardless of what was just asked. Query relevance is the recall
+    layer's job, and it does it properly: sqlite-vec KNN in C, fused with FTS
+    via RRF, instead of a pure-Python cosine over every memory in the corpus.
+
+    The query branch that used to live here embedded the same string recall()
+    was already embedding — two HTTP round trips per run — then scanned every
+    vector to reorder the result. Measured on the live corpus: 15.9x the wall
+    time (124ms vs 8ms) to change 11% of the selected set, and that 11% is
+    exactly what the recall layer surfaces anyway.
 
     Returns dicts with: id, type, title, content, importance, updated,
-    access_count, score.
+    access_count, is_feedback, score.
     """
     db = _db()
     rows = db.execute(
@@ -277,31 +269,6 @@ def _load_priority_memories(query: str = "") -> list[dict[str, Any]]:
     # scoring below (via human access-recency); this handles directives only.
     rows = [r for r in rows if r["suppression"] < 1.0]
 
-    # --- Query-aware scoring: embed query and load memory vectors ---
-    query_vec: list[float] | None = None
-    vec_map: dict[str, bytes] = {}  # mem_id → packed embedding blob
-    if query.strip():
-        try:
-            from .memory import _embed_query
-
-            query_vec = _embed_query(query)
-        except Exception:
-            log.warning("context_query_embed_failed")
-            query_vec = None
-
-    if query_vec is not None:
-        id_set = [r["id"] for r in rows]
-        if id_set:
-            placeholders = ",".join("?" for _ in id_set)
-            vec_rows = db.execute(
-                f"SELECT memory_id, embedding FROM memory_vec WHERE memory_id IN ({placeholders})",
-                id_set,
-            ).fetchall()
-            for vr in vec_rows:
-                vec_map[vr["memory_id"]] = vr["embedding"]
-
-    has_query = query_vec is not None and len(vec_map) > 0
-
     max_access = max((r["access_count"] for r in rows), default=1) or 1
     log_max = math.log1p(max_access)
 
@@ -311,16 +278,8 @@ def _load_priority_memories(query: str = "") -> list[dict[str, Any]]:
         rec = _recency_score(r["updated"])
         freq = math.log1p(r["access_count"]) / log_max if log_max > 0 else 0.5
 
-        if has_query:
-            # Query-aware: importance 30%, recency 25%, access 20%, similarity 25%
-            sim = 0.0
-            blob = vec_map.get(r["id"])
-            if blob is not None and query_vec is not None:
-                sim = max(0.0, _cosine_similarity(query_vec, blob))
-            score = 0.30 * imp + 0.25 * rec + 0.20 * freq + 0.25 * sim
-        else:
-            # Static fallback: importance 40%, recency 35%, access 25%
-            score = 0.40 * imp + 0.35 * rec + 0.25 * freq
+        # importance 40%, recency 35%, access 25%
+        score = 0.40 * imp + 0.35 * rec + 0.25 * freq
 
         # Access-recency: how recently this memory was actually USED, not
         # edited. `updated` is a poor staleness signal — dream/cron sessions
@@ -461,15 +420,14 @@ def _build_recent_outputs_block(chat_id: str, limit: int) -> str | None:
     return "\n".join(lines)
 
 
-def build_working_context(
-    query: str = "",
-    budget_tokens: int = _WORKING_MEMORY_BUDGET,
-) -> str:
+def build_working_context(budget_tokens: int = _WORKING_MEMORY_BUDGET) -> str:
     """Build a working memory block for system prompt injection.
 
     Scores all active memories by importance/recency/access, selects
     the top ones within token budget, and formats them as a structured
     context block the agent can reference.
+
+    Takes no query: this is standing context. See _load_priority_memories.
 
     Returns empty string if no memories qualify or DB is unavailable.
     """
@@ -495,7 +453,7 @@ def build_working_context(
         return "\n\n".join(parts)
 
     try:
-        memories = _load_priority_memories(query=query)
+        memories = _load_priority_memories()
     except Exception as e:
         log.warning("context_load_failed", error=str(e))
         return _prepended(None)

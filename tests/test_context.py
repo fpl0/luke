@@ -900,3 +900,40 @@ class TestFeedbackReserve:
         assert context._is_feedback("insight-y", '["feedback", "tone"]')
         assert not context._is_feedback("insight-y", '["reflexion"]')
         assert not context._is_feedback("insight-y", "")
+
+
+class TestBackgroundLayerIsStanding:
+    """The background layer must not become query-aware again.
+
+    It once embedded the same query recall() was already embedding — two HTTP
+    round trips per run — then scanned every vector in the corpus to reorder
+    the result. Measured 15.9x the wall time to change 11% of the selection,
+    and that 11% is what the recall layer surfaces anyway.
+    """
+
+    def test_load_priority_memories_takes_no_query(self) -> None:
+        import inspect
+
+        params = inspect.signature(context._load_priority_memories).parameters
+        assert "query" not in params
+
+    def test_build_working_context_takes_no_query(self) -> None:
+        import inspect
+
+        params = inspect.signature(context.build_working_context).parameters
+        assert "query" not in params
+
+    def test_does_not_embed(self, test_db: Any, monkeypatch: Any) -> None:
+        """Building standing context must issue no embedding call at all."""
+        conn = db._db()
+        _insert_memory(conn, "entity-a", "entity", "A", "content", importance=1.5)
+
+        calls: list[Any] = []
+
+        def _boom(texts: list[str]) -> None:
+            calls.append(texts)
+            return None
+
+        monkeypatch.setattr("luke.memory._embed_via_server", _boom)
+        context.build_working_context()
+        assert calls == [], "background layer embedded something"

@@ -2161,9 +2161,7 @@ async def run_agent(
     prompt_text_for_context = _context_query(prompt, user_text)
     _EFFORT_BUDGET = {"low": 3_000, "medium": 6_000, "high": 12_000, "max": 12_000}
     ctx_budget = 12_000 if autonomous else _EFFORT_BUDGET.get(effort or "high", 12_000)
-    working_ctx = context.build_working_context(
-        query=prompt_text_for_context, budget_tokens=ctx_budget
-    )
+    working_ctx = context.build_working_context(budget_tokens=ctx_budget)
     system_append = _compose_system_append(persona, working_ctx)
 
     # Per-run counters and timing state (closed over by hooks)
