@@ -1204,7 +1204,9 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
     @tool(
         "remember",
         "Save memory. type: entity|episode|procedure|insight|goal. "
-        "importance: 0.1-2.0 (default 1.0). Returns change summary on entity update.",
+        "importance: 0.1-2.0 — omit it unless you have a specific reason; "
+        "omitting preserves the existing value on update, and above 1.5 is a "
+        "scarce band. Returns change summary on entity update.",
         # Full JSON Schema (not a plain type-dict): the Agent SDK marks EVERY key
         # of a plain dict as required, which rejected any remember() call omitting
         # tags/links/importance at the MCP validation layer — before mem_save's

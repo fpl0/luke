@@ -497,6 +497,32 @@ _MIGRATIONS: list[tuple[int, str, list[str]]] = [
             "WHERE human_last_accessed = ''",
         ],
     ),
+    (
+        15,
+        "renormalize auto-extracted procedures minted at the importance ceiling",
+        [
+            # behaviors.py's skill-extraction prompt instructed
+            # "importance: 2.0 (procedures are high-value)", minting one
+            # ceiling-valued procedure per extraction run — 266 of them, and
+            # accelerating (117 in July alone). The effect was a monoculture:
+            # procedures are 28% of the corpus but took 64% of every injected
+            # memory set, and they held 179 of the 225 slots above the
+            # importance>=1.5 injection floor.
+            #
+            # Reset to the tool default. Extraction is a hypothesis that
+            # something is reusable, not evidence that it is; the ranker
+            # settles that by watching whether the memory actually gets used.
+            # The 1.92-2.00 spread among them is decay noise (decay is
+            # access-modulated), so no ordering worth preserving is lost.
+            #
+            # Scoped by tag so human-authored high-importance procedures are
+            # untouched — risk-tiers-approved (1.95) is the one procedure at
+            # this level that a person actually vouched for.
+            "UPDATE memory_meta SET importance = 1.0 "
+            "WHERE type = 'procedure' AND importance >= 1.9 "
+            "AND tags_json LIKE '%auto-extracted%'",
+        ],
+    ),
 ]
 
 

@@ -633,3 +633,79 @@ class TestCountRecentOutbound:
         # Very short window (0 seconds) should exclude it (message is at least 1ms old)
         # Use a more realistic check — just verify the parameter works
         assert test_db.count_recent_outbound("12345", window_seconds=7200) == 1
+
+
+# ---------------------------------------------------------------------------
+# Migrations
+# ---------------------------------------------------------------------------
+
+
+class TestMigration15:
+    """Renormalization of auto-extracted procedures minted at the ceiling.
+
+    This migration rewrites live user data, so it is scoped by tag rather than
+    by value alone. These tests pin that scoping: everything a person vouched
+    for must survive it.
+    """
+
+    @staticmethod
+    def _seed(conn: Any, mem_id: str, mem_type: str, importance: float, tags: str) -> None:
+        now = datetime.now(UTC).isoformat()
+        conn.execute(
+            "INSERT INTO memory_meta (id, type, importance, tags_json, links_json, "
+            "created, updated, last_accessed, status) "
+            "VALUES (?, ?, ?, ?, '[]', ?, ?, ?, 'active')",
+            (mem_id, mem_type, importance, tags, now, now, now),
+        )
+
+    @staticmethod
+    def _rerun(conn: Any) -> None:
+        """Rewind past migration 15 and replay it."""
+        from luke.db import _run_migrations
+
+        conn.execute("DELETE FROM schema_version WHERE version >= 15")
+        conn.commit()
+        _run_migrations(conn)
+
+    def test_resets_auto_extracted_procedures(self, test_db: Any) -> None:
+        conn = test_db._db()
+        self._seed(conn, "proc-auto", "procedure", 1.99, '["skill", "auto-extracted"]')
+        conn.commit()
+        self._rerun(conn)
+        row = conn.execute("SELECT importance FROM memory_meta WHERE id = 'proc-auto'").fetchone()
+        assert row["importance"] == 1.0
+
+    def test_preserves_human_authored_procedures(self, test_db: Any) -> None:
+        """A procedure a person vouched for keeps its importance."""
+        conn = test_db._db()
+        self._seed(conn, "proc-human", "procedure", 1.95, '["governance", "approved"]')
+        conn.commit()
+        self._rerun(conn)
+        row = conn.execute("SELECT importance FROM memory_meta WHERE id = 'proc-human'").fetchone()
+        assert row["importance"] == pytest.approx(1.95)
+
+    def test_leaves_other_types_alone(self, test_db: Any) -> None:
+        """Only procedures were minted at the ceiling; nothing else is touched."""
+        conn = test_db._db()
+        self._seed(conn, "entity-core", "entity", 2.0, '["auto-extracted"]')
+        conn.commit()
+        self._rerun(conn)
+        row = conn.execute("SELECT importance FROM memory_meta WHERE id = 'entity-core'").fetchone()
+        assert row["importance"] == pytest.approx(2.0)
+
+    def test_leaves_below_threshold_alone(self, test_db: Any) -> None:
+        conn = test_db._db()
+        self._seed(conn, "proc-mid", "procedure", 1.4, '["auto-extracted"]')
+        conn.commit()
+        self._rerun(conn)
+        row = conn.execute("SELECT importance FROM memory_meta WHERE id = 'proc-mid'").fetchone()
+        assert row["importance"] == pytest.approx(1.4)
+
+    def test_idempotent(self, test_db: Any) -> None:
+        conn = test_db._db()
+        self._seed(conn, "proc-auto", "procedure", 1.99, '["auto-extracted"]')
+        conn.commit()
+        self._rerun(conn)
+        self._rerun(conn)
+        row = conn.execute("SELECT importance FROM memory_meta WHERE id = 'proc-auto'").fetchone()
+        assert row["importance"] == 1.0

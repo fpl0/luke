@@ -1233,7 +1233,14 @@ async def run_skill_extraction(bot: Bot, sem: asyncio.Semaphore) -> None:
         "- type: procedure\n"
         "- id: a descriptive kebab-case ID (e.g., 'proc-deploy-luke-production')\n"
         "- tags: ['skill', 'auto-extracted'] + relevant domain tags\n"
-        "- importance: 2.0 (procedures are high-value)\n"
+        # Omit, don't lower: mem_save passes importance=None when the parameter
+        # is absent, and index_memory then PRESERVES the stored value. Naming
+        # any number here makes every re-extraction clobber whatever the ranker
+        # has learned about the procedure since.
+        "- importance: omit this parameter entirely. The default is correct for\n"
+        "  an auto-extracted procedure — extraction is a hypothesis that\n"
+        "  something is reusable, not evidence that it is. The ranker promotes\n"
+        "  procedures that actually get used and demotes the ones that don't.\n"
         "- Content must follow this format:\n"
         "  ## When to Use\n"
         "  [trigger conditions]\n\n"

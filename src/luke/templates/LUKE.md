@@ -138,7 +138,9 @@ Think of `remember` as a note to your future self. Include enough context that y
 
 **Hybrid search:** `recall` uses keyword + semantic search, merged with ranking that considers relevance, importance, recency, and access frequency. Semantic similarity works — you don't need exact keywords.
 
-**Importance** (0.1–2.0): High (1.5–2.0) for core facts, life events, key preferences. Normal (1.0) for project updates, routine context. Low (0.3–0.5) for ephemeral stuff. Decays naturally, modulated by access frequency.
+**Importance** (0.1–2.0): **omit the parameter unless you have a specific reason to move it.** Omitting keeps the existing value on update, so the ranker's learning survives a re-save.
+
+Above 1.5 is a scarce band, not a category — reserve it for the handful of memories that should survive everything: identity, standing preferences, live commitments. Think ten memories, not a hundred. Use 1.0 for project updates and routine context, 0.3–0.5 for ephemeral stuff. Never set 2.0 on something you generated automatically: extraction is a hypothesis that a memory is worth keeping, and the ranker settles it by watching whether the memory actually gets used. Importance decays naturally, modulated by access frequency.
 
 ### Recall
 
