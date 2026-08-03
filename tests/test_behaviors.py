@@ -736,7 +736,7 @@ class TestDeepWorkPeerYield:
             patch("luke.behaviors.bus"),
             patch("luke.behaviors.memory") as mock_memory,
             patch("luke.behaviors.run_agent", new_callable=AsyncMock) as mock_agent,
-            patch("luke.behaviors.send_long_message", new_callable=AsyncMock) as mock_send,
+            patch("luke.behaviors.send_long_message", new_callable=AsyncMock),
         ):
             mock_db.get_quality_blocked_goals.return_value = []
             mock_db.get_recent_quality_scores.return_value = []
@@ -745,8 +745,12 @@ class TestDeepWorkPeerYield:
             await run_deep_work(AsyncMock(), _SEM)
 
         mock_agent.assert_called_once()
-        starting = [c.args[2] for c in mock_send.call_args_list if "starting" in c.args[2]]
-        assert starting and "g2" in starting[0] and "g1" not in starting[0]
+        # Read the goal off the session prompt, not off a chat message. The
+        # start ping used to carry it, but announcing that a process began is
+        # exactly the play-by-play the persona forbids, so it is gone.
+        prompt = mock_agent.call_args.kwargs["prompt"]
+        active = prompt.split("Active goals (priority order):")[1].split("\n\n")[0]
+        assert "g2" in active and "g1" not in active
 
 
 # ---------------------------------------------------------------------------
@@ -762,9 +766,7 @@ class TestDeepWorkLifecycleNotifications:
         )
         return [{"id": "g1", "type": "goal", "title": "Goal 1", "score": 1.0}]
 
-    async def test_start_and_outcome_sent(self, tmp_settings: Any) -> None:
-        """Filipe is informed of session start and outcome deterministically —
-        never dependent on the agent choosing to speak."""
+    async def _run(self, tmp_settings: Any, summary: str | None = None) -> list[str]:
         from luke.behaviors import run_deep_work
 
         goals = self._goal_fixture(tmp_settings)
@@ -773,6 +775,7 @@ class TestDeepWorkLifecycleNotifications:
             patch("luke.behaviors.bus"),
             patch("luke.behaviors.memory") as mock_memory,
             patch("luke.behaviors.run_agent", new_callable=AsyncMock) as mock_agent,
+            patch("luke.behaviors._latest_deep_work_summary", return_value=summary),
             patch("luke.behaviors.send_long_message", new_callable=AsyncMock) as mock_send,
         ):
             mock_db.get_quality_blocked_goals.return_value = []
@@ -780,10 +783,28 @@ class TestDeepWorkLifecycleNotifications:
             mock_memory.recall.return_value = goals
             mock_agent.return_value = MagicMock(texts=[])
             await run_deep_work(AsyncMock(), _SEM)
+        return [c.args[2] for c in mock_send.call_args_list]
 
-        texts = [c.args[2] for c in mock_send.call_args_list]
-        assert any("Deep work session starting" in t and "g1" in t for t in texts)
-        assert any("Deep work session done" in t for t in texts)
+    async def test_session_that_moved_nothing_says_nothing(self, tmp_settings: Any) -> None:
+        """No plan change and no summary means silence.
+
+        The old code sent "🔨 starting" and "✅ done (16m)" unconditionally —
+        20 such messages in 30 days, none carrying an outcome. Telling Filipe a
+        process ran is the internal play-by-play his persona file forbids.
+        """
+        texts = await self._run(tmp_settings)
+        assert texts == []
+
+    async def test_session_that_produced_something_reports_it(self, tmp_settings: Any) -> None:
+        """The deterministic notice survives — it just needs an outcome.
+
+        This is the half that must not regress: the agent left ~10/12
+        autonomous sessions unannounced on its own.
+        """
+        texts = await self._run(tmp_settings, summary="Shipped the parser.")
+        assert any("Shipped the parser." in t for t in texts)
+        # Elapsed minutes are telemetry, and they are already in the logs.
+        assert not any("m)." in t for t in texts)
 
     async def test_failed_session_notifies(self, tmp_settings: Any) -> None:
         """A dead session is announced, not silently swallowed."""
@@ -803,7 +824,7 @@ class TestDeepWorkLifecycleNotifications:
             await run_deep_work(AsyncMock(), _SEM)
 
         texts = [c.args[2] for c in mock_send.call_args_list]
-        assert any("session errored" in t for t in texts)
+        assert any("Deep work errored" in t for t in texts)
 
     async def test_timeout_is_reported_as_timeout_not_crash(self, tmp_settings: Any) -> None:
         """A session that runs out of wall clock must not read as a crash."""

@@ -965,25 +965,26 @@ async def run_deep_work(bot: Bot, sem: asyncio.Semaphore) -> None:
         "10. If the goal is complete: update plan status to completed, update goal memory\n"
         "11. If blocked: update plan status to blocked, note what you need\n"
         "12. Save a summary episode (deep-work-log) of what was accomplished\n\n"
-        "Session start and outcome are announced to Filipe automatically — do not "
-        "duplicate them. You may send at most ONE additional message per session, "
-        "only if truly blocked; prefer updating the plan's Blockers section.\n"
+        "A session that moved a plan announces itself to Filipe automatically — do "
+        "not duplicate that. A session that moved nothing says nothing, and that is "
+        "correct: he does not need to know you woke up. You may send at most ONE "
+        "additional message per session, only if truly blocked; prefer updating the "
+        "plan's Blockers section.\n"
         "You have full tool access: web search, code, files, memory.\n"
     )
 
     # Track that orient phase completed (all gates passed, goals reviewed)
     bus.emit("deep_work_oriented", {"goals_reviewed": len(goals)})
 
-    # Lifecycle notifications: deterministic, code-side, so Filipe is informed
-    # of start / progress / completion regardless of what the agent chooses to
-    # say (historically ~10/12 autonomous sessions sent nothing).
+    # Outcome notification: deterministic and code-side, because the agent left
+    # ~10/12 autonomous sessions unannounced. But deterministic is not the same
+    # as unconditional — the start ping and the "done (16m)" receipt told Filipe
+    # that a process ran, which is the internal/technical play-by-play his own
+    # persona file forbids. What survives is the outcome: a plan that moved, or
+    # a session that broke. A session that changed nothing now says nothing.
     statuses_before = {gid: _parse_plan_status(gid) for gid in active_goal_ids}
     started_iso = datetime.now(UTC).isoformat()
     started_mono = time.monotonic()
-    await _notify(
-        bot,
-        "🔨 Deep work session starting — goals on deck: " + ", ".join(active_goal_ids),
-    )
 
     # The finally covers the whole session — the window that actually matters,
     # since a claim held past the work is what lets a peer walk in. An exception
@@ -1016,10 +1017,10 @@ async def run_deep_work(bot: Bot, sem: asyncio.Semaphore) -> None:
                 )
             else:
                 reason = f"errored after {mins}m"
-            await _notify(bot, f"⚠️ Deep work session {reason} — it will retry next cycle.")
+            await _notify(bot, f"Deep work {reason} — it'll retry next cycle.")
             return
 
-        lines = [f"✅ Deep work session done ({mins}m)."]
+        lines: list[str] = []
         for gid in active_goal_ids:
             before, after = statuses_before.get(gid), _parse_plan_status(gid)
             if after == "completed" and before != "completed":
@@ -1029,7 +1030,12 @@ async def run_deep_work(bot: Bot, sem: asyncio.Semaphore) -> None:
         summary = _latest_deep_work_summary(started_iso)
         if summary:
             lines.append(summary)
-        await _notify(bot, "\n".join(lines))
+        # Silence when nothing moved. The elapsed minutes are deliberately gone:
+        # how long it took is telemetry, and it is already in the logs.
+        if lines:
+            await _notify(bot, "\n".join(lines))
+        else:
+            log.info("deep_work_silent", goals=active_goal_ids, minutes=mins)
     finally:
         for c in claims:
             # Only release a claim we really own. A fail-open claim carries an
