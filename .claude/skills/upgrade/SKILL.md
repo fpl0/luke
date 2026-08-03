@@ -148,11 +148,35 @@ Compare the two files:
 diff "$LUKE_DIR/LUKE.md" src/luke/templates/LUKE.md
 ```
 
-If they differ, AskUserQuestion: "The persona template (LUKE.md) has been updated. Would you like to:\n1. Replace your current persona with the new template\n2. See the diff and merge manually\n3. Keep your current persona unchanged"
+**Read the diff in both directions before offering anything.** This step is not
+a one-way sync: the live copy is edited at runtime and drifts *ahead* of the
+template, not just behind it. On 2026-08-03 the live file was 98 lines ahead —
+Active Attention, the Reflexion Loop and Quality Gates existed only there — so
+`cp` would have silently deleted three working sections.
 
-- **Option 1:** Copy the new template over: `cp src/luke/templates/LUKE.md "$LUKE_DIR/LUKE.md"`
-- **Option 2:** Show the diff output and let the user decide what to keep
-- **Option 3:** Skip — no action needed
+Classify the diff first:
+
+```bash
+diff "$LUKE_DIR/LUKE.md" src/luke/templates/LUKE.md | grep '^<'   # live-only — WOULD BE DESTROYED by cp
+diff "$LUKE_DIR/LUKE.md" src/luke/templates/LUKE.md | grep '^>'   # template-only — the actual upgrade
+```
+
+If there is **no** live-only content, offer the copy. If there **is**, say what
+would be lost, by name, and default to merging: port the live-only sections back
+into the template (they are usually real features that never made it into the
+repo), then sync — so the next upgrade starts from zero drift.
+
+AskUserQuestion: "The persona template has changed. Live-only sections that
+would be lost: <list, or 'none'>. Would you like to:\n1. Port the live-only
+sections into the template, then sync both (recommended when the list is
+non-empty)\n2. Replace your persona with the template as-is\n3. Keep your
+persona unchanged"
+
+- **Option 1:** Edit `src/luke/templates/LUKE.md` to absorb the live-only content, commit it, then `cp src/luke/templates/LUKE.md "$LUKE_DIR/LUKE.md"`
+- **Option 2:** `cp src/luke/templates/LUKE.md "$LUKE_DIR/LUKE.md"` — only safe when the live-only list is empty
+- **Option 3:** Skip — but the drift compounds, so say so
+
+Back up before any write: `cp "$LUKE_DIR/LUKE.md" "$LUKE_DIR/backups/LUKE.md.pre-upgrade-$(date +%Y%m%d)"`
 
 ## 6. Regenerate launchd Plist
 
