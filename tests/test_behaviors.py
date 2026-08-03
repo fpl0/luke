@@ -624,7 +624,7 @@ class TestRunDeepWork:
 
 class TestDeepWorkPeerYield:
     """The 2026-08-02 11:07Z collision: a deep-work tick woke 7 minutes into the
-    11:00 build cron's session, both driving goal-letta-parity. Per-task-id dedup
+    11:00 build cron's session, both driving goal-parity-build. Per-task-id dedup
     does not see it, and the claim was only advisory prompt text in three cron
     prompts — nothing covered this path.
     """
@@ -657,7 +657,7 @@ class TestDeepWorkPeerYield:
             mock_db.get_recent_quality_scores.return_value = []
             mock_memory.recall.return_value = goals
             mock_attention.list_attention.return_value = [
-                {"id": "32", "content": "LETTA — build continues", "origin": "luke"}
+                {"id": "32", "content": "parity build continues", "origin": "luke"}
             ]
             await run_deep_work(AsyncMock(), _SEM)
 

@@ -51,21 +51,6 @@ def fake_embed_server(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("luke.memory._embed_via_server", _fake)
 
 
-@pytest.fixture(autouse=True)
-def sqlite_backends_guard(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Force the sqlite/sdk backends for every test, whatever .env says.
-
-    On the live machine .env sets MEMORY_BACKEND=letta — without this, any test
-    that indexes a memory would write-through real passages into the live Letta
-    archive, and recalls would hit the live server. Letta-path tests opt back in
-    explicitly and mock the HTTP layer.
-    """
-    monkeypatch.setattr(settings, "memory_backend", "sqlite")
-    monkeypatch.setattr(settings, "agent_backend", "sdk")
-    monkeypatch.setattr(settings, "letta_archive_id", "")
-    monkeypatch.setattr(settings, "letta_agent_id", "")
-
-
 @pytest.fixture()
 def tmp_settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
     """Redirect settings to use tmp_path for all data dirs."""

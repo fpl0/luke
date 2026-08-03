@@ -25,9 +25,9 @@ def store(tmp_settings: Any) -> Any:
 
 def test_first_claim_granted_second_denied(store: Any) -> None:
     """The actual 2026-08-02 collision: two sessions, same goal, one must yield."""
-    first = work_claim.claim("goal-letta-parity", holder="02:00 build")
+    first = work_claim.claim("goal-parity-build", holder="02:00 build")
     assert first is not None
-    second = work_claim.claim("goal-letta-parity", holder="03:03 deep work")
+    second = work_claim.claim("goal-parity-build", holder="03:03 deep work")
     assert second is None, "a second live session must be denied the same goal"
 
 
@@ -96,14 +96,12 @@ def test_corrupt_claim_file_does_not_block(store: Any) -> None:
     assert work_claim.claim("goal-x", holder="next") is not None
 
 
-def test_fails_open_when_the_store_is_broken(
-    store: Any, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_fails_open_when_the_store_is_broken(store: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     """The property that matters most: a bug in here must never stall a goal."""
     monkeypatch.setattr(
         work_claim.os, "makedirs", lambda *a, **k: (_ for _ in ()).throw(OSError("disk gone"))
     )
-    granted = work_claim.claim("goal-letta-parity", holder="deadline work")
+    granted = work_claim.claim("goal-parity-build", holder="deadline work")
     assert granted is not None, "an internal error must GRANT, never deny"
     assert granted.token == "", "a fail-open grant holds no releasable token"
 
@@ -161,18 +159,18 @@ def test_cli_denies_across_separate_processes(tmp_path: Any) -> None:
             env=env,
         )
 
-    first = run("acquire", "goal-letta-parity", "--holder", "build cron")
+    first = run("acquire", "goal-parity-build", "--holder", "build cron")
     assert first.returncode == 0, first.stderr
     token = first.stdout.strip().splitlines()[-1].strip()
 
-    second = run("acquire", "goal-letta-parity", "--holder", "deep work tick")
+    second = run("acquire", "goal-parity-build", "--holder", "deep work tick")
     assert second.returncode == 3, (
         "a separate process must be DENIED a goal another session holds; "
         f"got exit {second.returncode}: {second.stdout}"
     )
 
-    assert run("release", "goal-letta-parity", token).returncode == 0
-    assert run("acquire", "goal-letta-parity", "--holder", "next").returncode == 0
+    assert run("release", "goal-parity-build", token).returncode == 0
+    assert run("acquire", "goal-parity-build", "--holder", "next").returncode == 0
 
 
 def test_cli_status_reports_free_and_held(store: Any, capsys: Any) -> None:

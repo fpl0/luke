@@ -174,15 +174,15 @@ def read_frontmatter(path: Path) -> dict[str, Any]:
 # Embeddings (bge embed server + sqlite-vec)
 # ---------------------------------------------------------------------------
 # The model (BAAI/bge-base-en-v1.5 via fastembed) is loaded ONCE, in the
-# launchd-supervised embed server (scripts/bge_embed_server.py, :17595) that
-# also serves the Letta stack. Embedding in-process duplicated ~450MB of
-# identical weights per process; this HTTP seam keeps a single canonical copy.
+# launchd-supervised embed server (scripts/bge_embed_server.py, :17595).
+# Embedding in-process duplicated ~450MB of identical weights per process;
+# this HTTP seam keeps a single canonical copy.
 # fastembed's query_embed/passage_embed are both plain embed() for bge models,
 # so the server's /v1/embeddings returns bit-identical vectors to the old
 # in-process path — stored memory_vec rows remain valid.
 #
 # Failure semantics: the server is required infrastructure (supervised by
-# com.luke.bgeembed, probed by letta_stack_health.sh), but an unreachable
+# com.luke.bgeembed), but an unreachable
 # server at call time is a runtime error → return None. Recall degrades to
 # FTS-only and indexing proceeds without a vector; backfill_missing_embeddings
 # (hourly maintenance) heals the gap once the server is back.
@@ -677,17 +677,6 @@ def index_memory(
         except Exception:
             pass  # best-effort — don't fail index_memory over event
 
-    # Phase 2.2c: mirror this committed write into the Letta archive when backend=letta,
-    # so the shadow-run stays live instead of drifting between daily delta-syncs. Fully
-    # fail-safe (no-op off the letta backend; never raises). Reversible: delete this call
-    # + src/luke/letta_writer.py to revert.
-    try:
-        from .letta_writer import letta_write_through
-
-        letta_write_through(mem_id)
-    except Exception:
-        log.warning("letta_write_through_hook_failed", mem_id=mem_id)
-
     return embedding
 
 
@@ -777,23 +766,14 @@ def recall(
     query_embedding: list[float] | None = None
     if query:
         sem_results: list[dict[str, Any]] | None = None
-        # Letta backend (reversible via settings.memory_backend): source semantic
-        # candidates from the Letta vector store, falling back to sqlite-vec on any miss.
-        if settings.memory_backend == "letta":
-            from .letta_adapter import letta_semantic_search
-
-            sem_results = letta_semantic_search(
-                query, mem_type=mem_type, limit=limit, include_private=include_private
+        query_embedding = _embed_query(query)
+        if query_embedding is not None:
+            sem_results = _semantic_search(
+                query_embedding,
+                mem_type=mem_type,
+                limit=limit,
+                include_private=include_private,
             )
-        if sem_results is None:
-            query_embedding = _embed_query(query)
-            if query_embedding is not None:
-                sem_results = _semantic_search(
-                    query_embedding,
-                    mem_type=mem_type,
-                    limit=limit,
-                    include_private=include_private,
-                )
         if sem_results is not None:
             # Filter by cluster if provided
             if cluster_ids:
@@ -1251,21 +1231,6 @@ def archive_memory(mem_id: str) -> None:
         (mem_id,),
     )
     _commit(conn)
-    # Phase 2.2b: mirror the forget into the Letta ledger. At this point the FTS row is
-    # still present (cleanup_archived_fts is a separate lazy pass), so the write-through
-    # re-mirrors the passage carrying status='archived'; the adapter skips archived
-    # passages and the sqlite active-join drops them, so recall stays correct. Fail-safe.
-    _letta_status_write_through(mem_id)
-
-
-def _letta_status_write_through(mem_id: str) -> None:
-    """Fire the Letta write-through for a status/link change. Never raises."""
-    try:
-        from .letta_writer import letta_write_through
-
-        letta_write_through(mem_id)
-    except Exception:
-        log.warning("letta_write_through_hook_failed", mem_id=mem_id)
 
 
 def restore_memory(mem_id: str) -> bool:
@@ -1304,8 +1269,6 @@ def restore_memory(mem_id: str) -> bool:
                     ),
                 )
     _commit(conn)
-    # Phase 2.2b: mirror the restore (status back to 'active') into the Letta ledger.
-    _letta_status_write_through(mem_id)
     return True
 
 
@@ -1340,11 +1303,6 @@ def link_memories(from_id: str, to_id: str, relationship: str) -> bool:
         (from_id, to_id, relationship, now),
     )
     _commit(conn)
-    if cur.rowcount > 0:
-        # Phase 2.2b: a new edge was committed — re-mirror the from_id passage so its
-        # Letta `links` metadata reflects the live graph (the write-through reads
-        # memory_links, not links_json). Fail-safe; only on a genuinely new edge.
-        _letta_status_write_through(from_id)
     return cur.rowcount > 0
 
 
@@ -1365,12 +1323,6 @@ def invalidate_link(from_id: str, to_id: str, relationship: str) -> bool:
         (now, from_id, to_id, to_id, from_id, relationship),
     )
     _commit(conn)
-    if cur.rowcount > 0:
-        # Phase 2.2b: re-mirror both endpoints so their Letta `links` metadata drops the
-        # expired edge — link_memories() mirrors on edge creation, this is the removal
-        # half. Fail-safe, no-op off the letta backend.
-        _letta_status_write_through(from_id)
-        _letta_status_write_through(to_id)
     return cur.rowcount > 0
 
 
@@ -1469,7 +1421,7 @@ def prune_stale_reflections(max_age_days: int = 45, max_access: int = 2, limit: 
     reflexion-/dream-/counterfactual- insights accumulate from nightly
     behaviors; ones nothing recalled in six weeks are noise by definition
     (Filipe: "AI slop"). Consolidation owns the useful ones — this owns the
-    residue. Goes through archive_memory so the Letta mirror stays in sync.
+    residue. Goes through archive_memory so status changes stay consistent.
     """
     cutoff = (datetime.now(UTC) - timedelta(days=max_age_days)).isoformat()
     rows = (

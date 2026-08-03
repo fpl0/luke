@@ -56,7 +56,6 @@ from claude_agent_sdk.types import (
 from structlog.stdlib import BoundLogger
 
 from . import context, db, memory
-from . import letta_agent as _letta_agent
 from .bus import bus
 from .config import settings
 from .memory import MEMORY_DIRS, read_frontmatter, read_memory_body, sanitize_memory_id
@@ -105,12 +104,27 @@ _COMMITMENT_VERBS = re.compile(
 
 
 _MONTHS = {
-    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
-    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+    "jan": 1,
+    "feb": 2,
+    "mar": 3,
+    "apr": 4,
+    "may": 5,
+    "jun": 6,
+    "jul": 7,
+    "aug": 8,
+    "sep": 9,
+    "oct": 10,
+    "nov": 11,
+    "dec": 12,
 }
 _WEEKDAYS = {
-    "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
-    "friday": 4, "saturday": 5, "sunday": 6,
+    "monday": 0,
+    "tuesday": 1,
+    "wednesday": 2,
+    "thursday": 3,
+    "friday": 4,
+    "saturday": 5,
+    "sunday": 6,
 }
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
 # A yearless date resolving within this many days of now is treated as a
@@ -874,7 +888,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
     @tool(
         "send_message",
         "Send text. HTML tags (<b>,<i>,<code>,<pre>), NOT markdown. Auto-splits at 4096.",
-        _schema({"chat_id": str, "text": str, "silent": bool}, ['chat_id', 'silent']),
+        _schema({"chat_id": str, "text": str, "silent": bool}, ["chat_id", "silent"]),
         annotations=_OPEN_WORLD,
     )
     async def t_send(args: dict[str, Any]) -> dict[str, Any]:
@@ -889,7 +903,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
     @tool(
         "send_photo",
         "Send photo from local path",
-        _schema({"chat_id": str, "path": str, "caption": str}, ['chat_id', 'caption']),
+        _schema({"chat_id": str, "path": str, "caption": str}, ["chat_id", "caption"]),
         annotations=_OPEN_WORLD,
     )
     async def t_photo(args: dict[str, Any]) -> dict[str, Any]:
@@ -906,7 +920,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
     @tool(
         "send_document",
         "Send file/document from local path",
-        _schema({"chat_id": str, "path": str, "caption": str}, ['chat_id', 'caption']),
+        _schema({"chat_id": str, "path": str, "caption": str}, ["chat_id", "caption"]),
         annotations=_OPEN_WORLD,
     )
     async def t_doc(args: dict[str, Any]) -> dict[str, Any]:
@@ -923,7 +937,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
     @tool(
         "send_voice",
         "Send voice from local .ogg file",
-        _schema({"chat_id": str, "path": str}, ['chat_id']),
+        _schema({"chat_id": str, "path": str}, ["chat_id"]),
         annotations=_OPEN_WORLD,
     )
     async def t_voice(args: dict[str, Any]) -> dict[str, Any]:
@@ -936,7 +950,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
     @tool(
         "send_video",
         "Send video from local path",
-        _schema({"chat_id": str, "path": str, "caption": str}, ['chat_id', 'caption']),
+        _schema({"chat_id": str, "path": str, "caption": str}, ["chat_id", "caption"]),
         annotations=_OPEN_WORLD,
     )
     async def t_video(args: dict[str, Any]) -> dict[str, Any]:
@@ -953,7 +967,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
     @tool(
         "send_location",
         "Send GPS location",
-        _schema({"chat_id": str, "latitude": float, "longitude": float}, ['chat_id']),
+        _schema({"chat_id": str, "latitude": float, "longitude": float}, ["chat_id"]),
         annotations=_OPEN_WORLD,
     )
     async def t_loc(args: dict[str, Any]) -> dict[str, Any]:
@@ -967,7 +981,10 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
     @tool(
         "send_poll",
         "Create poll. options: list of strings e.g. ['Yes','No']",
-        _schema({"chat_id": str, "question": str, "options": list, "is_anonymous": bool}, ['chat_id', 'is_anonymous']),
+        _schema(
+            {"chat_id": str, "question": str, "options": list, "is_anonymous": bool},
+            ["chat_id", "is_anonymous"],
+        ),
         annotations=_OPEN_WORLD,
     )
     async def t_poll(args: dict[str, Any]) -> dict[str, Any]:
@@ -990,7 +1007,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
         "send_buttons",
         "Send message with inline buttons. buttons: rows of [{text,data}]. "
         "Pressed button sends '[Button pressed: data]' as new message.",
-        _schema({"chat_id": str, "text": str, "buttons": list}, ['chat_id']),
+        _schema({"chat_id": str, "text": str, "buttons": list}, ["chat_id"]),
         annotations=_OPEN_WORLD,
     )
     async def t_buttons(args: dict[str, Any]) -> dict[str, Any]:
@@ -1015,7 +1032,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
     @tool(
         "reply",
         "Reply to msg:{id} from prompt. HTML tags, NOT markdown.",
-        _schema({"chat_id": str, "message_id": str, "text": str}, ['chat_id']),
+        _schema({"chat_id": str, "message_id": str, "text": str}, ["chat_id"]),
         annotations=_OPEN_WORLD,
     )
     async def t_reply(args: dict[str, Any]) -> dict[str, Any]:
@@ -1046,7 +1063,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
     @tool(
         "react",
         "React with emoji",
-        _schema({"chat_id": str, "message_id": str, "emoji": str}, ['chat_id']),
+        _schema({"chat_id": str, "message_id": str, "emoji": str}, ["chat_id"]),
         annotations=_OPEN_WORLD,
     )
     async def t_react(args: dict[str, Any]) -> dict[str, Any]:
@@ -1062,7 +1079,10 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
         "Query emoji reactions received on messages. "
         "Filter by msg_id, sender_id, or sentiment (positive/negative/neutral). "
         "Returns newest first with message previews.",
-        _schema({"msg_id": int, "sender_id": str, "sentiment": str, "limit": int}, ['msg_id', 'sender_id', 'sentiment', 'limit']),
+        _schema(
+            {"msg_id": int, "sender_id": str, "sentiment": str, "limit": int},
+            ["msg_id", "sender_id", "sentiment", "limit"],
+        ),
         annotations=_READ_ONLY,
     )
     async def t_get_reactions(args: dict[str, Any]) -> dict[str, Any]:
@@ -1089,7 +1109,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
     @tool(
         "edit_message",
         "Edit sent message. HTML tags, NOT markdown.",
-        _schema({"chat_id": str, "message_id": str, "text": str}, ['chat_id']),
+        _schema({"chat_id": str, "message_id": str, "text": str}, ["chat_id"]),
         annotations=_DESTRUCTIVE,
     )
     async def t_edit(args: dict[str, Any]) -> dict[str, Any]:
@@ -1103,7 +1123,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
     @tool(
         "delete_message",
         "Delete message",
-        _schema({"chat_id": str, "message_id": str}, ['chat_id']),
+        _schema({"chat_id": str, "message_id": str}, ["chat_id"]),
         annotations=_DESTRUCTIVE,
     )
     async def t_del(args: dict[str, Any]) -> dict[str, Any]:
@@ -1113,7 +1133,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
     @tool(
         "pin",
         "Pin message",
-        _schema({"chat_id": str, "message_id": str}, ['chat_id']),
+        _schema({"chat_id": str, "message_id": str}, ["chat_id"]),
         annotations=_OPEN_WORLD,
     )
     async def t_pin(args: dict[str, Any]) -> dict[str, Any]:
@@ -1398,8 +1418,8 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
         annotations=_READ_ONLY,
     )
     async def mem_recall(args: dict[str, Any]) -> dict[str, Any]:
-        # Off-loop: recall embeds the query and, on the letta backend, makes a
-        # blocking HTTP call — neither may stall the event loop mid-turn.
+        # Off-loop: recall embeds the query over a blocking HTTP call to the
+        # embed server — that must not stall the event loop mid-turn.
         results = await asyncio.to_thread(
             memory.recall,
             query=args.get("query", ""),
@@ -1455,7 +1475,10 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
         "Link two memories. Labels: related, involves, contributes_to, derived_from, "
         "uses, about, informed_by, supports, caused, supersedes, contradicts, "
         "blocked_by, enables. Set supersedes_rel to invalidate an old relationship.",
-        _schema({"from_id": str, "to_id": str, "relationship": str, "supersedes_rel": str}, ['supersedes_rel']),
+        _schema(
+            {"from_id": str, "to_id": str, "relationship": str, "supersedes_rel": str},
+            ["supersedes_rel"],
+        ),
     )
     async def mem_link(args: dict[str, Any]) -> dict[str, Any]:
         note = ""
@@ -1547,7 +1570,10 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
         "Review pending memory corrections detected automatically. "
         "Returns pending corrections with original content, proposed correction, "
         "and confidence score. Use action: approve, reject, or modify with corrected_content.",
-        _schema({"action": str, "correction_id": int, "corrected_content": str}, ['action', 'correction_id', 'corrected_content']),
+        _schema(
+            {"action": str, "correction_id": int, "corrected_content": str},
+            ["action", "correction_id", "corrected_content"],
+        ),
         annotations=_DESTRUCTIVE,
     )
     async def mem_review_corrections(args: dict[str, Any]) -> dict[str, Any]:
@@ -1603,7 +1629,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
         "across sessions. Use when the user says something matters or asks you "
         "to track something. Examples: 'track the Fanatics prep', 'watch for "
         "Naiara's email', 'remember I want to focus on deep work this week'.",
-        _schema({"content": str, "related_id": str}, ['related_id']),
+        _schema({"content": str, "related_id": str}, ["related_id"]),
         annotations=_OPEN_WORLD,
     )
     async def t_pin_attention(args: dict[str, Any]) -> dict[str, Any]:
@@ -1637,7 +1663,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
     @tool(
         "get_cost_report",
         "Cost/usage stats. period: today|week|month|all",
-        _schema({"period": str}, ['period']),
+        _schema({"period": str}, ["period"]),
         annotations=_READ_ONLY,
     )
     async def t_cost(args: dict[str, Any]) -> dict[str, Any]:
@@ -1669,7 +1695,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
         "browse",
         "Open a URL and extract page content. Returns title + text. "
         "Optional: CSS selector to narrow extraction, screenshot to save a PNG.",
-        _schema({"url": str, "selector": str, "screenshot": bool}, ['selector', 'screenshot']),
+        _schema({"url": str, "selector": str, "screenshot": bool}, ["selector", "screenshot"]),
         annotations=_OPEN_WORLD,
     )
     async def t_browse(args: dict[str, Any]) -> dict[str, Any]:
@@ -1728,7 +1754,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
             "prompt must be fully self-contained (no shared context from this turn). "
             "Use for: research that takes >30s, file builds, multi-step analysis."
         ),
-        _schema({"prompt": str, "trigger_msg_id": int}, ['trigger_msg_id']),
+        _schema({"prompt": str, "trigger_msg_id": int}, ["trigger_msg_id"]),
         annotations=_OPEN_WORLD,
     )
     async def t_delegate(args: dict[str, Any]) -> dict[str, Any]:
@@ -2133,17 +2159,9 @@ async def run_agent(
     prompt_text_for_context = _context_query(prompt, user_text)
     _EFFORT_BUDGET = {"low": 3_000, "medium": 6_000, "high": 12_000, "max": 12_000}
     ctx_budget = 12_000 if autonomous else _EFFORT_BUDGET.get(effort or "high", 12_000)
-    # Phase 4.1: when agent_backend="letta", source the always-in-context world model from the
-    # luke-agent-claude core blocks (self-editing, packed in 2.2a) instead of re-injecting the
-    # sqlite working-memory blob. Fail-safe: a None assembly falls through to the sqlite blob,
-    # so a down/empty Letta agent degrades to current SDK behavior. Defaults off (backend="sdk").
-    working_ctx: str | None = None
-    if settings.agent_backend == "letta":
-        working_ctx = _letta_agent.build_letta_context()
-    if working_ctx is None:
-        working_ctx = context.build_working_context(
-            query=prompt_text_for_context, budget_tokens=ctx_budget
-        )
+    working_ctx = context.build_working_context(
+        query=prompt_text_for_context, budget_tokens=ctx_budget
+    )
     system_append = _compose_system_append(persona, working_ctx)
 
     # Per-run counters and timing state (closed over by hooks)

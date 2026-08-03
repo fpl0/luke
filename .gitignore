@@ -20,24 +20,9 @@ wheels/
 # OS
 .DS_Store
 
-# Letta stack — tooling venv + runtime artifacts the daemons write at repo root
-.letta-venv/
-.letta_health_state
-.letta_sync_watermark
-lettahealth.out
-lettahealth.err
-letta_stack_health.log
-bridge.log
-bridge.err
-lettasync.log
-lettasync.err
+# Embed server — runtime logs the daemon writes at repo root
 bgeembed.log
 bgeembed.err
-lettablockfresh.log
-lettablockfresh.err
-openapi_letta.json
-letta_server.out
-letta_server.err
 
 # Data belongs in $LUKE_DIR, never the repo
 luke.db

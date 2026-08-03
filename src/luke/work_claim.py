@@ -2,14 +2,14 @@
 
 The scheduler already dedups *per task id* (docs/concurrency.md: "skips any task whose
 previous run is still in-flight"). That is not enough. Several DIFFERENT tasks can drive
-work on the SAME goal — the dedicated ``LETTA PARITY BUILD SESSION`` crons (02:00 / 11:00
-/ 19:00), the generic deep-work trigger, and the Sunday self-audit all pick a goal off the
-active list and start editing. Different task ids, so per-task dedup never fires, and two
-sessions end up writing the same files.
+work on the SAME goal — dedicated build-session crons (02:00 / 11:00 / 19:00), the generic
+deep-work trigger, and the Sunday self-audit all pick a goal off the active list and start
+editing. Different task ids, so per-task dedup never fires, and two sessions end up writing
+the same files.
 
 Observed, not hypothetical (2026-08-02): a deep-work tick at 03:03Z and a build session
-that started minutes earlier were both implementing the 5.1R harness fix, editing
-``letta_agent.py`` and ``letta_reply_diff.py`` concurrently. The same overlap had already
+that started minutes earlier were both implementing the same harness fix, editing the same
+two modules concurrently. The same overlap had already
 cost real work — the 01:03Z session died after 30 minutes leaving 1,245 uncommitted lines
 that the next session had to find and recover before it could do anything else.
 
@@ -41,11 +41,11 @@ only showed up when the CLI was run twice for real.
 
 CLI, for use from a cron/session prompt:
 
-    TOKEN=$(python3 -m luke.work_claim acquire goal-letta-parity --holder "02:00 build" | tail -1)
+    TOKEN=$(python3 -m luke.work_claim acquire goal-parity-build --holder "02:00 build" | tail -1)
       exit 0  -> claimed; the release token is the LAST line of stdout
       exit 3  -> held by a live session; the caller should do something else
-    python3 -m luke.work_claim release goal-letta-parity "$TOKEN"
-    python3 -m luke.work_claim status goal-letta-parity
+    python3 -m luke.work_claim release goal-parity-build "$TOKEN"
+    python3 -m luke.work_claim status goal-parity-build
 
 ``tail -1`` is not incidental: structlog writes its own lines to stdout, so the token is
 emitted last and callers must take the last line rather than the whole capture.

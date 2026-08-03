@@ -28,7 +28,7 @@ Files are human-readable and agent-editable. SQLite provides retrieval.
 `recall()` combines multiple strategies and merges results:
 
 1. **FTS5 lexical search** — queries are sanitized (operators stripped) and joined with OR semantics so longer queries return MORE results, ranked by BM25. This prevents the implicit-AND paradox where more words = fewer matches.
-2. **Semantic search** — the local bge embed server (:17595, `BAAI/bge-base-en-v1.5`) encodes the raw query over localhost HTTP, sqlite-vec finds nearest neighbors via KNN. One canonical model copy serves Luke and Letta; if the server is unreachable, recall degrades to FTS-only and the hourly `backfill_missing_embeddings()` pass heals missing vectors.
+2. **Semantic search** — the local bge embed server (:17595, `BAAI/bge-base-en-v1.5`) encodes the raw query over localhost HTTP, sqlite-vec finds nearest neighbors via KNN. One canonical model copy serves every consumer; if the server is unreachable, recall degrades to FTS-only and the hourly `backfill_missing_embeddings()` pass heals missing vectors.
 3. **Reciprocal Rank Fusion** (k=60) — merges FTS5 and semantic rankings without requiring score normalization. Memories ranked highly by both methods get the highest combined scores.
 4. **Temporal filter** — optional date range on `updated` timestamp
 5. **Graph traversal** — optional BFS from a related memory (depth 2, exponential weight decay per hop)

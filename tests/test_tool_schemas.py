@@ -101,9 +101,7 @@ def test_no_tool_requires_a_param_its_handler_treats_as_optional() -> None:
             (
                 d
                 for d in node.decorator_list
-                if isinstance(d, ast.Call)
-                and isinstance(d.func, ast.Name)
-                and d.func.id == "tool"
+                if isinstance(d, ast.Call) and isinstance(d.func, ast.Name) and d.func.id == "tool"
             ),
             None,
         )
@@ -122,7 +120,9 @@ def test_no_tool_requires_a_param_its_handler_treats_as_optional() -> None:
         body = ast.dump(ast.Module(body=node.body, type_ignores=[]))
         name = deco.args[0].value
         for p in params:
-            hard = f"Subscript(value=Name(id='args', ctx=Load()), slice=Constant(value='{p}')" in body
+            hard = (
+                f"Subscript(value=Name(id='args', ctx=Load()), slice=Constant(value='{p}')" in body
+            )
             soft = f"attr='get'" in body and f"Constant(value='{p}')" in body
             if soft and not hard:
                 offenders.append(f"{name}.{p}")

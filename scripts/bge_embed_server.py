@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """Minimal OpenAI-compatible /v1/embeddings server for Luke's embedding model
 (BAAI/bge-base-en-v1.5 via fastembed). This is the SINGLE canonical copy of the
-model weights: Luke's memory.py embeds through it (sqlite-vec indexing + recall)
-and the Letta server embeds archive passages through it. Loading the model
-in-process per consumer duplicated ~450MB of identical weights each.
+model weights: Luke's memory.py embeds through it (sqlite-vec indexing + recall).
+Loading the model in-process per consumer duplicated ~450MB of identical weights
+each.
 
-Honors OpenAI's ``encoding_format``: Letta's client requests ``"base64"`` and decodes
-the response as packed little-endian float32 — returning plain float lists there is
-the recall-500 "fault 2" (2026-08-01). Float lists remain the default when the field
-is absent.
+Honors OpenAI's ``encoding_format``: a client requesting ``"base64"`` gets the
+response as packed little-endian float32. Float lists remain the default when the
+field is absent.
 
 Run: .venv/bin/python scripts/bge_embed_server.py  # serves on :17595
 Supervised by com.luke.bgeembed.plist; GET /health is the liveness probe.

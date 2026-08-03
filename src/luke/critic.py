@@ -58,9 +58,7 @@ def _critic_system_prompt(today: date | None = None) -> str:
     already cleared. A critic with no calendar must not adjudicate calendars.
     """
     d = today or datetime.now(UTC).date()
-    return _CRITIC_SYSTEM_TEMPLATE.format(
-        today=d.isoformat(), weekday=d.strftime("%A")
-    )
+    return _CRITIC_SYSTEM_TEMPLATE.format(today=d.isoformat(), weekday=d.strftime("%A"))
 
 
 _CRITIC_USER_TEMPLATE = (
