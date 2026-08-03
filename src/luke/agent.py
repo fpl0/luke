@@ -54,6 +54,7 @@ from claude_agent_sdk.types import (
     ThinkingConfig,
     ThinkingConfigAdaptive,
 )
+from croniter import croniter
 from structlog.stdlib import BoundLogger
 
 from . import context, db, memory
@@ -793,6 +794,75 @@ def _duplicate_pending_task(
             if new_value and new_value == str(t.get("schedule_value", "")):
                 return t
     return None
+
+
+# --- Cron local-wall-clock gate ---
+# Cron schedule_values are evaluated in UTC (scheduler._is_due wraps croniter in
+# ensure_utc), while every time Filipe states is Dublin wall-clock. On 2026-08-03
+# the Kagan nightly-lecture series was one turn from shipping `30 21 * * *` for a
+# 21:30 Dublin send — that is 22:30 IST, wrong every night for 23 nights. Advisory
+# "convert local -> UTC" memory already existed in five places and did not fire
+# (insight-insight-accumulation-as-surrogate). This is the executed-surface
+# version: when a cron prompt DECLARES the local wall-clock time it means to fire
+# at, the declared time must match what the cron actually resolves to in
+# Europe/Dublin, or the schedule is blocked with the corrected value.
+_CRON_LOCAL_TIME_RE = re.compile(
+    r"(?<!\d)(\d{1,2}):(\d{2})(?!\d)[^.\n]{0,24}?"
+    r"(?:dublin|local time|irish time|\bist\b|\bgmt\b)",
+    re.IGNORECASE,
+)
+
+
+def _cron_local_time_mismatch(tool_input: Mapping[str, Any], now: datetime) -> str | None:
+    """Return a correction message if a cron fires at a different Dublin time than declared.
+
+    Only judges crons whose minute and hour are single fixed integers and whose
+    prompt states a time next to a locality marker ("21:30 Dublin"). Anything
+    ambiguous — ranges, steps, lists, wildcards, no declared local time — passes.
+    """
+    if str(tool_input.get("schedule_type", "")) != "cron":
+        return None
+    value = str(tool_input.get("schedule_value", "") or "").strip()
+    fields = value.split()
+    if len(fields) != 5:
+        return None
+    minute_f, hour_f = fields[0], fields[1]
+    if not (minute_f.isdigit() and hour_f.isdigit()):
+        return None
+
+    declared = {
+        (int(h) % 24, int(m))
+        for h, m in _CRON_LOCAL_TIME_RE.findall(str(tool_input.get("prompt", "") or ""))
+        if int(m) < 60
+    }
+    if not declared:
+        return None
+
+    try:
+        fires_utc = db.ensure_utc(croniter(value, db.ensure_utc(now)).get_next(datetime))
+    except Exception:
+        return None
+    fires_local = fires_utc.astimezone(_DUBLIN_TZ)
+    if (fires_local.hour, fires_local.minute) in declared:
+        return None
+
+    want_h, want_m = sorted(declared)[0]
+    # Inverse-convert the declared Dublin time back to UTC on the day it next fires.
+    wanted_local = fires_local.replace(hour=want_h, minute=want_m, second=0, microsecond=0)
+    wanted_utc = wanted_local.astimezone(UTC)
+    fixed = f"{wanted_utc.minute} {wanted_utc.hour} {fields[2]} {fields[3]} {fields[4]}"
+    day_note = ""
+    if wanted_utc.date() != wanted_local.date():
+        day_note = (
+            " NOTE: the UTC conversion crosses midnight, so the day-of-week/month "
+            "fields may need shifting too — check them by hand."
+        )
+    return (
+        f"Cron `{value}` fires at {fires_local:%H:%M} Dublin, but the prompt says "
+        f"{want_h:02d}:{want_m:02d}. Cron schedule_values are evaluated in UTC "
+        f"(scheduler._is_due -> ensure_utc + croniter); only `once` tasks take a "
+        f"local offset. Use `{fixed}` instead.{day_note}"
+    )
 
 
 _AUTO_SKILL_THRESHOLD: int = 5  # tool calls to trigger procedure extraction in stop hook
@@ -2360,6 +2430,18 @@ async def run_agent(
                             "(proc-scheduled-task-dedup)"
                         ),
                     }
+                # --- Cron local-wall-clock gate ---
+                # Cron values are UTC; Filipe's times are Dublin. Block a cron
+                # whose prompt declares a local time it will not actually fire at.
+                try:
+                    tz_fix = _cron_local_time_mismatch(tool_input, datetime.now(UTC))
+                except Exception as e:  # never let the gate crash a schedule
+                    log.warning("cron_tz_gate_error", error=str(e))
+                    tz_fix = None
+                if tz_fix:
+                    log.warning("cron_local_time_blocked", chat_id=chat_id, detail=tz_fix)
+                    bus.emit("cron_local_time_blocked", {"detail": tz_fix})
+                    return {"decision": "block", "reason": tz_fix}
 
         if tool_name in _SEND_TOOLS:
             send_count["n"] += 1

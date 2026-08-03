@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from datetime import date
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -20,6 +20,7 @@ from luke.agent import (
     AgentResult,
     _build_stop_hook,
     _context_query,
+    _cron_local_time_mismatch,
     _duplicate_pending_task,
     _md_to_html,
     _ok,
@@ -2715,3 +2716,96 @@ class TestContextQuery:
 
     def test_empty_list_without_user_text_is_safe(self) -> None:
         assert _context_query([], user_text=None) == ""
+
+
+class TestCronLocalTimeGate:
+    """Cron values are UTC; Filipe's stated times are Dublin wall-clock.
+
+    Regression guard for the 2026-08-03 Kagan nightly-lecture near-miss: a
+    `30 21 * * *` cron for a "21:30 Dublin" send would have fired at 22:30 IST
+    every night for 23 nights.
+    """
+
+    # August 2026 — Ireland on IST (UTC+1).
+    NOW = datetime(2026, 8, 3, 20, 15, tzinfo=UTC)
+    # Late November 2026 — Ireland back on GMT (UTC+0).
+    NOW_GMT = datetime(2026, 11, 20, 20, 15, tzinfo=UTC)
+
+    def _inp(self, value: str, prompt: str) -> dict[str, str]:
+        return {"schedule_type": "cron", "schedule_value": value, "prompt": prompt}
+
+    def test_utc_hour_used_for_local_time_is_blocked(self) -> None:
+        msg = _cron_local_time_mismatch(
+            self._inp("30 21 * * *", "Kagan nightly lecture send at 21:30 Dublin."), self.NOW
+        )
+        assert msg is not None
+        assert "22:30 Dublin" in msg
+        assert "`30 20 * * *`" in msg
+
+    def test_correct_conversion_passes(self) -> None:
+        assert (
+            _cron_local_time_mismatch(
+                self._inp("30 20 * * *", "Kagan nightly lecture send at 21:30 Dublin."), self.NOW
+            )
+            is None
+        )
+
+    def test_same_wall_clock_flips_across_dst(self) -> None:
+        """`30 20` is 21:30 in August but 20:30 in November — the gate follows DST."""
+        inp = self._inp("30 20 * * *", "Nightly send at 21:30 Dublin.")
+        assert _cron_local_time_mismatch(inp, self.NOW) is None
+        winter = _cron_local_time_mismatch(inp, self.NOW_GMT)
+        assert winter is not None and "20:30 Dublin" in winter
+        assert "`30 21 * * *`" in winter
+
+    def test_no_declared_local_time_passes(self) -> None:
+        assert (
+            _cron_local_time_mismatch(
+                self._inp("30 21 * * *", "Kagan nightly lecture send. Read the plan file."),
+                self.NOW,
+            )
+            is None
+        )
+
+    def test_bare_time_without_locality_marker_passes(self) -> None:
+        """A time with no locality marker is not a declaration of intent."""
+        assert (
+            _cron_local_time_mismatch(
+                self._inp("30 6 * * *", "Remind Filipe his visa interview is at 07:45."), self.NOW
+            )
+            is None
+        )
+
+    def test_wildcard_and_step_hours_pass(self) -> None:
+        for value in ("*/15 * * * *", "30 */2 * * *", "0 8,12,16,20 * * *", "30 8-10 * * *"):
+            assert (
+                _cron_local_time_mismatch(self._inp(value, "Fires 09:00 Dublin."), self.NOW) is None
+            )
+
+    def test_multiple_declared_times_any_match_passes(self) -> None:
+        assert (
+            _cron_local_time_mismatch(
+                self._inp("30 20 * * *", "Fires 21:30 Dublin (cron is UTC: 30 20 = 21:30 IST)."),
+                self.NOW,
+            )
+            is None
+        )
+
+    def test_non_cron_types_ignored(self) -> None:
+        assert (
+            _cron_local_time_mismatch(
+                {
+                    "schedule_type": "once",
+                    "schedule_value": "2026-08-04T21:30:00+01:00",
+                    "prompt": "Send at 21:30 Dublin.",
+                },
+                self.NOW,
+            )
+            is None
+        )
+
+    def test_midnight_crossing_flags_day_fields(self) -> None:
+        msg = _cron_local_time_mismatch(
+            self._inp("0 8 * * 1", "Monday review at 00:30 Dublin."), self.NOW
+        )
+        assert msg is not None and "crosses midnight" in msg
