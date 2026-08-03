@@ -280,14 +280,74 @@ def _should_send_error(chat_id: str) -> bool:
 
 
 _CONV_STATE_ID = "conversation-state-latest"
+# Read cap for the raw file before tail-trimming. _save_conv_state can emit
+# ~8.3k chars (10 messages x 500 + batch + an 800-char reply), so this has to
+# clear that comfortably or the trim would operate on already-truncated text.
+_CONV_STATE_READ_MAX = 20_000
 _STALE_HOURS = 24.0
 _COST_ANOMALY_MIN = 2.0  # minimum cost to trigger anomaly check
 _COST_ANOMALY_MULTIPLIER = 3  # times rolling average
 
 
+# A conversation-state message line: "**Filipe Lima** (2026-08-03T09:41): ..."
+_CONV_MSG_LINE = re.compile(r"^\*\*[^*]+\*\* \(")
+
+
+def _trim_conv_state(body: str, limit: int) -> str:
+    """Trim conversation state to *limit* chars, keeping the NEWEST exchange.
+
+    _save_conv_state writes the thread chronologically — a structured header,
+    then messages oldest-first, with the latest reply appended last. A plain
+    ``body[:limit]`` therefore drops the most recent turn and cuts mid-sentence,
+    which is precisely backwards for a block whose entire job is letting the
+    conversation resume seamlessly. The builder packs up to 10 messages at 500
+    chars plus an 800-char reply, so worst case it discarded most of the thread
+    and always the part that mattered.
+
+    Keeps the header (which carries topics, last-active and pending actions)
+    and then as many trailing message lines as fit.
+    """
+    if len(body) <= limit:
+        return body
+
+    lines = body.split("\n")
+    first_msg = next(
+        (i for i, ln in enumerate(lines) if _CONV_MSG_LINE.match(ln)),
+        len(lines),
+    )
+    header = lines[:first_msg]
+    messages = lines[first_msg:]
+
+    header_text = "\n".join(header)
+    room = limit - len(header_text) - 1
+    if room <= 0:
+        # Pathological header — fall back to keeping the newest text we can.
+        return body[-limit:]
+
+    kept: list[str] = []
+    used = 0
+    for line in reversed(messages):
+        cost = len(line) + 1
+        if used + cost > room:
+            break
+        kept.insert(0, line)
+        used += cost
+
+    if not kept:
+        # Even one message will not fit beside the header; the newest exchange
+        # still beats the oldest, so keep the tail of it rather than nothing.
+        return (header_text + "\n" + messages[-1])[-limit:] if messages else header_text[:limit]
+
+    return "\n".join([*header, *kept])
+
+
 def _load_conv_state() -> tuple[str, str | None]:
     """Read conversation state body and timestamp (sync, for use in to_thread)."""
-    body = memory.read_memory_body("episode", _CONV_STATE_ID, settings.recall_content_limit)
+    # Read uncapped, then trim from the correct end. read_memory_body's own
+    # limit keeps the FIRST n chars, which drops the newest exchange.
+    body = memory.read_memory_body("episode", _CONV_STATE_ID, _CONV_STATE_READ_MAX)
+    if body:
+        body = _trim_conv_state(body, settings.recall_content_limit)
     updated = memory.get_memory_updated(_CONV_STATE_ID) if body else None
     return body, updated
 

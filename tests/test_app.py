@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+import luke.app as app_mod
 from luke.config import settings
 from luke.memory import MemoryResult
 
@@ -1350,3 +1351,69 @@ class TestEnsureDirsSeedsVoice:
         _ensure_dirs()
 
         assert cfg.read_text() == '{"outputStyle": "custom"}'
+
+
+class TestTrimConvState:
+    """Conversation state must lose its OLDEST content, never its newest.
+
+    _save_conv_state writes chronologically with the latest reply appended
+    last, so the previous body[:limit] dropped the most recent exchange and cut
+    mid-sentence — backwards for the one block whose job is seamless resumption.
+    """
+
+    HEADER = (
+        "# Conversation State\n\n"
+        "**Last exchange:** 2026-08-03T10:03+00:00\n"
+        "**Active topics:** work\n"
+        "**User last active:** 2026-08-03T09:41\n"
+    )
+
+    def _body(self, n: int) -> str:
+        msgs = "\n".join(
+            f"**Filipe Lima** (2026-08-03T09:{i:02d}): message number {i}" for i in range(n)
+        )
+        return self.HEADER + msgs
+
+    def test_short_body_untouched(self) -> None:
+        body = self._body(3)
+        assert app_mod._trim_conv_state(body, 10_000) == body
+
+    def test_keeps_the_newest_message(self) -> None:
+        body = self._body(40)
+        out = app_mod._trim_conv_state(body, 600)
+        assert "message number 39" in out
+        assert "message number 0" not in out
+
+    def test_keeps_the_header(self) -> None:
+        out = app_mod._trim_conv_state(self._body(40), 600)
+        assert "**Active topics:**" in out
+        assert "**User last active:**" in out
+
+    def test_respects_the_limit(self) -> None:
+        for limit in (200, 600, 1500, 3000):
+            out = app_mod._trim_conv_state(self._body(40), limit)
+            assert len(out) <= limit, f"overflowed at {limit}"
+
+    def test_does_not_cut_mid_line(self) -> None:
+        """Whole messages only — a half-sentence is worse than one fewer turn."""
+        out = app_mod._trim_conv_state(self._body(40), 600)
+        for line in out.split("\n"):
+            if line.startswith("**Filipe"):
+                assert line.endswith(tuple("0123456789")), f"truncated line: {line!r}"
+
+    def test_messages_stay_in_order(self) -> None:
+        out = app_mod._trim_conv_state(self._body(40), 900)
+        nums = [int(ln.rsplit(" ", 1)[1]) for ln in out.split("\n") if ln.startswith("**Filipe")]
+        assert nums == sorted(nums)
+
+    def test_headerless_body_still_trims(self) -> None:
+        body = "\n".join(f"**Luke** (2026-08-03T09:{i:02d}): line {i}" for i in range(40))
+        out = app_mod._trim_conv_state(body, 400)
+        assert "line 39" in out
+        assert len(out) <= 400
+
+    def test_oversized_header_falls_back_to_newest_text(self) -> None:
+        body = "H" * 5000 + "\n**Luke** (2026-08-03T09:00): the newest thing"
+        out = app_mod._trim_conv_state(body, 100)
+        assert "the newest thing" in out
+        assert len(out) <= 100
