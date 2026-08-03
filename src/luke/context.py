@@ -12,7 +12,7 @@ import math
 import struct
 from contextlib import suppress
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, NamedTuple
 
 import structlog
 import yaml
@@ -143,12 +143,64 @@ _FALLBACK_CONSTITUTIONAL = (
 # Token budget for injected working memory (chars / 3.5 ≈ tokens)
 _CHARS_PER_TOKEN = 3.5
 _WORKING_MEMORY_BUDGET = 12_000  # tokens
-_MAX_CONTENT_PREVIEW = 400  # chars per memory in injection block
 _RECENT_OUTPUT_MAX_CHARS = 800  # chars per outbound message in recent-outputs block
+
+
+class RenderSpec(NamedTuple):
+    """How one memory type is rendered — and therefore what it costs.
+
+    Selection and rendering used to disagree: the budget charged every memory
+    400 chars of content while the renderer printed insights and procedures as
+    bare titles, capped at 10 and 5. At a 12k budget that meant 95 memories
+    selected, ~1.3k tokens actually emitted, and 74 memories charged for text
+    that was never sent — the goals and entities that DO render in full were
+    starved by phantom allocations for lines that never existed.
+
+    One table now drives both, so the discrepancy is unrepresentable.
+    ``max_items`` doubles as the per-type quota.
+    """
+
+    max_items: int
+    field: str  # "content" or "title"
+    chars: int
+
+
+# Caps are sized so the BUDGET binds at the effort tiers actually used, not the
+# caps. The old 10/5/3 caps were written when every line was charged 400 chars,
+# so they had to be stingy; a rendered insight title costs ~45 tokens, and being
+# able to see 25 of Filipe's stated preferences is worth more than the 1.1k
+# tokens it costs. Titles are the right encoding for insights and procedures —
+# they read as complete rules ("Don't announce non-actions — stay actually
+# silent"), with the body a Read away.
+_BACKGROUND_SPEC: dict[str, RenderSpec] = {
+    "goal": RenderSpec(8, "content", 400),  # what we're working toward
+    "entity": RenderSpec(12, "content", 500),  # who and what matters
+    "insight": RenderSpec(25, "title", 160),  # learned preferences and rules
+    "procedure": RenderSpec(6, "title", 120),  # reference; kept tight on purpose
+    "episode": RenderSpec(5, "content", 300),  # recent events, for continuity
+}
+
+_SECTION_TITLES: dict[str, str] = {
+    "goal": "## Active Goals",
+    "entity": "## Key Entities",
+    "insight": "## Active Insights",
+    "procedure": "## Procedures",
+    "episode": "## Recent Episodes",
+}
+
+# Order sections so the things that shape judgement come before reference
+# material: what we're working toward, who matters, what we've learned.
+_SECTION_ORDER: tuple[str, ...] = ("goal", "entity", "insight", "procedure", "episode")
 
 
 def _estimate_tokens(text: str) -> int:
     return max(1, int(len(text) / _CHARS_PER_TOKEN)) if text else 0
+
+
+def _render_line(memory: dict[str, Any], spec: RenderSpec) -> str:
+    """The exact text this memory contributes. The only place cost is defined."""
+    value = memory["title"] if spec.field == "title" else memory["content"]
+    return f"  [{memory['id']}] {(value or '')[: spec.chars]}"
 
 
 def _recency_score(updated_iso: str, half_life_days: float = 14.0) -> float:
@@ -311,20 +363,32 @@ def _load_priority_memories(query: str = "") -> list[dict[str, Any]]:
     return memories
 
 
-def _select_within_budget(
+def _spend(
     memories: list[dict[str, Any]],
     budget_tokens: int,
-) -> list[dict[str, Any]]:
-    """Greedily select top-scored memories until budget exhausted."""
-    selected: list[dict[str, Any]] = []
+) -> tuple[dict[str, list[str]], int]:
+    """Select in score order, charging each memory what it actually renders.
+
+    Returns rendered lines grouped by type, and the tokens spent. A memory is
+    skipped — not charged — once its type is full or the wallet cannot cover
+    its line, so nothing is ever paid for and then dropped.
+    """
+    lines: dict[str, list[str]] = {}
     used = 0
     for m in memories:
-        content_preview = m["content"][:_MAX_CONTENT_PREVIEW]
-        tokens = _estimate_tokens(f"[{m['id']}] {content_preview}")
-        if used + tokens <= budget_tokens:
-            selected.append(m)
-            used += tokens
-    return selected
+        spec = _BACKGROUND_SPEC.get(m["type"])
+        if spec is None:
+            continue
+        bucket = lines.setdefault(m["type"], [])
+        if len(bucket) >= spec.max_items:
+            continue
+        line = _render_line(m, spec)
+        cost = _estimate_tokens(line)
+        if used + cost > budget_tokens:
+            continue  # keep scanning: a cheaper line may still fit
+        bucket.append(line)
+        used += cost
+    return {k: v for k, v in lines.items() if v}, used
 
 
 def _build_recent_outputs_block(chat_id: str, limit: int) -> str | None:
@@ -403,16 +467,9 @@ def build_working_context(
     if not memories:
         return _prepended(None)
 
-    selected = _select_within_budget(memories, budget_tokens)
-    if not selected:
+    by_type, spent = _spend(memories, budget_tokens)
+    if not by_type:
         return _prepended(None)
-
-    # Separate by type for structured injection
-    goals = [m for m in selected if m["type"] == "goal"]
-    entities = [m for m in selected if m["type"] == "entity"]
-    insights = [m for m in selected if m["type"] == "insight"]
-    procedures = [m for m in selected if m["type"] == "procedure"]
-    episodes = [m for m in selected if m["type"] == "episode"]
 
     sections: list[str] = []
     # Verbatim recent outputs go above the reconstructed working memory so the
@@ -425,49 +482,26 @@ def build_working_context(
         sections.append(attn_block)
     sections.append("# Injected Working Memory")
 
-    if goals:
-        lines = []
-        for m in goals:
-            lines.append(f"  [{m['id']}] {m['content'][:_MAX_CONTENT_PREVIEW]}")
-        sections.append("## Active Goals\n" + "\n".join(lines))
+    for mem_type in _SECTION_ORDER:
+        lines = by_type.get(mem_type)
+        if lines:
+            sections.append(f"{_SECTION_TITLES[mem_type]}\n" + "\n".join(lines))
 
-    if entities:
-        lines = []
-        for m in entities:
-            lines.append(f"  [{m['id']}] {m['content'][:_MAX_CONTENT_PREVIEW]}")
-        sections.append("## Key Entities\n" + "\n".join(lines))
-
-    if insights:
-        lines = []
-        for m in insights[:10]:  # cap insights — they can be numerous
-            lines.append(f"  [{m['id']}] {m['title']}")
-        sections.append("## Active Insights\n" + "\n".join(lines))
-
-    if procedures:
-        lines = []
-        for m in procedures[:5]:
-            lines.append(f"  [{m['id']}] {m['title']}")
-        sections.append("## Procedures\n" + "\n".join(lines))
-
-    if episodes:
-        lines = []
-        for m in episodes[:3]:
-            lines.append(f"  [{m['id']}] {m['content'][:200]}")
-        sections.append("## Recent Episodes\n" + "\n".join(lines))
-
-    stats = (
-        f"\n<!-- context: {len(selected)} memories injected, "
-        f"~{sum(_estimate_tokens(m['content'][:_MAX_CONTENT_PREVIEW]) for m in selected)} tokens, "
-        f"{len(goals)} goals, {len(entities)} entities, "
-        f"{len(insights)} insights -->"
+    counts = {t: len(v) for t, v in by_type.items()}
+    injected = sum(counts.values())
+    # Report what was RENDERED, not what was considered. The old counter said
+    # "95 memories injected" for a block that emitted 21 of them.
+    sections.append(
+        f"\n<!-- context: {injected} memories, ~{spent} tokens "
+        f"of {budget_tokens} budget, {counts} -->"
     )
-    sections.append(stats)
 
     log.info(
         "context_injected",
-        memories=len(selected),
-        goals=len(goals),
-        entities=len(entities),
+        memories=injected,
+        tokens=spent,
+        budget=budget_tokens,
+        by_type=counts,
     )
 
     return "\n\n".join(sections)

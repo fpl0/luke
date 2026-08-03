@@ -1604,3 +1604,74 @@ class TestPendingCorrectionsHygiene:
         assert expired == 1
         assert memory.get_pending_corrections("e1") == []
         assert len(memory.get_pending_corrections("e2")) == 1
+
+
+class TestImportanceScore:
+    """The scale both rankers share. A regression here silently flattens
+    ranking rather than raising anything, so the boundaries are pinned."""
+
+    def test_ceiling_maps_to_one(self) -> None:
+        assert memory.importance_score(2.0) == pytest.approx(1.0)
+
+    def test_default_maps_to_half(self) -> None:
+        assert memory.importance_score(1.0) == pytest.approx(0.5)
+
+    def test_floor_is_small_but_positive(self) -> None:
+        assert 0.0 < memory.importance_score(0.1) < 0.1
+
+    def test_strictly_monotonic_across_the_live_range(self) -> None:
+        """The whole point: every step in stored importance must move the score.
+
+        The old clamp made everything from 1.0 to 2.0 identical — which is 85%
+        of the real corpus.
+        """
+        values = [0.1, 0.5, 0.9, 1.0, 1.2, 1.5, 1.8, 1.99, 2.0]
+        scores = [memory.importance_score(v) for v in values]
+        assert scores == sorted(scores)
+        assert len(set(scores)) == len(scores), "some stored values collapse to one score"
+
+    def test_clamps_out_of_range(self) -> None:
+        assert memory.importance_score(5.0) == pytest.approx(1.0)
+        assert memory.importance_score(-1.0) == pytest.approx(0.0)
+
+    def test_output_always_within_unit_interval(self) -> None:
+        for v in (-10.0, 0.0, 0.37, 1.0, 2.0, 99.0):
+            assert 0.0 <= memory.importance_score(v) <= 1.0
+
+
+class TestUtilityFactorProperties:
+    def test_monotonic_in_useful_count(self) -> None:
+        """More demonstrated usefulness must never lower the factor."""
+        scores = [memory.utility_factor(200, u) for u in range(0, 201, 20)]
+        assert scores == sorted(scores)
+
+    def test_monotonic_in_access_count_at_fixed_useful(self) -> None:
+        """More exposure with no more use must never raise the factor."""
+        scores = [memory.utility_factor(a, 10) for a in range(10, 500, 50)]
+        assert scores == sorted(scores, reverse=True)
+
+    def test_always_within_floor_and_one(self) -> None:
+        from luke.config import settings
+
+        for access in (0, 1, 10, 100, 1000, 10_000):
+            for useful in (0, 1, access // 2, access, access * 3):
+                f = memory.utility_factor(access, useful)
+                assert settings.utility_floor <= f <= 1.0, f"{access=} {useful=} -> {f}"
+
+    def test_evidence_accumulates_gradually(self) -> None:
+        """A memory should not be condemned by its first few misses."""
+        early = memory.utility_factor(5, 0)
+        mid = memory.utility_factor(50, 0)
+        late = memory.utility_factor(500, 0)
+        assert early > mid > late
+        assert early > 0.85, "too harsh on thin evidence"
+
+    def test_authority_is_material(self, test_db: Any) -> None:
+        """The gate must be able to move a score meaningfully.
+
+        Folded into access_score it could shift a final score by under 3%,
+        which is why it never corrected anything.
+        """
+        worst = memory.utility_factor(500, 0)
+        best = memory.utility_factor(500, 500)
+        assert best - worst >= 0.4

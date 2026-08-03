@@ -110,7 +110,11 @@ class TestBuildWorkingContext:
         _insert_memory(conn, "goal-x", "goal", "Goal X", "Active goal", importance=1.5)
         result = context.build_working_context()
         assert "<!-- context:" in result
-        assert "1 goals" in result
+        # Counts what was RENDERED. The old comment reported memories
+        # *considered*, which read "95 memories injected" for a block that
+        # emitted 21 of them.
+        assert "'goal': 1" in result
+        assert "of 12000 budget" in result
 
     def test_multiple_types_structured(self, test_db: Any) -> None:
         conn = db._db()
@@ -681,3 +685,157 @@ class TestActiveAttentionInContext:
         attn_pos = result.index("<active-attention>")
         mem_pos = result.index("# Injected Working Memory")
         assert out_pos < attn_pos < mem_pos
+
+
+class TestSpendMatchesRender:
+    """The phantom-budget regression guard.
+
+    Selection and rendering were two independent code paths that disagreed:
+    the budget charged every memory 400 chars of content, the renderer emitted
+    bare titles for insights and procedures and capped them at 10 and 5. On the
+    real corpus a 12,000-token budget bought ~1,300 tokens of output and threw
+    away 74 memories it had already paid for. These tests pin the two together.
+    """
+
+    def test_charged_tokens_equal_rendered_tokens(self, test_db: Any) -> None:
+        conn = db._db()
+        for i in range(12):
+            _insert_memory(
+                conn, f"insight-{i}", "insight", f"Insight {i}", "x" * 900, importance=1.4
+            )
+            _insert_memory(
+                conn, f"proc-{i}", "procedure", f"Procedure {i}", "y" * 900, importance=1.4
+            )
+            _insert_memory(conn, f"entity-{i}", "entity", f"Entity {i}", "z" * 900, importance=1.4)
+        memories = context._load_priority_memories()
+        by_type, spent = context._spend(memories, 4000)
+
+        rendered = sum(
+            context._estimate_tokens(line) for lines in by_type.values() for line in lines
+        )
+        assert spent == rendered
+
+    def test_nothing_charged_is_dropped(self, test_db: Any) -> None:
+        """Every memory the wallet paid for must appear in the output."""
+        conn = db._db()
+        for i in range(30):
+            _insert_memory(
+                conn, f"insight-{i}", "insight", f"Insight {i}", "body " * 200, importance=1.4
+            )
+        memories = context._load_priority_memories()
+        by_type, _ = context._spend(memories, 12_000)
+        result = context.build_working_context(budget_tokens=12_000)
+        for lines in by_type.values():
+            for line in lines:
+                mem_id = line.split("[")[1].split("]")[0]
+                assert mem_id in result
+
+    def test_type_caps_are_enforced_during_selection(self, test_db: Any) -> None:
+        """A capped-out type must stop consuming budget, not be sliced later."""
+        conn = db._db()
+        for i in range(40):
+            _insert_memory(conn, f"insight-{i}", "insight", f"Insight {i}", "body", importance=1.9)
+        for i in range(5):
+            _insert_memory(
+                conn, f"entity-{i}", "entity", f"Entity {i}", "who they are", importance=0.4
+            )
+        by_type, _ = context._spend(context._load_priority_memories(), 12_000)
+
+        assert len(by_type["insight"]) == context._BACKGROUND_SPEC["insight"].max_items
+        # 40 high-importance insights would previously have eaten the whole
+        # budget at 400 charged chars each, starving the entities entirely.
+        assert by_type.get("entity"), "entities starved by capped-out insights"
+
+    def test_budget_is_respected(self, test_db: Any) -> None:
+        conn = db._db()
+        for i in range(20):
+            _insert_memory(conn, f"entity-{i}", "entity", f"Entity {i}", "z" * 400, importance=1.4)
+        _, spent = context._spend(context._load_priority_memories(), 200)
+        assert spent <= 200
+
+
+class TestSpendMechanics:
+    """Edge cases of the spend loop.
+
+    _spend is the single point where a memory's cost is decided, so every way
+    it can silently drop or over-charge something is worth pinning.
+    """
+
+    def test_empty_input(self, test_db: Any) -> None:
+        assert context._spend([], 5000) == ({}, 0)
+
+    def test_zero_budget_renders_nothing(self, test_db: Any) -> None:
+        conn = db._db()
+        _insert_memory(conn, "entity-a", "entity", "A", "content", importance=1.5)
+        by_type, spent = context._spend(context._load_priority_memories(), 0)
+        assert by_type == {}
+        assert spent == 0
+
+    def test_unknown_type_is_skipped_not_charged(self, test_db: Any) -> None:
+        """A type with no RenderSpec has no defined cost, so it cannot be sold."""
+        rogue = [{"id": "x", "type": "nonsense", "title": "T", "content": "C", "score": 9.9}]
+        by_type, spent = context._spend(rogue, 5000)
+        assert by_type == {}
+        assert spent == 0
+
+    def test_oversized_line_skipped_cheaper_one_still_fits(self, test_db: Any) -> None:
+        """A too-expensive memory must not end selection — scanning continues."""
+        big = {"id": "big", "type": "entity", "title": "B", "content": "x" * 5000, "score": 9.0}
+        small = {"id": "small", "type": "insight", "title": "S", "content": "y", "score": 1.0}
+        by_type, spent = context._spend([big, small], 40)
+        assert "big" not in str(by_type)
+        assert by_type.get("insight"), "cheaper lower-scored memory should still fit"
+        assert spent <= 40
+
+    def test_caps_are_independent_per_type(self, test_db: Any) -> None:
+        conn = db._db()
+        for i in range(40):
+            _insert_memory(conn, f"insight-{i}", "insight", f"I{i}", "b", importance=1.5)
+            _insert_memory(conn, f"proc-{i}", "procedure", f"P{i}", "b", importance=1.5)
+        by_type, _ = context._spend(context._load_priority_memories(), 100_000)
+        assert len(by_type["insight"]) == context._BACKGROUND_SPEC["insight"].max_items
+        assert len(by_type["procedure"]) == context._BACKGROUND_SPEC["procedure"].max_items
+
+    def test_selection_follows_score_order(self, test_db: Any) -> None:
+        """Within a type, the cap must keep the best — not the first seen."""
+        conn = db._db()
+        _insert_memory(conn, "entity-top", "entity", "Top", "c", importance=2.0, access_count=50)
+        for i in range(20):
+            _insert_memory(conn, f"entity-low-{i}", "entity", f"L{i}", "c", importance=0.2)
+        by_type, _ = context._spend(context._load_priority_memories(), 100_000)
+        assert any("entity-top" in line for line in by_type["entity"])
+
+    def test_spent_never_exceeds_budget(self, test_db: Any) -> None:
+        conn = db._db()
+        for i in range(60):
+            _insert_memory(conn, f"entity-{i}", "entity", f"E{i}", "z" * 500, importance=1.5)
+        memories = context._load_priority_memories()
+        for budget in (1, 17, 120, 999, 5000):
+            _, spent = context._spend(memories, budget)
+            assert spent <= budget, f"overspent at budget={budget}"
+
+
+class TestRenderLine:
+    """_render_line is the only definition of what a memory costs."""
+
+    def test_title_field_uses_title(self) -> None:
+        spec = context.RenderSpec(10, "title", 100)
+        line = context._render_line({"id": "m1", "title": "T", "content": "C" * 500}, spec)
+        assert "T" in line
+        assert "CCC" not in line
+
+    def test_content_field_uses_content(self) -> None:
+        spec = context.RenderSpec(10, "content", 100)
+        line = context._render_line({"id": "m1", "title": "T", "content": "CCC"}, spec)
+        assert "CCC" in line
+
+    def test_truncates_to_spec_chars(self) -> None:
+        spec = context.RenderSpec(10, "content", 20)
+        line = context._render_line({"id": "m1", "title": "", "content": "x" * 500}, spec)
+        assert line.count("x") == 20
+
+    def test_handles_missing_value(self) -> None:
+        """A memory with no content must render, not crash."""
+        spec = context.RenderSpec(10, "content", 20)
+        line = context._render_line({"id": "m1", "title": "T", "content": None}, spec)
+        assert "m1" in line
