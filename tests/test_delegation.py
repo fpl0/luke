@@ -57,7 +57,13 @@ class TestDelegationEnvelope:
 
 class TestDelegateTool:
     @pytest.fixture()
-    def tool_env(self, tmp_path: Any) -> dict[str, Any]:
+    def tool_env(self, tmp_path: Any, test_db: Any) -> dict[str, Any]:
+        # test_db is required even though nothing here reads it directly: the
+        # delegate tool calls bus.emit(), which writes an `events` row through
+        # the REAL luke.config.settings — patching luke.agent.settings does not
+        # redirect it. Without a schema-initialised temp DB those writes landed
+        # in the developer's live production database (60 bogus cron_created
+        # rows accumulated there before this was caught).
         store_dir = tmp_path / "store"
         store_dir.mkdir()
         mock_bot = AsyncMock(spec=Bot)

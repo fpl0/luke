@@ -4,8 +4,22 @@ from __future__ import annotations
 
 # Must set env BEFORE any luke imports — Settings() runs at import time
 import os
+import tempfile
 
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "0000000000:AAHfakeTestTokenForUnitTesting1234")
+
+# Point LUKE_DIR at a throwaway directory for the whole session. Without this
+# it falls through to .env — the developer's LIVE data dir — and any test that
+# doesn't take `tmp_settings` writes straight into it. That is not theoretical:
+# `_save_conv_state` is dispatched as a fire-and-forget to_thread task
+# (app.py), so it can outlive the fixture teardown that restores
+# `settings.luke_dir`, and land test fixture content in the real
+# memory/episodes/conversation-state-latest.md — corrupting the continuity
+# anchor the agent reads on every turn. Observed 2026-08-03.
+#
+# Assignment, not setdefault: an exported LUKE_DIR pointing at live data is
+# exactly the case this must override.
+os.environ["LUKE_DIR"] = tempfile.mkdtemp(prefix="luke-test-session-")
 
 from pathlib import Path
 from typing import Any
