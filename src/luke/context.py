@@ -197,6 +197,21 @@ def _estimate_tokens(text: str) -> int:
     return max(1, int(len(text) / _CHARS_PER_TOKEN)) if text else 0
 
 
+# Slots inside the insight cap reserved for feedback insights — Filipe's own
+# stated preferences ("Don't announce non-actions", "present the plan before
+# building"). They are durable rules, so they lose on recency to the steady
+# stream of fresh reflexion/dream insights: measured 0-1 of 25 slots on the
+# live corpus. Weight tuning does not fix it — taxonomy weights made it worse.
+# A directive about how to behave has to be present to be followed, so it gets
+# a floor rather than a better score.
+_FEEDBACK_RESERVE = 8
+
+
+def _is_feedback(mem_id: str, tags_json: str) -> bool:
+    """Same definition memory.get_feedback_insight_ids uses."""
+    return mem_id.startswith("feedback-") or '"feedback"' in (tags_json or "")
+
+
 def _render_line(memory: dict[str, Any], spec: RenderSpec) -> str:
     """The exact text this memory contributes. The only place cost is defined."""
     value = memory["title"] if spec.field == "title" else memory["content"]
@@ -245,6 +260,7 @@ def _load_priority_memories(query: str = "") -> list[dict[str, Any]]:
                   COALESCE(m.importance, 1.0) AS importance,
                   m.updated, COALESCE(m.access_count, 0) AS access_count,
                   COALESCE(m.useful_count, 0) AS useful_count,
+                  COALESCE(m.tags_json, '') AS tags_json,
                   COALESCE(m.human_last_accessed, '') AS human_last_accessed,
                   COALESCE(m.suppression, 0.0) AS suppression
            FROM memory_meta m
@@ -355,6 +371,7 @@ def _load_priority_memories(query: str = "") -> list[dict[str, Any]]:
                 "importance": r["importance"],
                 "updated": r["updated"],
                 "access_count": r["access_count"],
+                "is_feedback": _is_feedback(r["id"], r["tags_json"]),
                 "score": min(score, 1.0),
             }
         )
@@ -375,19 +392,38 @@ def _spend(
     """
     lines: dict[str, list[str]] = {}
     used = 0
-    for m in memories:
+
+    def admit(m: dict[str, Any]) -> None:
+        nonlocal used
         spec = _BACKGROUND_SPEC.get(m["type"])
         if spec is None:
-            continue
+            return
         bucket = lines.setdefault(m["type"], [])
         if len(bucket) >= spec.max_items:
-            continue
+            return
         line = _render_line(m, spec)
         cost = _estimate_tokens(line)
         if used + cost > budget_tokens:
-            continue  # keep scanning: a cheaper line may still fit
+            return  # keep scanning: a cheaper line may still fit
         bucket.append(line)
         used += cost
+
+    # Feedback insights first, up to the reserve. They compete on score among
+    # themselves, then everything else fills the remaining slots — so this is a
+    # floor on representation, not a bypass of ranking.
+    admitted: set[str] = set()
+    for m in memories:
+        if len(admitted) >= _FEEDBACK_RESERVE:
+            break
+        if m["type"] == "insight" and m.get("is_feedback"):
+            before = len(lines.get("insight", ()))
+            admit(m)
+            if len(lines.get("insight", ())) > before:
+                admitted.add(m["id"])
+
+    for m in memories:
+        if m["id"] not in admitted:
+            admit(m)
     return {k: v for k, v in lines.items() if v}, used
 
 

@@ -839,3 +839,64 @@ class TestRenderLine:
         spec = context.RenderSpec(10, "content", 20)
         line = context._render_line({"id": "m1", "title": "T", "content": None}, spec)
         assert "m1" in line
+
+
+class TestFeedbackReserve:
+    """Filipe's stated preferences must survive the recency competition.
+
+    Feedback insights are durable behavioural rules, so they steadily lose
+    slots to the stream of fresh reflexion/dream insights — measured 0-1 of 25
+    on the live corpus. A directive about how to behave has to be present to be
+    followed, so it gets a floor rather than a better score.
+    """
+
+    @staticmethod
+    def _seed(conn: Any, n_recent: int = 40, n_feedback: int = 10) -> None:
+        now = datetime.now(UTC).isoformat()
+        old = (datetime.now(UTC) - timedelta(days=120)).isoformat()
+        for i in range(n_recent):
+            _insert_memory(
+                conn, f"reflexion-{i}", "insight", f"Recent reflexion {i}", "b", importance=1.6
+            )
+        for i in range(n_feedback):
+            _insert_memory(
+                conn, f"feedback-pref-{i}", "insight", f"Preference {i}", "b", importance=1.5
+            )
+            conn.execute(
+                "UPDATE memory_meta SET updated = ? WHERE id = ?", (old, f"feedback-pref-{i}")
+            )
+        conn.execute("UPDATE memory_meta SET updated = ? WHERE id LIKE 'reflexion-%'", (now,))
+        conn.commit()
+
+    def test_feedback_insights_are_reserved(self, test_db: Any) -> None:
+        conn = db._db()
+        self._seed(conn)
+        by_type, _ = context._spend(context._load_priority_memories(), 12_000)
+        feedback = [line for line in by_type["insight"] if "[feedback-" in line]
+        assert len(feedback) == context._FEEDBACK_RESERVE
+
+    def test_reserve_does_not_exceed_the_type_cap(self, test_db: Any) -> None:
+        conn = db._db()
+        self._seed(conn, n_recent=0, n_feedback=60)
+        by_type, _ = context._spend(context._load_priority_memories(), 100_000)
+        assert len(by_type["insight"]) == context._BACKGROUND_SPEC["insight"].max_items
+
+    def test_non_feedback_insights_still_fill_the_rest(self, test_db: Any) -> None:
+        conn = db._db()
+        self._seed(conn)
+        by_type, _ = context._spend(context._load_priority_memories(), 12_000)
+        others = [line for line in by_type["insight"] if "[feedback-" not in line]
+        assert others, "reserve must be a floor, not a takeover"
+
+    def test_reserve_respects_the_budget(self, test_db: Any) -> None:
+        conn = db._db()
+        self._seed(conn)
+        _, spent = context._spend(context._load_priority_memories(), 60)
+        assert spent <= 60
+
+    def test_tagged_feedback_counts_too(self, test_db: Any) -> None:
+        """Definition matches memory.get_feedback_insight_ids: id prefix OR tag."""
+        assert context._is_feedback("feedback-x", "")
+        assert context._is_feedback("insight-y", '["feedback", "tone"]')
+        assert not context._is_feedback("insight-y", '["reflexion"]')
+        assert not context._is_feedback("insight-y", "")
