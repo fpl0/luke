@@ -758,10 +758,13 @@ def _save_conv_state(
     last_exchange = last_user_active
     # Everything after the last user turn is Luke talking to itself — say so,
     # so four hours of scheduled-task output can't read as a live conversation.
+    # Counted over the RENDERED window, not all of `recent`: the block shows
+    # the last 10 messages, so counting over 20 claimed 8 when 5 were visible.
+    _shown = recent[-10:]
     trailing_own = (
-        len(recent)
+        len(_shown)
         - 1
-        - max((i for i, r in enumerate(recent) if r["sender_name"] != assistant), default=-1)
+        - max((i for i, r in enumerate(_shown) if r["sender_name"] != assistant), default=-1)
     )
 
     # Build conversation thread: recent history + current exchange.

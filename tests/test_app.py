@@ -1483,3 +1483,38 @@ class TestConvStateAttribution:
         app_mod._save_conv_state(test_db.get_pending_messages("12345"), [])
         body = (settings.memory_dir / "episodes" / "conversation-state-latest.md").read_text()
         assert "own output, not a reply" not in body
+
+
+class TestTrailingOwnCount:
+    """The Note must count what's VISIBLE.
+
+    It counted over the 20-row history while the block renders only the last
+    10, so it claimed 8 when 5 were shown. Luke: "the number is not describing
+    what I can see."
+    """
+
+    def test_count_matches_rendered_lines(self, test_db: Any) -> None:
+        from luke.config import settings
+
+        # 1 user turn, then 14 agent messages — more than the rendered window.
+        test_db.store_message(
+            chat_id="12345",
+            sender_name="Filipe Lima",
+            content="the only user turn",
+            timestamp="2026-08-03T09:00:00+00:00",
+        )
+        for i in range(14):
+            test_db.store_message(
+                chat_id="12345",
+                sender_name=settings.assistant_name,
+                content=f"agent output {i}",
+                timestamp=f"2026-08-03T10:{i:02d}:00+00:00",
+            )
+        app_mod._save_conv_state(test_db.get_pending_messages("12345"), [])
+        body = (settings.memory_dir / "episodes" / "conversation-state-latest.md").read_text()
+
+        claimed = int(body.split("the last ")[1].split(" message(s)")[0])
+        shown = sum(
+            1 for ln in body.split("\n") if ln.startswith(f"**{settings.assistant_name}** (")
+        )
+        assert claimed == shown, f"Note claims {claimed}, block shows {shown}"
