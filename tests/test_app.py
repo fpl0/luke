@@ -1393,4 +1393,93 @@ class TestConvStateNoDuplicateReply:
         app_mod._save_conv_state(msgs, ["some reply"])
 
         body = (settings.memory_dir / "episodes" / "conversation-state-latest.md").read_text()
-        assert "**Last exchange:** 2026-08-03T09:41" in body
+        assert "**Last exchange (Filipe):** 2026-08-03T09:41" in body
+
+
+class TestConvStateAttribution:
+    """ "Last exchange" must mean the last time FILIPE spoke.
+
+    Luke's own outbound messages live in the messages table too, so taking the
+    last row attributed Luke's own reply to a conversation that never happened.
+    Luke: "if I'd trusted this block, I'd have believed Filipe said something
+    at 14:36 that he never said — plausible rather than obviously garbled."
+    """
+
+    @staticmethod
+    def _seed_and_save(test_db: Any, *, user_in_batch: bool) -> str:
+        """Seed a user turn followed by two scheduled agent outputs, then save.
+
+        process() only ever calls _save_conv_state with a non-empty batch, so
+        the batch always carries at least one message.
+        """
+        from luke.config import settings
+
+        test_db.store_message(
+            chat_id="12345",
+            sender_name="Filipe Lima",
+            content="the real question",
+            timestamp="2026-08-03T11:03:00+00:00",
+        )
+        for i, text in enumerate(["scheduled output one", "scheduled output two"]):
+            test_db.store_message(
+                chat_id="12345",
+                sender_name=settings.assistant_name,
+                content=text,
+                timestamp=f"2026-08-03T14:3{i}:00+00:00",
+            )
+        rows = test_db.get_pending_messages("12345")
+        if user_in_batch:
+            batch = rows
+        else:
+            # get_pending_messages never returns the agent's own messages, so
+            # this shape only arises from a direct caller (an operator script
+            # regenerating state) — which is exactly where the blank was seen.
+            batch = [
+                test_db.StoredMessage(
+                    id=99,
+                    sender_name=settings.assistant_name,
+                    sender_id="",
+                    message_id=0,
+                    content="scheduled output two",
+                    timestamp="2026-08-03T14:31:00+00:00",
+                )
+            ]
+        app_mod._save_conv_state(batch, [])
+        return (settings.memory_dir / "episodes" / "conversation-state-latest.md").read_text()
+
+    def test_last_exchange_tracks_the_user_not_the_agent(self, test_db: Any) -> None:
+        body = self._seed_and_save(test_db, user_in_batch=True)
+        line = body.split("**Last exchange (Filipe):**")[1].split("\n")[0]
+        assert "11:03" in line
+        assert "14:3" not in line, "attributed an agent message to Filipe"
+
+    def test_user_timestamp_survives_a_batch_with_no_user_message(self, test_db: Any) -> None:
+        """It went blank and threw away a timestamp we still knew."""
+        body = self._seed_and_save(test_db, user_in_batch=False)
+        assert "**User last active:** 2026-08-03T11:03" in body
+        assert "unknown" not in body
+
+    def test_trailing_agent_output_is_labelled(self, test_db: Any) -> None:
+        """Four hours of scheduled output must not read as live conversation."""
+        body = self._seed_and_save(test_db, user_in_batch=True)
+        assert "own output, not a reply from Filipe" in body
+        assert "the last 2 message(s)" in body
+
+    def test_no_note_when_user_spoke_last(self, test_db: Any) -> None:
+        from luke.config import settings
+
+        test_db.store_message(
+            chat_id="12345",
+            sender_name=settings.assistant_name,
+            content="earlier reply",
+            timestamp="2026-08-03T10:00:00+00:00",
+        )
+        test_db.store_message(
+            chat_id="12345",
+            sender_name="Filipe Lima",
+            content="latest word",
+            timestamp="2026-08-03T11:03:00+00:00",
+        )
+        app_mod._save_conv_state(test_db.get_pending_messages("12345"), [])
+        body = (settings.memory_dir / "episodes" / "conversation-state-latest.md").read_text()
+        assert "own output, not a reply" not in body

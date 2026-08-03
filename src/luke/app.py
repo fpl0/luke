@@ -734,13 +734,35 @@ def _save_conv_state(
     # Pull recent messages for broader context (not just current batch)
     recent = db.get_recent_messages(settings.chat_id, limit=20) if messages else []
 
-    # Extract structured metadata
+    # Extract structured metadata.
+    #
+    # "Last exchange" means the last time FILIPE said something — not the last
+    # row in the table. Luke's own outbound messages live in `messages` too, so
+    # taking recent[-1] made the block attribute Luke's own reply to a
+    # conversation that never happened: "if I'd trusted this block, I'd have
+    # believed Filipe said something at 14:36 that he never said." That is the
+    # dangerous form of the bug — plausible rather than obviously garbled.
+    #
+    # Falling back to `recent` rather than the current batch also stops the
+    # field going blank on a turn with no user message, which threw away a
+    # timestamp we still knew.
     topics = _extract_topics(messages, agent_texts)
     user_msgs = [m for m in messages if m.sender_name != assistant]
-    last_user_active = user_msgs[-1].timestamp[:16] if user_msgs else "unknown"
-    # When the exchange actually happened — not when this function ran. `now`
-    # made the block claim a freshness the conversation didn't have.
-    last_exchange = recent[-1]["timestamp"][:16] if recent else now
+    user_rows = [r for r in recent if r["sender_name"] != assistant]
+    if user_msgs:
+        last_user_active = user_msgs[-1].timestamp[:16]
+    elif user_rows:
+        last_user_active = user_rows[-1]["timestamp"][:16]
+    else:
+        last_user_active = "unknown"
+    last_exchange = last_user_active
+    # Everything after the last user turn is Luke talking to itself — say so,
+    # so four hours of scheduled-task output can't read as a live conversation.
+    trailing_own = (
+        len(recent)
+        - 1
+        - max((i for i, r in enumerate(recent) if r["sender_name"] != assistant), default=-1)
+    )
 
     # Build conversation thread: recent history + current exchange.
     # Truncate on a word boundary and mark the gap — a bare [:500] cut mid-word
@@ -776,7 +798,13 @@ def _save_conv_state(
     if pending:
         structured += f"**Pending actions:** {' | '.join(pending)}\n"
 
-    body = f"**Last exchange:** {last_exchange}\n{structured}" + "\n".join(lines)
+    header = f"**Last exchange (Filipe):** {last_exchange}\n{structured}"
+    if trailing_own > 0:
+        header += (
+            f"**Note:** the last {trailing_own} message(s) below are {assistant}'s own "
+            "output, not a reply from Filipe.\n"
+        )
+    body = header + "\n".join(lines)
     # Write memory file
     import yaml
 
