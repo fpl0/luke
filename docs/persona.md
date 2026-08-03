@@ -33,6 +33,52 @@ Luke is INFP at its core — introverted, intuitive, feeling, principled. This i
 
 The voice section describes the target. The "Voice in Practice" section demonstrates it through 7 examples covering: greetings, uncertainty, research delivery, disagreement, error recovery, going deep, and emotional attunement.
 
+## Where the Register Is Actually Set
+
+A persona only holds if it is the most recent instruction the model read. Every
+run assembles three things into two positions, and the ordering in both was
+arrived at by watching it fail:
+
+```
+system prompt:   <working_memory> … </working_memory>  +  LUKE.md
+user message:    <context><memories> … </memories></context>  +  <voice>  +  what Filipe typed
+```
+
+**System prompt — persona last.** With the persona first, up to 12k tokens of
+clinical memory prose landed after it and Luke answered like a status report
+(Filipe, 2026-08-01: "not really following his personality"). `_compose_system_append`
+inverted it and framed the memory as *"Background knowledge. It informs what you
+know — never how you sound."*
+
+**User message — voice last.** That fix could not reach the turn block, which is
+prepended to the *user* message and therefore reads after the persona. Measured
+2026-08-03: 2,098 tokens of memory dossier immediately ahead of a two-token
+question ("so?"). Filipe called the register "impersonal" (08-02) and "mechanic"
+(08-03) with the ordering fix already live, because the ordering fix never
+covered that position. `_compose_turn_prefix` now carries the same framing plus a
+short `<voice>` anchor after the evidence.
+
+The anchor names measured behaviours rather than adjectives — 989-char average
+replies against Filipe's 229, a summing-up closer in 33% of messages, a trailing
+offer in 25%. Adjectives do not survive contact with a 2k-token dossier;
+"match his length" does.
+
+## What the Persona Should Not Have to Enforce
+
+Three rules were failing because they depended on the model remembering them
+every single turn. They are now guaranteed in code, and the persona keeps only
+the parts that need judgement:
+
+| Rule | Was | Now |
+|---|---|---|
+| No markdown | 21 messages carried literal `` ` `` or `**` in 30 days | `_md_to_html` rewrites them in the send path |
+| No internal play-by-play | 20 "🔨 starting" / "✅ done (16m)" messages | deep work notifies only when a plan moved |
+| Notice a repeated question | 3 rewordings of one answer in 80 seconds | `_repeat_note` flags the repeat as data in the turn block |
+
+The general principle: if a rule is mechanically checkable, check it
+mechanically. A persona rule is a good place for "answer the question behind the
+question" and a bad place for "don't emit this character".
+
 ## Stay Luke (Anti-Pattern Defense)
 
 Claude's RLHF training creates strong default patterns that override custom personas at predictable moments. The "Stay Luke" section names these moments explicitly:

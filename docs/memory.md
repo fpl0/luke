@@ -110,13 +110,26 @@ It emits **two blocks**, because they have different lifetimes:
 | Block | Content | Placement | Lifetime |
 |---|---|---|---|
 | `system_block` | conversation-state, active attention, recent outputs, standing memory | system prompt | replaced every run |
-| `turn_block` | recall hits, trigger-matched skills, ranked graph neighbours | user prompt | accumulates in the transcript, correctly |
+| `turn_block` | recall hits, trigger-matched skills, ranked graph neighbours, repeat-question flag | user prompt | accumulates in the transcript, correctly |
+
+Both blocks are framed as knowledge rather than voice, and both frames are
+charged to the budget that renders them. The turn block's frame matters more
+than it looks: it lands closer to the user's words than the persona does, so
+unframed it was setting the register. See [persona.md](persona.md#where-the-register-is-actually-set).
 
 Order of spend, with one `seen` set threaded through so nothing appears twice:
 
 1. **Pinned** — conversation-state (trimmed to keep the *newest* exchange), attention, recent outputs. Not budgeted: continuity is not optional context.
 2. **Turn evidence** — capped at 60% of budget so a run of long recall hits can never starve standing context. Procedures capped at 3; trigger-matched skills are exempt from the check but still counted, so a chosen procedure is never blocked while total share stays bounded. Each entry renders `[id] (type, 4 months ago) body` — the ranker decays by recency, and the age label is what lets the model see it.
 3. **Standing memory** — spends the remainder under `_BACKGROUND_SPEC`, which is one table defining both what renders and what it costs. Eight insight slots are reserved for feedback insights: they are durable behavioural rules with old timestamps, so they lose the recency competition (measured 1 of 25 on the live corpus) despite being the encoded "what Filipe cares about".
+
+One thing in the turn block is not a memory. `_repeat_note` compares the query
+against the last 20 messages and flags a question Filipe is asking again within
+20 minutes at ≥0.68 similarity. It is deliberately unbudgeted — one line, and
+the turn it matters on is exactly the turn a budget squeeze would drop it. The
+detection is fuzzy because the failure it catches was fuzzy: three rewordings of
+one question in 80 seconds defeated exact matching, and Luke answered all three
+by rewording the answer.
 
 Only what actually **rendered** counts as injected — retrieval routinely produces
 more candidates than fit (42 for one real query), and a candidate the budget

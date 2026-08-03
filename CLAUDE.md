@@ -197,7 +197,7 @@ Key behaviors:
 - **Utility tracking** — distinguishes intentional access (agent tools) from speculative (injection); `utility_factor()` gates the final score in [0.5, 1.0], shrunk toward a prior so new memories are neutral and only sustained non-use demotes
 - **Multi-hop graph** — BFS up to depth 2 with exponential weight decay per hop; Hebbian co-access strengthening evolves link weights over time
 - **Adaptive forgetting** — hourly type-aware importance decay modulated by access count (spaced repetition)
-- **Injection** — `context.assemble_context()` is the single call site (from `run_agent`): one budget, one dedup pass, type quotas. Emits a system block (pinned continuity + standing memory, replaced per run) and a turn block (query-ranked evidence). Never raises
+- **Injection** — `context.assemble_context()` is the single call site (from `run_agent`): one budget, one dedup pass, type quotas. Emits a system block (pinned continuity + standing memory, replaced per run) and a turn block (query-ranked evidence + a repeat-question flag). Both blocks are framed as knowledge-not-voice, and a `<voice>` anchor follows the turn block so the register survives the dossier ahead of Filipe's words — see `docs/persona.md`. Never raises
 - **Conflict detection** — entity updates detect and report changes; history recorded in `memory_history` table
 - **Consolidation** — daily scheduler task clusters related episodes (≥2 shared tags) and synthesizes insights via agent
 - **Self-healing** — `sync_memory_index()` on startup detects unindexed files and indexes them (with embeddings)
@@ -220,6 +220,7 @@ The scheduler loop runs every 60 seconds (configurable via `SCHEDULER_INTERVAL`)
    - Every 8h: autonomous multi-step goal execution with plan-before-execute pattern
    - Plans stored in `$LUKE_DIR/workspace/plans/{goal_id}.md` with status tracking
    - Rate-limited to 1 outbound message per session
+   - Notifies only on an **outcome** — a plan status that changed, a summary episode, or a session that broke. No start ping, no "done (16m)" receipt: telling Filipe that a process ran is the internal play-by-play the persona forbids. A session that moved nothing says nothing (`deep_work_silent`)
 4. Fetches active tasks (excludes completed `once` tasks at SQL level)
 5. Checks due-ness via `_is_due()` (handles cron, interval, once with timezone-aware datetimes)
 6. Deduplicates — won't fire a task that's still running from a previous tick
