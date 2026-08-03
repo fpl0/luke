@@ -1079,6 +1079,51 @@ def _recency_score(updated_iso: str) -> float:
     return math.exp(-age_days / settings.recency_decay_days)
 
 
+# The write clamp in the `remember` tool bounds stored importance at 2.0, so
+# that — not 1.0 — is the scale's ceiling.
+IMPORTANCE_MAX = 2.0
+
+# Utility shrinkage. The raw useful/access ratio is unusable at low access
+# counts: 0 useful out of 1 access is not evidence of uselessness. Shrinking
+# toward a corpus-typical prior makes a new memory score exactly neutral and
+# lets only sustained, high-volume non-use pull a memory down.
+UTILITY_PRIOR = 0.6  # corpus-typical useful/access rate across types
+UTILITY_PSEUDOCOUNT = 20  # accesses of evidence before observation beats the prior
+
+
+def importance_score(importance: float) -> float:
+    """Map stored importance (0.1-2.0) onto the 0-1 ranking scale.
+
+    Linear, not clamped. ``min(importance, 1.0)`` made importance an identical
+    constant for 85% of the corpus, which zeroed out its nominal 0.25 weight —
+    and its 0.40 weight under the `factual` taxonomy that covers most memories.
+    Dividing by the write ceiling keeps the whole ordering.
+
+    Shared by both rankers so they cannot drift apart again: recall()'s
+    composite scorer and the injection ranker in context.py disagreed before
+    this existed, one clamping and the other dividing by 2.0.
+    """
+    return min(max(importance, 0.0), IMPORTANCE_MAX) / IMPORTANCE_MAX
+
+
+def utility_factor(access_count: int, useful_count: int) -> float:
+    """Multiplicative demotion for memories that get surfaced but never used.
+
+    Returns a value in [utility_floor, 1.0]: utility can demote, never promote.
+    Promotion is what built the rich-get-richer loop in the first place — a
+    memory that gets injected accrues access, which raised its score, which got
+    it injected again.
+
+    A brand-new memory returns exactly 1.0, so nothing is punished for being
+    new. Only a memory with real access volume and a poor hit rate is demoted.
+    """
+    shrunk = (useful_count + UTILITY_PRIOR * UTILITY_PSEUDOCOUNT) / (
+        access_count + UTILITY_PSEUDOCOUNT
+    )
+    floor = settings.utility_floor
+    return floor + (1.0 - floor) * min(shrunk / UTILITY_PRIOR, 1.0)
+
+
 def _apply_composite_scores(results: dict[str, dict[str, Any]]) -> None:
     """Apply composite scoring (relevance * importance * recency * access) in place.
 
@@ -1111,19 +1156,13 @@ def _apply_composite_scores(results: dict[str, dict[str, Any]]) -> None:
 
     for entry in results.values():
         relevance = entry.get("score", 0)
-        importance: float = min(entry["importance"], 1.0)
+        importance: float = importance_score(entry["importance"])
         access_count: int = entry["access_count"]
         useful_count: int = entry["useful_count"]
         updated: str = entry["updated"]
         taxonomy: str = entry.get("taxonomy", "")
         recency = _recency_score(updated)
         access_score = math.log(1 + access_count) / log_101  # ~1.0 at 100 accesses
-        # Utility modulation: penalize memories that get accessed but never used.
-        # Clamped: useful_count is incremented on its own (touch_memories'
-        # useful_only path) for memories credited without a matching access, so
-        # the raw rate can exceed 1.0 and inflate access_score past its ceiling.
-        utility_rate = min(1.0, useful_count / max(access_count, 1))
-        access_score *= settings.utility_floor + settings.utility_weight * utility_rate
 
         # Select weights based on taxonomy
         w_imp, w_rec, w_acc = _TAXONOMY_WEIGHTS.get(taxonomy, (base_w_imp, base_w_rec, base_w_acc))
@@ -1133,12 +1172,15 @@ def _apply_composite_scores(results: dict[str, dict[str, Any]]) -> None:
         # Normalize context to 0-1 (weights for non-relevance factors sum to 0.6)
         context_norm = context / context_denom if context_denom > 0 else context
 
-        if relevance > 0:
-            # Query-matched: relevance gates the context score
-            entry["score"] = relevance * context_norm
-        else:
-            # Non-query (temporal/graph): rank below query matches
-            entry["score"] = context_norm * 0.3
+        # Query-matched: relevance gates the context score.
+        # Non-query (temporal/graph): rank below query matches.
+        base = relevance * context_norm if relevance > 0 else context_norm * 0.3
+
+        # Utility gates the FINAL score, not access_score. Folded into
+        # access_score it could move the total by under 3% — decorative against
+        # a memory with 260 accesses and 15 uses that still ranked in. Applied
+        # here it can demote by up to (1 - utility_floor).
+        entry["score"] = base * utility_factor(access_count, useful_count)
 
 
 # Human-turn flag: True only while serving a live conversation with Filipe,

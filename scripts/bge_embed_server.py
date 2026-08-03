@@ -12,6 +12,7 @@ field is absent.
 Run: .venv/bin/python scripts/bge_embed_server.py  # serves on :17595
 Supervised by com.luke.bgeembed.plist; GET /health is the liveness probe.
 """
+
 import base64
 import json
 import struct
@@ -61,7 +62,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             n = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(n) or b"{}")
-        except (ValueError, json.JSONDecodeError):
+        except ValueError, json.JSONDecodeError:
             self._respond(400, {"error": "invalid JSON body"})
             return
         inp = body.get("input", "")
@@ -74,8 +75,12 @@ class Handler(BaseHTTPRequestHandler):
         ]
         self._respond(
             200,
-            {"object": "list", "data": data, "model": body.get("model", MODEL),
-             "usage": {"prompt_tokens": 0, "total_tokens": 0}},
+            {
+                "object": "list",
+                "data": data,
+                "model": body.get("model", MODEL),
+                "usage": {"prompt_tokens": 0, "total_tokens": 0},
+            },
         )
 
 

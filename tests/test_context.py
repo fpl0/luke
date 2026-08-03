@@ -136,13 +136,20 @@ class TestBuildPreservationManifest:
         assert "Must Preserve Goal" in result
         assert "ACTIVE GOALS" in result
 
-    def test_includes_high_importance_entities(self, test_db: Any) -> None:
+    def test_ranks_entities_by_importance(self, test_db: Any) -> None:
+        """The manifest takes the top 15 entities, in importance order.
+
+        It used to also require importance >= 1.2. That bar was redundant —
+        only 15 entities cleared it in the real corpus, so LIMIT 15 was already
+        binding — and an absolute threshold on a rescalable value can only fail
+        by silently emptying the section. Ordering says the same thing without
+        depending on the scale.
+        """
         conn = db._db()
         _insert_memory(conn, "person-key", "entity", "Key Person", "Important", importance=1.5)
         _insert_memory(conn, "entity-low", "entity", "Low Entity", "Unimportant", importance=0.5)
         result = context.build_preservation_manifest()
-        assert "person-key" in result
-        assert "entity-low" not in result
+        assert result.index("person-key") < result.index("entity-low")
 
     def test_includes_constitutional_invariants(self, test_db: Any) -> None:
         result = context.build_preservation_manifest()

@@ -789,15 +789,32 @@ class TestFTSSanitization:
 
 
 class TestBoundedImportance:
-    def test_high_importance_clamped_in_scoring(self, test_db: Any) -> None:
-        """Importance > 1.0 should be clamped to 1.0 in composite scoring."""
+    def test_importance_discriminates_in_scoring(self, test_db: Any) -> None:
+        """Importance above 1.0 must still separate memories.
+
+        This asserted the opposite until 2026-08-03: scoring clamped importance
+        to 1.0, which made it an identical constant for 85% of the real corpus
+        and silently zeroed out its weight — the heaviest weight in the table
+        under the `factual` taxonomy that covers most memories.
+        """
         memory.index_memory("high", "entity", "High Imp", "keyword stuff", importance=2.0)
         memory.index_memory("normal", "entity", "Normal Imp", "keyword stuff", importance=1.0)
         results = memory.recall(query="keyword stuff")
         scores = {m["id"]: m["score"] for m in results}
-        # Both have importance clamped to 1.0, so scores should be close
-        if "high" in scores and "normal" in scores:
-            assert scores["high"] == pytest.approx(scores["normal"], abs=0.1)
+        assert scores["high"] > scores["normal"]
+
+    def test_importance_score_shared_by_both_rankers(self, test_db: Any) -> None:
+        """recall() and the injection ranker must agree on the importance scale.
+
+        They disagreed before this helper existed — one clamped at 1.0, the
+        other divided by 2.0 — so the same memory carried two different
+        importances depending on which layer surfaced it.
+        """
+        from luke import context
+
+        memory.index_memory("m1", "entity", "M1", "content here", importance=1.6)
+        injected = {m["id"]: m for m in context._load_priority_memories()}
+        assert memory.importance_score(injected["m1"]["importance"]) == pytest.approx(0.8)
 
     def test_stored_importance_not_clamped(self, test_db: Any) -> None:
         """Importance > 1.0 should still be stored for decay runway."""
@@ -811,6 +828,53 @@ class TestBoundedImportance:
 # ---------------------------------------------------------------------------
 # Utility tracking
 # ---------------------------------------------------------------------------
+
+
+class TestUtilityFactor:
+    """The anti-popularity gate. Folded into access_score it could move the
+    final score by under 3%, which is why a memory with 260 accesses and 15
+    uses kept ranking in. It now gates the composite directly."""
+
+    def test_new_memory_is_neutral(self) -> None:
+        """Nothing is punished for being new — 0/0 must not read as useless."""
+        assert memory.utility_factor(0, 0) == pytest.approx(1.0)
+
+    def test_proven_useful_is_neutral(self) -> None:
+        """procedure-morning-briefing: 489 accesses, 414 useful."""
+        assert memory.utility_factor(489, 414) == pytest.approx(1.0)
+
+    def test_sustained_non_use_is_demoted(self) -> None:
+        """proc-trust-repair-commitment-delivery: 260 accesses, 15 useful."""
+        assert memory.utility_factor(260, 15) < 0.6
+
+    def test_low_evidence_is_shrunk_toward_neutral(self) -> None:
+        """A handful of misses is not proof; the prior should dominate."""
+        assert memory.utility_factor(3, 0) > 0.9
+
+    def test_never_promotes(self) -> None:
+        """Utility can demote, never promote — promotion built the loop."""
+        assert memory.utility_factor(100, 100) <= 1.0
+        assert memory.utility_factor(1, 50) <= 1.0
+
+    def test_bounded_by_floor(self) -> None:
+        from luke.config import settings
+
+        assert memory.utility_factor(10_000, 0) >= settings.utility_floor
+
+    def test_gate_demotes_a_real_ranking(self, test_db: Any) -> None:
+        """End-to-end: high-access/low-utility must lose to its twin."""
+        memory.index_memory("hoarder", "entity", "Hoarder", "keyword alpha")
+        memory.index_memory("earner", "entity", "Earner", "keyword alpha")
+        conn = db._db()
+        conn.execute(
+            "UPDATE memory_meta SET access_count = 260, useful_count = 15 WHERE id = 'hoarder'"
+        )
+        conn.execute(
+            "UPDATE memory_meta SET access_count = 260, useful_count = 200 WHERE id = 'earner'"
+        )
+        conn.commit()
+        scores = {m["id"]: m["score"] for m in memory.recall(query="keyword alpha")}
+        assert scores["earner"] > scores["hoarder"]
 
 
 class TestUtilityTracking:

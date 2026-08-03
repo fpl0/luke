@@ -301,8 +301,18 @@ def reconstruct_injected(query: str, recall_ids: list[str]) -> set[str]:
 
 
 def run(cases: list[dict[str, Any]], limit: int) -> dict[str, Any]:
-    from luke import memory
+    from luke import db, memory
     from luke.config import settings
+
+    # Migrate the SNAPSHOT (never the live DB — LUKE_DIR was repointed before
+    # this import). Without this the replay measures the new scorer against
+    # un-migrated data, which is precisely the state the deploy never occupies
+    # and the one where the change looks worst: unclamping importance before
+    # the ceiling-valued procedures are renormalized makes them rank higher,
+    # not lower.
+    db.init()
+    version = db.get_schema_version()
+    print(f"snapshot migrated to schema v{version}")
 
     orig_apply = memory._apply_composite_scores
     pool: dict[str, dict[str, Any]] = {}

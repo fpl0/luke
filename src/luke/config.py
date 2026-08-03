@@ -43,8 +43,11 @@ class Settings(BaseSettings):
     rrf_k: int = 60  # Reciprocal Rank Fusion constant
 
     max_consolidation_clusters: int = 3  # max clusters per consolidation run
-    utility_floor: float = 0.7  # minimum fraction of access_score at 0% utility
-    utility_weight: float = 0.3  # how much utility_rate can boost above floor
+    # Worst-case score multiplier for a memory with real access volume and a
+    # poor hit rate. utility_weight is gone: the gate now spans
+    # [utility_floor, 1.0], so the old second knob was the same degree of
+    # freedom expressed twice.
+    utility_floor: float = 0.5
 
     # Adaptive forgetting decay rates per memory type (hourly)
     decay_rate_entity: float = 0.9998

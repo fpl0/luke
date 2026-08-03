@@ -22,6 +22,7 @@ from . import attention as _attention_module
 from . import db as _db_module
 from .config import settings
 from .db import _db, ensure_utc
+from .memory import importance_score, utility_factor
 
 log: BoundLogger = structlog.get_logger()
 
@@ -191,6 +192,7 @@ def _load_priority_memories(query: str = "") -> list[dict[str, Any]]:
         """SELECT m.id, m.type, f.title, f.content,
                   COALESCE(m.importance, 1.0) AS importance,
                   m.updated, COALESCE(m.access_count, 0) AS access_count,
+                  COALESCE(m.useful_count, 0) AS useful_count,
                   COALESCE(m.human_last_accessed, '') AS human_last_accessed,
                   COALESCE(m.suppression, 0.0) AS suppression
            FROM memory_meta m
@@ -237,7 +239,7 @@ def _load_priority_memories(query: str = "") -> list[dict[str, Any]]:
 
     memories: list[dict[str, Any]] = []
     for r in rows:
-        imp = min(1.0, r["importance"] / 2.0)
+        imp = importance_score(r["importance"])
         rec = _recency_score(r["updated"])
         freq = math.log1p(r["access_count"]) / log_max if log_max > 0 else 0.5
 
@@ -276,8 +278,15 @@ def _load_priority_memories(query: str = "") -> list[dict[str, Any]]:
         # (1.55) loses the floor once unused, while person-filipe (1.99, edited
         # in May but accessed daily) keeps it. An unconditional floor made
         # importance a permanent override that recency could never overcome.
-        if r["importance"] >= 1.5 and acc_rec >= 0.3:
+        # 0.75 on the normalized scale is the same 1.5 raw threshold as before.
+        if imp >= 0.75 and acc_rec >= 0.3:
             score = max(score, 0.4)
+
+        # Utility gate, AFTER the floor: a memory that gets surfaced constantly
+        # and used rarely must not be able to hide behind the floor, which was
+        # an absolute override no evidence could defeat. Same helper the recall
+        # ranker uses — one utility model, two callers.
+        score *= utility_factor(r["access_count"], r["useful_count"])
 
         # Graduated suppression: attenuate by an explicit per-memory signal
         # (hard vetoes at 1.0 were already dropped above). Applied last so it
@@ -492,13 +501,15 @@ def build_preservation_manifest() -> str:
             lines.append(f"  - {r['id']}: {r['title']}")
         sections.append("\n".join(lines))
 
-    # High-importance entities
+    # Top entities. No absolute importance bar: "the 15 most important entities"
+    # is what this wants, and LIMIT already says it. A fixed threshold could
+    # only ever fail in one direction — silently emptying the section if the
+    # corpus rescaled — while ORDER BY says the same thing scale-independently.
     entity_rows = db.execute(
         """SELECT m.id, f.title
            FROM memory_meta m
            JOIN memory_fts f ON m.id = f.id
            WHERE m.type = 'entity' AND m.status = 'active'
-             AND m.importance >= 1.2
            ORDER BY m.importance DESC
            LIMIT 15"""
     ).fetchall()
