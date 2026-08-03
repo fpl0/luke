@@ -462,6 +462,41 @@ class TestComposeSystemAppend:
         assert out.endswith("</working_memory>")
 
 
+class TestComposeTurnPrefix:
+    """The gap persona-last could not close.
+
+    _compose_system_append wins recency inside the SYSTEM prompt, but the turn
+    block is prepended to the USER message — so it reads after the persona and
+    immediately before Filipe. Measured 2026-08-03: 2,098 turn-block tokens
+    ahead of a two-token question ("so?"). He called the register "impersonal"
+    (08-02) and "mechanic" (08-03) after the ordering fix had already shipped.
+    """
+
+    def test_voice_anchor_lands_after_the_evidence(self) -> None:
+        from luke.agent import _VOICE_ANCHOR, _compose_turn_prefix
+
+        out = _compose_turn_prefix("<context><memories>\n[m1] stuff\n</memories></context>")
+        assert out.index("[m1]") < out.index(_VOICE_ANCHOR)
+
+    def test_nothing_follows_the_anchor_but_the_user(self) -> None:
+        from luke.agent import _compose_turn_prefix
+
+        out = _compose_turn_prefix("<context><memories>\n[m1] stuff\n</memories></context>")
+        assert out.rstrip().endswith("</voice>")
+        full = out + "SO_QUESTIONMARK"
+        assert full.index("</voice>") < full.index("SO_QUESTIONMARK")
+
+    def test_anchor_names_the_measured_tics(self) -> None:
+        """Adjectives don't survive contact with a 2k-token dossier; the named
+        behaviours are each a thing the 30-day log shows Luke doing."""
+        from luke.agent import _VOICE_ANCHOR
+
+        low = _VOICE_ANCHOR.lower()
+        assert "match his length" in low  # 989-char replies against his 229
+        assert "summarise" in low  # a summing-up closer in 33% of messages
+        assert "offering" in low  # a trailing offer in 25%
+
+
 # ---------------------------------------------------------------------------
 # _INTERNAL_RE
 # ---------------------------------------------------------------------------

@@ -9,6 +9,7 @@ Provides runtime context management for the agent:
 from __future__ import annotations
 
 import asyncio
+import difflib
 import math
 import re
 from collections.abc import Mapping
@@ -810,6 +811,15 @@ _TURN_BODY_CHARS = 1_200
 # never starve standing context to nothing.
 _TURN_BUDGET_SHARE = 0.6
 
+# The system block carries an equivalent "knowledge, not voice" line via
+# agent._compose_system_append. The turn block had none, and it lands even
+# closer to the user's words than the persona does — up to 2,240 tokens of
+# clinical memory prose immediately before a four-character question ("so?",
+# 2026-08-03). Register tracks the most recent thing read, so the unframed
+# block was setting it. Same defect the persona-last ordering fixed on
+# 2026-08-01, one layer down.
+_TURN_FRAME = "Reference material retrieved for this turn. Knowledge, never voice."
+
 # Per-type ceilings on turn evidence. Procedures were 28% of the corpus but
 # took 64% of every injected set, because they are numerous, high-access and
 # were minted at the importance ceiling. Trigger-matched skills are exempt: a
@@ -1044,7 +1054,7 @@ def _render_turn_block(
     """
     lines: list[str] = []
     rendered: list[str] = []
-    used = 0
+    used = _estimate_tokens(_TURN_FRAME)
     for c in candidates:
         # Over-read then truncate, so the cut lands on a word boundary and
         # announces the gap instead of amputating mid-word.
@@ -1061,7 +1071,13 @@ def _render_turn_block(
         used += cost
     if not lines:
         return "", 0, []
-    block = "<context><memories>\n" + "\n---\n".join(lines) + "\n</memories></context>"
+    block = (
+        "<context><memories>\n"
+        + _TURN_FRAME
+        + "\n"
+        + "\n---\n".join(lines)
+        + "\n</memories></context>"
+    )
     return block, used, rendered
 
 
@@ -1074,6 +1090,52 @@ class AssembledContext:
     ids: list[str] = field(default_factory=list)  # everything RENDERED
     recalled_ids: list[str] = field(default_factory=list)  # query-ranked subset
     tokens: int = 0
+
+
+# A question Filipe has just asked again is the loudest signal available that
+# the previous answer missed. On 2026-08-03 he asked "how do you evaluate these
+# changes" three times in 80 seconds and got three rewordings of one answer,
+# then: "Why are you giving me these mechanic answers?". The rephrasings were
+# lexically different enough that a duplicate scan missed them — which is the
+# point. Luke re-derived instead of noticing, so the repeat is surfaced as data
+# rather than left to inference.
+_REPEAT_WINDOW_MIN = 20.0
+_REPEAT_SIMILARITY = 0.68
+
+
+def _repeat_note(query: str, chat_id: str) -> str:
+    """Flag a question Filipe is asking again. Empty string when he isn't."""
+    if not query.strip():
+        return ""
+    assistant = settings.assistant_name
+    now = datetime.now(UTC)
+    prior: list[tuple[float, str]] = []
+    for row in _db_module.get_recent_messages(chat_id, limit=20):
+        if row["sender_name"] == assistant:
+            continue
+        text = str(row["content"]).strip()
+        # The pending messages that BUILT this query are in the table already;
+        # comparing the query against itself would fire on every single turn.
+        if not text or text in query:
+            continue
+        try:
+            age = (now - datetime.fromisoformat(row["timestamp"])).total_seconds() / 60
+        except ValueError:
+            continue
+        if 0 <= age <= _REPEAT_WINDOW_MIN:
+            prior.append((age, text))
+
+    for age, text in reversed(prior):
+        ratio = difflib.SequenceMatcher(None, text.lower(), query.lower()).ratio()
+        if ratio >= _REPEAT_SIMILARITY:
+            mins = "just now" if age < 1 else f"{int(age)} min ago"
+            return (
+                f'<repeat>Filipe asked this {mins} — "{_truncate(text, 120, hint="")}" — and '
+                "is asking again. Your previous answer did not land. Rewording it "
+                "will not help; work out what he actually wanted and answer that, "
+                "or ask him which part you missed.</repeat>"
+            )
+    return ""
 
 
 def _assemble(
@@ -1131,6 +1193,18 @@ def _assemble(
         )
     except Exception as e:
         log.warning("background_context_failed", error=str(e))
+
+    # Appended after the memories so it sits as close to Filipe's words as the
+    # assembler can put it, and unbudgeted: one line, and the turn it matters on
+    # is exactly the turn a budget squeeze would drop it.
+    if turn_scoped and chat_id:
+        try:
+            note = _repeat_note(query, chat_id)
+            if note:
+                turn_block = f"{turn_block}\n\n{note}" if turn_block else note
+                log.info("repeat_question_flagged", chat_id=chat_id)
+        except Exception as e:
+            log.warning("repeat_note_failed", error=str(e))
 
     system_block = "\n\n".join(p for p in (pinned, background) if p)
     rendered = _rendered_ids(background) + recalled_ids

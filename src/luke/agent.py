@@ -794,6 +794,36 @@ def parse_delegation(stored: str) -> tuple[str, int | None] | None:
     return body, trigger
 
 
+# Closes the gap the persona-last ordering could not reach. _compose_system_append
+# wins recency inside the SYSTEM prompt, but the turn block is prepended to the
+# USER message, so it reads after the persona and immediately before Filipe.
+# Measured 2026-08-03: 2,098 turn-block tokens ahead of a two-token question.
+# Filipe reported the register as "impersonal" (08-02) and "mechanic" (08-03)
+# after the ordering fix shipped, because the ordering fix never covered this
+# position. Named tics, not adjectives — each line below is a thing the log
+# shows Luke doing: 989-char average replies against his 229; a summing-up
+# closer in 33% of messages; a trailing offer in 25%.
+_VOICE_ANCHOR = (
+    "<voice>\n"
+    "Everything above is reference. Below is Filipe, talking to you.\n"
+    "Answer as Luke. Match his length — a short question takes a short answer.\n"
+    "Don't summarise what the exchange revealed, and don't close by offering\n"
+    "to do more; if it's worth doing, do it.\n"
+    "</voice>"
+)
+
+
+def _compose_turn_prefix(turn_block: str) -> str:
+    """Prefix for the user message: evidence, then voice, then his words.
+
+    The voice anchor goes LAST so the register is the most recent instruction
+    read before the message it has to answer — the same argument that puts the
+    persona last in the system prompt, applied at the position that one cannot
+    reach.
+    """
+    return f"{turn_block}\n\n{_VOICE_ANCHOR}\n\n"
+
+
 def _compose_system_append(persona: str, working_ctx: str | None) -> str:
     """Assemble the system-prompt append: working memory FIRST, persona LAST.
 
@@ -2180,7 +2210,7 @@ async def run_agent(
     )
     system_append = _compose_system_append(persona, ctx.system_block)
     if ctx.turn_block:
-        block = f"{ctx.turn_block}\n\n"
+        block = _compose_turn_prefix(ctx.turn_block)
         # New list rather than in-place insert: `prompt` belongs to the caller.
         if isinstance(prompt, list):
             prompt = [{"type": "text", "text": block}, *prompt]

@@ -1060,9 +1060,20 @@ class TestRenderTurnBlock:
         block, spent, _rendered = context._render_turn_block(cands, 5000)
         assert "<context><memories>" in block
         assert "mem1" in block
-        assert spent == context._estimate_tokens(
+        # The frame is charged too — selection cost must equal render cost, and
+        # the frame renders.
+        assert spent == context._estimate_tokens(context._TURN_FRAME) + context._estimate_tokens(
             next(ln for ln in block.split("\n") if ln.startswith("[mem1]"))
         )
+
+    def test_block_is_framed_as_knowledge_not_voice(self, tmp_settings: Any) -> None:
+        """This block lands closer to the user's words than the persona does.
+        Unframed, it was setting the register — the same defect the persona-last
+        ordering fixed in the system prompt, one layer down."""
+        cands = [{"id": "mem1", "type": "entity", "title": "Test Memory", "score": 0.9}]
+        block, _spent, _rendered = context._render_turn_block(cands, 5000)
+        assert context._TURN_FRAME in block
+        assert "never voice" in block.lower()
 
     def test_respects_budget(self, tmp_settings: Any) -> None:
         cands = [
@@ -1493,3 +1504,66 @@ class TestTruncate:
         )
         assert "more chars" in line
         assert not line.endswith("wor")
+
+
+class TestRepeatQuestion:
+    """A question asked twice is the loudest available signal that the first
+    answer missed. On 2026-08-03 Filipe asked the same thing three times in 80
+    seconds, got three rewordings, and then asked why the answers were
+    "mechanic". The rephrasings defeated exact-match, so this is fuzzy."""
+
+    def _store(self, chat: str, texts: list[tuple[str, str, float]]) -> None:
+        """Store (sender, content, minutes-ago) messages."""
+        now = datetime.now(UTC)
+        for sender, content, mins_ago in texts:
+            db.store_message(
+                chat_id=chat,
+                sender_name=sender,
+                message_id=0,
+                content=content,
+                timestamp=(now - timedelta(minutes=mins_ago)).isoformat(),
+            )
+
+    def test_reworded_repeat_is_flagged(self, test_db: Any) -> None:
+        self._store("c1", [("Filipe", "how do you evaluate these changes?", 1.0)])
+        note = context._repeat_note("I mean, how do you evaluate these chanes", "c1")
+        assert "asking again" in note
+        assert "did not land" in note
+
+    def test_unrelated_question_is_not_flagged(self, test_db: Any) -> None:
+        self._store("c1", [("Filipe", "how big is your log file?", 1.0)])
+        assert context._repeat_note("what time is the visa interview", "c1") == ""
+
+    def test_the_query_does_not_match_itself(self, test_db: Any) -> None:
+        """The pending message that BUILT the query is already in the table.
+        Without the guard this fires on every single turn."""
+        self._store("c1", [("Filipe", "what is on MEMORY.md?", 0.0)])
+        assert context._repeat_note("what is on MEMORY.md?", "c1") == ""
+
+    def test_old_repeats_are_not_flagged(self, test_db: Any) -> None:
+        """Asking the same thing tomorrow is a new question, not a rephrase."""
+        self._store("c1", [("Filipe", "how do you evaluate these changes?", 240.0)])
+        assert context._repeat_note("how do you evaluate these change?", "c1") == ""
+
+    def test_lukes_own_words_are_not_a_repeat(self, test_db: Any) -> None:
+        """Luke echoes the question back constantly; matching his own output
+        would fire on nearly every turn."""
+        self._store("c1", [("Luke", "how do you evaluate these changes? Good question.", 1.0)])
+        assert context._repeat_note("how do you evaluate these chanes", "c1") == ""
+
+    async def test_reaches_the_prompt(self, tmp_settings: Any, test_db: Any) -> None:
+        self._store("c9", [("Filipe", "why did the morning digest break again?", 1.0)])
+        ctx = await context.assemble_context(
+            query="why did the morning digest break again",
+            chat_id="c9",
+            budget_tokens=2000,
+        )
+        assert "<repeat>" in ctx.turn_block
+
+    async def test_absent_when_nothing_repeats(self, tmp_settings: Any, test_db: Any) -> None:
+        ctx = await context.assemble_context(
+            query="what is the visa interview date",
+            chat_id="c9",
+            budget_tokens=2000,
+        )
+        assert "<repeat>" not in ctx.turn_block
