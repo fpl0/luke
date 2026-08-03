@@ -14,7 +14,6 @@ import pytest
 
 import luke.app as app_mod
 from luke.config import settings
-from luke.memory import MemoryResult
 
 # ---------------------------------------------------------------------------
 # Error throttling
@@ -115,57 +114,6 @@ class TestSafeHandler:
 # ---------------------------------------------------------------------------
 # Format memory context
 # ---------------------------------------------------------------------------
-
-
-class TestFormatMemoryContext:
-    def test_structure(self, tmp_settings: Any) -> None:
-        from luke.app import _format_memory_context
-
-        memories: list[MemoryResult] = [
-            {"id": "mem1", "type": "entity", "title": "Test Memory", "score": 0.95},
-        ]
-        result = _format_memory_context(memories)
-        assert "<context>" in result
-        assert "<memories>" in result
-        assert "mem1" in result
-        assert "entity" in result
-
-    def test_empty_memories(self, tmp_settings: Any) -> None:
-        from luke.app import _format_memory_context
-
-        result = _format_memory_context([])
-        assert "<context>" in result
-        assert "<memories>" in result
-
-
-class TestAutoRecall:
-    async def test_trigger_skill_displaces_lowest_non_skill(self, tmp_settings: Any) -> None:
-        from luke.app import _auto_recall
-
-        tmp_settings.auto_recall_limit = 2
-        existing = [
-            {"id": "old-skill", "type": "procedure", "title": "Old Skill", "score": 0.1},
-            {"id": "entity-1", "type": "entity", "title": "Entity", "score": 0.2},
-        ]
-        trigger = [{"id": "new-skill", "type": "procedure", "title": "New Skill", "score": 0.9}]
-
-        def fake_frontmatter(path: Path) -> dict[str, Any]:
-            if path.name == "old-skill.md":
-                return {"tags": ["skill"]}
-            return {"tags": []}
-
-        with (
-            patch("luke.app.settings", tmp_settings),
-            patch("luke.app.recall", return_value=existing),
-            patch("luke.app.get_trigger_matched_skills", return_value=trigger),
-            patch("luke.app.get_graph_neighbors", return_value=[]),
-            patch("luke.app.touch_memories"),
-            patch("luke.app.read_frontmatter", side_effect=fake_frontmatter),
-            patch("luke.app._format_memory_context", return_value="<context></context>"),
-        ):
-            _memory_context, memories = await _auto_recall("deploy this release", "12345")
-
-        assert [m["id"] for m in memories] == ["old-skill", "new-skill"]
 
 
 # ---------------------------------------------------------------------------
@@ -471,7 +419,6 @@ class TestProcess:
 
     async def test_retry_on_failure_no_cursor_advance(self) -> None:
         """Agent failure should NOT advance cursor — messages stay pending for retry."""
-        import luke.app as app_mod
         from luke.app import process
 
         chat_id = "900001"
@@ -523,7 +470,6 @@ class TestProcess:
     @pytest.mark.filterwarnings("ignore::RuntimeWarning")
     async def test_max_retries_advances_cursor(self) -> None:
         """After max_retries failures, cursor should advance and user notified."""
-        import luke.app as app_mod
         from luke.app import process
 
         chat_id = "900002"
@@ -571,7 +517,6 @@ class TestProcess:
 
     async def test_success_clears_retry_count(self) -> None:
         """Successful agent run should clear any retry count."""
-        import luke.app as app_mod
         from luke.app import process
 
         chat_id = "900003"
@@ -670,7 +615,7 @@ class TestStartupReplay:
 
 class TestSalienceGate:
     def test_trivial_messages_skip(self) -> None:
-        from luke.app import _needs_recall
+        from luke.context import needs_recall as _needs_recall
 
         assert _needs_recall("ok") is False
         assert _needs_recall("thanks!") is False
@@ -680,14 +625,14 @@ class TestSalienceGate:
         assert _needs_recall("") is False
 
     def test_substantive_messages_pass(self) -> None:
-        from luke.app import _needs_recall
+        from luke.context import needs_recall as _needs_recall
 
         assert _needs_recall("What did we discuss yesterday about the project?") is True
         assert _needs_recall("Can you research flights to Tokyo?") is True
         assert _needs_recall("Update the goal for learning Spanish") is True
 
     def test_short_but_meaningful(self) -> None:
-        from luke.app import _needs_recall
+        from luke.context import needs_recall as _needs_recall
 
         # Short but not in trivial set
         assert _needs_recall("deploy now") is True
@@ -1351,69 +1296,3 @@ class TestEnsureDirsSeedsVoice:
         _ensure_dirs()
 
         assert cfg.read_text() == '{"outputStyle": "custom"}'
-
-
-class TestTrimConvState:
-    """Conversation state must lose its OLDEST content, never its newest.
-
-    _save_conv_state writes chronologically with the latest reply appended
-    last, so the previous body[:limit] dropped the most recent exchange and cut
-    mid-sentence — backwards for the one block whose job is seamless resumption.
-    """
-
-    HEADER = (
-        "# Conversation State\n\n"
-        "**Last exchange:** 2026-08-03T10:03+00:00\n"
-        "**Active topics:** work\n"
-        "**User last active:** 2026-08-03T09:41\n"
-    )
-
-    def _body(self, n: int) -> str:
-        msgs = "\n".join(
-            f"**Filipe Lima** (2026-08-03T09:{i:02d}): message number {i}" for i in range(n)
-        )
-        return self.HEADER + msgs
-
-    def test_short_body_untouched(self) -> None:
-        body = self._body(3)
-        assert app_mod._trim_conv_state(body, 10_000) == body
-
-    def test_keeps_the_newest_message(self) -> None:
-        body = self._body(40)
-        out = app_mod._trim_conv_state(body, 600)
-        assert "message number 39" in out
-        assert "message number 0" not in out
-
-    def test_keeps_the_header(self) -> None:
-        out = app_mod._trim_conv_state(self._body(40), 600)
-        assert "**Active topics:**" in out
-        assert "**User last active:**" in out
-
-    def test_respects_the_limit(self) -> None:
-        for limit in (200, 600, 1500, 3000):
-            out = app_mod._trim_conv_state(self._body(40), limit)
-            assert len(out) <= limit, f"overflowed at {limit}"
-
-    def test_does_not_cut_mid_line(self) -> None:
-        """Whole messages only — a half-sentence is worse than one fewer turn."""
-        out = app_mod._trim_conv_state(self._body(40), 600)
-        for line in out.split("\n"):
-            if line.startswith("**Filipe"):
-                assert line.endswith(tuple("0123456789")), f"truncated line: {line!r}"
-
-    def test_messages_stay_in_order(self) -> None:
-        out = app_mod._trim_conv_state(self._body(40), 900)
-        nums = [int(ln.rsplit(" ", 1)[1]) for ln in out.split("\n") if ln.startswith("**Filipe")]
-        assert nums == sorted(nums)
-
-    def test_headerless_body_still_trims(self) -> None:
-        body = "\n".join(f"**Luke** (2026-08-03T09:{i:02d}): line {i}" for i in range(40))
-        out = app_mod._trim_conv_state(body, 400)
-        assert "line 39" in out
-        assert len(out) <= 400
-
-    def test_oversized_header_falls_back_to_newest_text(self) -> None:
-        body = "H" * 5000 + "\n**Luke** (2026-08-03T09:00): the newest thing"
-        out = app_mod._trim_conv_state(body, 100)
-        assert "the newest thing" in out
-        assert len(out) <= 100

@@ -849,6 +849,12 @@ class AgentResult:
     output_tokens: int = 0
     cache_create_tokens: int = 0
     cache_read_tokens: int = 0
+    # Memory this run injected. `injected_ids` is everything rendered in either
+    # layer — the reference scan credits utility across all of it. `recalled_ids`
+    # is the query-ranked subset only: correction detection does per-id
+    # similarity work, which is cost with no signal over standing context.
+    injected_ids: list[str] = field(default_factory=list)
+    recalled_ids: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -2151,18 +2157,35 @@ async def run_agent(
             "\n\n<constitutional>\n" + constitutional_path.read_text() + "\n</constitutional>"
         )
 
-    # Inject working memory — priority memories scored and selected at session start
-    # Adaptive budget: low-effort messages get less context (saves tokens + noise)
-    # user_text is the caller's clean, envelope-free user message, captured BEFORE any
-    # memory-context injection into `prompt`. Prefer it so retrieval queries and the
-    # file-artifact/source-read Stop gates read what the user actually typed — not the
-    # injected memory blob (which is prepended for str prompts and inserted at index 0
-    # for multimodal list prompts, masking the real message entirely).
+    # Assemble every memory layer here — the single call site. This is the only
+    # place that holds the clean user text, the effort tier, the chat id AND the
+    # prompt before it is sent, which is what lets the standing and turn layers
+    # share one budget and dedup against each other.
+    #
+    # user_text is the caller's envelope-free user message. Prefer it so the
+    # retrieval query and the file-artifact/source-read Stop gates read what the
+    # user actually typed, not an injected memory blob.
     prompt_text_for_context = _context_query(prompt, user_text)
-    _EFFORT_BUDGET = {"low": 3_000, "medium": 6_000, "high": 12_000, "max": 12_000}
-    ctx_budget = 12_000 if autonomous else _EFFORT_BUDGET.get(effort or "high", 12_000)
-    working_ctx = context.build_working_context(budget_tokens=ctx_budget)
-    system_append = _compose_system_append(persona, working_ctx)
+    # Budgets are TRUE rendered tokens now that selection charges what it prints,
+    # so these numbers finally mean something. Lower than the old 3k/6k/12k
+    # because the turn layer — previously unbudgeted, contributing ~7k on its
+    # own — now spends from the same wallet.
+    _EFFORT_BUDGET = {"low": 2_500, "medium": 4_000, "high": 6_000, "max": 8_000}
+    ctx_budget = 4_000 if autonomous else _EFFORT_BUDGET.get(effort or "high", 6_000)
+    ctx = await context.assemble_context(
+        query=prompt_text_for_context,
+        chat_id=chat_id,
+        budget_tokens=ctx_budget,
+        turn_scoped=not autonomous,
+    )
+    system_append = _compose_system_append(persona, ctx.system_block)
+    if ctx.turn_block:
+        block = f"{ctx.turn_block}\n\n"
+        # New list rather than in-place insert: `prompt` belongs to the caller.
+        if isinstance(prompt, list):
+            prompt = [{"type": "text", "text": block}, *prompt]
+        else:
+            prompt = block + prompt
 
     # Per-run counters and timing state (closed over by hooks)
     send_count = {"n": 0}
@@ -2703,7 +2726,7 @@ async def run_agent(
         resume=bool(session_id),
     )
 
-    result = AgentResult()
+    result = AgentResult(injected_ids=list(ctx.ids), recalled_ids=list(ctx.recalled_ids))
     async with ClaudeSDKClient(options=options) as client:
         _active_clients[chat_id] = client
         try:

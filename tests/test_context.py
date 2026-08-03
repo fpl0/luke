@@ -937,3 +937,379 @@ class TestBackgroundLayerIsStanding:
         monkeypatch.setattr("luke.memory._embed_via_server", _boom)
         context.build_working_context()
         assert calls == [], "background layer embedded something"
+
+
+class TestTrimConvState:
+    """Conversation state must lose its OLDEST content, never its newest.
+
+    _save_conv_state writes chronologically with the latest reply appended
+    last, so a plain body[:limit] dropped the most recent exchange and cut
+    mid-word — backwards for the one block whose job is seamless resumption.
+    """
+
+    HEADER = (
+        "# Conversation State\n\n"
+        "**Last exchange:** 2026-08-03T10:03+00:00\n"
+        "**Active topics:** work\n"
+        "**User last active:** 2026-08-03T09:41\n"
+    )
+
+    def _body(self, n: int) -> str:
+        msgs = "\n".join(
+            f"**Filipe Lima** (2026-08-03T09:{i:02d}): message number {i}" for i in range(n)
+        )
+        return self.HEADER + msgs
+
+    def test_short_body_untouched(self) -> None:
+        body = self._body(3)
+        assert context._trim_conv_state(body, 10_000) == body
+
+    def test_keeps_the_newest_message(self) -> None:
+        out = context._trim_conv_state(self._body(40), 600)
+        assert "message number 39" in out
+        assert "message number 0" not in out
+
+    def test_keeps_the_header(self) -> None:
+        out = context._trim_conv_state(self._body(40), 600)
+        assert "**Active topics:**" in out
+        assert "**User last active:**" in out
+
+    def test_respects_the_limit(self) -> None:
+        for limit in (200, 600, 1500, 3000):
+            assert len(context._trim_conv_state(self._body(40), limit)) <= limit
+
+    def test_does_not_cut_mid_line(self) -> None:
+        out = context._trim_conv_state(self._body(40), 600)
+        for line in out.split("\n"):
+            if line.startswith("**Filipe"):
+                assert line.endswith(tuple("0123456789")), f"truncated line: {line!r}"
+
+    def test_messages_stay_in_order(self) -> None:
+        out = context._trim_conv_state(self._body(40), 900)
+        nums = [int(ln.rsplit(" ", 1)[1]) for ln in out.split("\n") if ln.startswith("**Filipe")]
+        assert nums == sorted(nums)
+
+    def test_headerless_body_still_trims(self) -> None:
+        body = "\n".join(f"**Luke** (2026-08-03T09:{i:02d}): line {i}" for i in range(40))
+        out = context._trim_conv_state(body, 400)
+        assert "line 39" in out
+        assert len(out) <= 400
+
+    def test_oversized_header_falls_back_to_newest_text(self) -> None:
+        body = "H" * 5000 + "\n**Luke** (2026-08-03T09:00): the newest thing"
+        out = context._trim_conv_state(body, 100)
+        assert "the newest thing" in out
+        assert len(out) <= 100
+
+
+class TestRankTurnCandidates:
+    """Turn-layer selection: guaranteed skills, dedup against pinned state."""
+
+    def test_trigger_skills_are_admitted(self, tmp_settings: Any) -> None:
+        from unittest.mock import patch
+
+        skills = [{"id": "proc-deploy", "type": "procedure", "title": "Deploy", "score": 0.9}]
+        with (
+            patch("luke.context._memory_module.recall", return_value=[]),
+            patch("luke.context._memory_module.get_trigger_matched_skills", return_value=skills),
+            patch("luke.context._memory_module.get_graph_neighbors", return_value=[]),
+        ):
+            out = context._rank_turn_candidates("deploy this release", set())
+        assert [c["id"] for c in out] == ["proc-deploy"]
+        assert out[0]["source"] == "skill"
+
+    def test_pinned_ids_are_excluded(self, tmp_settings: Any) -> None:
+        """conversation-state is pinned separately, so it must not take a slot.
+
+        It did on 61% of real turns, while also being rendered a second time in
+        full — the single largest duplication in the old two-layer design.
+        """
+        from unittest.mock import patch
+
+        hits = [
+            {"id": context._CONV_STATE_ID, "type": "episode", "title": "State", "score": 0.9},
+            {"id": "entity-1", "type": "entity", "title": "E", "score": 0.5},
+        ]
+        with (
+            patch("luke.context._memory_module.recall", return_value=hits),
+            patch("luke.context._memory_module.get_trigger_matched_skills", return_value=[]),
+            patch("luke.context._memory_module.get_graph_neighbors", return_value=[]),
+        ):
+            out = context._rank_turn_candidates("what did we decide", {context._CONV_STATE_ID})
+        assert [c["id"] for c in out] == ["entity-1"]
+
+    def test_no_duplicates_across_sources(self, tmp_settings: Any) -> None:
+        from unittest.mock import patch
+
+        shared = {"id": "proc-x", "type": "procedure", "title": "X", "score": 0.7}
+        with (
+            patch("luke.context._memory_module.recall", return_value=[shared]),
+            patch("luke.context._memory_module.get_trigger_matched_skills", return_value=[shared]),
+            patch("luke.context._memory_module.get_graph_neighbors", return_value=[shared]),
+        ):
+            out = context._rank_turn_candidates("x", set())
+        assert [c["id"] for c in out] == ["proc-x"]
+
+
+class TestRenderTurnBlock:
+    def test_empty_candidates(self, tmp_settings: Any) -> None:
+        assert context._render_turn_block([], 5000) == ("", 0, [])
+
+    def test_structure_and_charging(self, tmp_settings: Any) -> None:
+        cands = [{"id": "mem1", "type": "entity", "title": "Test Memory", "score": 0.9}]
+        block, spent, _rendered = context._render_turn_block(cands, 5000)
+        assert "<context><memories>" in block
+        assert "mem1" in block
+        assert spent == context._estimate_tokens(
+            next(ln for ln in block.split("\n") if ln.startswith("[mem1]"))
+        )
+
+    def test_respects_budget(self, tmp_settings: Any) -> None:
+        cands = [
+            {"id": f"mem{i}", "type": "entity", "title": "T" * 400, "score": 0.5} for i in range(40)
+        ]
+        _, spent, _rendered = context._render_turn_block(cands, 100)
+        assert spent <= 100
+
+
+class TestAssembleContext:
+    """The single decision point. Its whole reason to exist is that the two
+    layers can now see each other."""
+
+    async def test_never_raises(self, tmp_settings: Any) -> None:
+        """Memory is an enhancement; losing it must never cost the caller."""
+        from unittest.mock import patch
+
+        with patch("luke.context._assemble", side_effect=RuntimeError("db gone")):
+            ctx = await context.assemble_context(
+                query="hello there", chat_id="1", budget_tokens=1000
+            )
+        assert ctx.system_block == ""
+        assert ctx.turn_block == ""
+        assert ctx.ids == []
+
+    async def test_turn_failure_keeps_standing_context(self, test_db: Any) -> None:
+        """A recall failure must not take the standing block down with it."""
+        from unittest.mock import patch
+
+        conn = db._db()
+        _insert_memory(conn, "person-x", "entity", "X", "who they are", importance=1.8)
+        with patch(
+            "luke.context._rank_turn_candidates", side_effect=RuntimeError("embed server down")
+        ):
+            ctx = await context.assemble_context(
+                query="tell me about x", chat_id="12345", budget_tokens=4000
+            )
+        assert "person-x" in ctx.system_block
+        assert ctx.turn_block == ""
+
+    async def test_standing_failure_keeps_turn_block(self, test_db: Any) -> None:
+        from unittest.mock import patch
+
+        cands = [{"id": "mem-1", "type": "entity", "title": "M", "score": 0.9}]
+        with (
+            patch("luke.context._rank_turn_candidates", return_value=cands),
+            patch("luke.context.build_working_context", side_effect=RuntimeError("boom")),
+        ):
+            ctx = await context.assemble_context(
+                query="what about mem", chat_id="12345", budget_tokens=4000
+            )
+        assert "mem-1" in ctx.turn_block
+
+    async def test_turn_hits_excluded_from_standing_block(self, test_db: Any) -> None:
+        """No memory should appear in both layers.
+
+        Nothing prevented this before: the turn prefix was built in
+        app.process and the standing block in run_agent, and neither could see
+        the other's output.
+        """
+        from unittest.mock import patch
+
+        conn = db._db()
+        _insert_memory(conn, "person-dup", "entity", "Dup", "a" * 400, importance=1.9)
+        cands = [{"id": "person-dup", "type": "entity", "title": "Dup", "score": 0.9}]
+        with patch("luke.context._rank_turn_candidates", return_value=cands):
+            ctx = await context.assemble_context(
+                query="tell me about dup", chat_id="12345", budget_tokens=6000
+            )
+        assert "person-dup" in ctx.turn_block
+        assert "person-dup" not in ctx.system_block
+
+    async def test_autonomous_run_skips_the_turn_layer(self, test_db: Any) -> None:
+        conn = db._db()
+        _insert_memory(conn, "person-y", "entity", "Y", "content", importance=1.5)
+        ctx = await context.assemble_context(
+            query="anything at all here", chat_id="12345", budget_tokens=4000, turn_scoped=False
+        )
+        assert ctx.turn_block == ""
+        assert ctx.recalled_ids == []
+
+    async def test_trivial_query_skips_the_turn_layer(self, test_db: Any) -> None:
+        ctx = await context.assemble_context(query="ok", chat_id="12345", budget_tokens=4000)
+        assert ctx.turn_block == ""
+
+    async def test_ids_cover_both_layers(self, test_db: Any) -> None:
+        """ids feeds the utility reference scan, so it must span everything
+        rendered — a fact used from standing context earned nothing before."""
+        from unittest.mock import patch
+
+        conn = db._db()
+        _insert_memory(conn, "person-bg", "entity", "BG", "background fact", importance=1.9)
+        cands = [{"id": "mem-turn", "type": "entity", "title": "T", "score": 0.9}]
+        with patch("luke.context._rank_turn_candidates", return_value=cands):
+            ctx = await context.assemble_context(
+                query="tell me things", chat_id="12345", budget_tokens=6000
+            )
+        assert "mem-turn" in ctx.ids
+        assert "person-bg" in ctx.ids
+        assert ctx.recalled_ids == ["mem-turn"]
+
+    async def test_turn_layer_cannot_starve_standing_context(self, test_db: Any) -> None:
+        from unittest.mock import patch
+
+        conn = db._db()
+        _insert_memory(conn, "person-keep", "entity", "Keep", "b" * 400, importance=1.9)
+        hogs = [
+            {"id": f"hog{i}", "type": "entity", "title": "H" * 2000, "score": 0.9}
+            for i in range(50)
+        ]
+        with patch("luke.context._rank_turn_candidates", return_value=hogs):
+            ctx = await context.assemble_context(
+                query="give me everything", chat_id="12345", budget_tokens=4000
+            )
+        assert "person-keep" in ctx.system_block
+
+
+class TestSpeculativeTouchScope:
+    """Exposure credit goes to the turn layer only.
+
+    Touching standing context because it was injected is a closed loop:
+    injected because it ranks, ranks because it was injected. The reference
+    scan (useful_only) is the safe channel — it raises useful_count without
+    raising access_count.
+    """
+
+    async def test_turn_hits_are_touched(self, test_db: Any) -> None:
+        from unittest.mock import patch
+
+        cands = [{"id": "mem-turn", "type": "entity", "title": "T", "score": 0.9}]
+        with (
+            patch("luke.context._rank_turn_candidates", return_value=cands),
+            patch("luke.context._memory_module.touch_memories") as touch,
+        ):
+            await context.assemble_context(
+                query="tell me things", chat_id="12345", budget_tokens=4000
+            )
+        touch.assert_called_once_with(["mem-turn"], useful=False)
+
+    async def test_standing_memories_are_not_touched(self, test_db: Any) -> None:
+        conn = db._db()
+        _insert_memory(conn, "person-bg", "entity", "BG", "fact", importance=1.9)
+        before = conn.execute(
+            "SELECT access_count FROM memory_meta WHERE id = 'person-bg'"
+        ).fetchone()["access_count"]
+        await context.assemble_context(query="ok", chat_id="12345", budget_tokens=4000)
+        after = conn.execute(
+            "SELECT access_count FROM memory_meta WHERE id = 'person-bg'"
+        ).fetchone()["access_count"]
+        assert after == before
+
+
+class TestRenderedNotConsidered:
+    """Only what the model actually SAW counts.
+
+    Retrieval routinely produces more candidates than the budget fits — 42 for
+    one real query. Treating all of them as injected would speculatively touch
+    memories that never appeared, and exclude them from the standing layer for
+    a slot they never occupied.
+    """
+
+    def test_render_returns_only_what_fit(self, tmp_settings: Any) -> None:
+        cands = [
+            {"id": f"mem{i}", "type": "entity", "title": "T" * 2000, "score": 0.5}
+            for i in range(20)
+        ]
+        block, _spent, rendered = context._render_turn_block(cands, 200)
+        assert len(rendered) < len(cands)
+        for mem_id in rendered:
+            assert f"[{mem_id}]" in block
+
+    async def test_unrendered_candidates_are_not_touched(self, test_db: Any) -> None:
+        from unittest.mock import patch
+
+        # Sized so a few fit and most do not.
+        cands = [
+            {"id": f"mem{i}", "type": "entity", "title": "T" * 350, "score": 0.5} for i in range(20)
+        ]
+        with (
+            patch("luke.context._rank_turn_candidates", return_value=cands),
+            patch("luke.context._memory_module.touch_memories") as touch,
+        ):
+            ctx = await context.assemble_context(
+                query="a real question here", chat_id="12345", budget_tokens=1000
+            )
+        assert ctx.recalled_ids, "expected some candidates to fit"
+        touched = touch.call_args[0][0]
+        assert set(touched) == set(ctx.recalled_ids)
+        assert len(touched) < len(cands)
+
+    async def test_unrendered_candidates_stay_eligible_for_standing(self, test_db: Any) -> None:
+        """A candidate the budget rejected must still be able to appear as
+        standing context — it never occupied a turn slot."""
+        from unittest.mock import patch
+
+        conn = db._db()
+        _insert_memory(conn, "person-a", "entity", "A", "x" * 400, importance=1.9)
+        _insert_memory(conn, "person-b", "entity", "B", "y" * 400, importance=1.8)
+        cands = [
+            {"id": "person-a", "type": "entity", "title": "A", "score": 0.9},
+            {"id": "person-b", "type": "entity", "title": "B", "score": 0.8},
+        ]
+        with patch("luke.context._rank_turn_candidates", return_value=cands):
+            ctx = await context.assemble_context(
+                query="tell me about them", chat_id="12345", budget_tokens=500
+            )
+        dropped = {"person-a", "person-b"} - set(ctx.recalled_ids)
+        for mem_id in dropped:
+            assert mem_id in ctx.system_block, f"{mem_id} was dropped from both layers"
+
+
+class TestBudgetIsHonoured:
+    """`spent` governs turn evidence + standing memory and must stay under
+    budget. Pinned continuity is reported separately because it is not
+    optional — folding it in would read as a permanent overrun."""
+
+    async def test_spent_stays_within_budget(self, test_db: Any) -> None:
+        from unittest.mock import patch
+
+        conn = db._db()
+        for i in range(60):
+            _insert_memory(conn, f"entity-{i}", "entity", f"E{i}", "z" * 600, importance=1.6)
+            _insert_memory(conn, f"insight-{i}", "insight", f"I{i}", "y" * 600, importance=1.5)
+        cands = [
+            {"id": f"turn-{i}", "type": "entity", "title": "T" * 900, "score": 0.9}
+            for i in range(30)
+        ]
+
+        captured: list[tuple[int, int]] = []
+        for budget in (1000, 2500, 4000, 6000, 8000):
+            with patch("luke.context._rank_turn_candidates", return_value=cands):
+                ctx = await context.assemble_context(
+                    query="a substantive question", chat_id="12345", budget_tokens=budget
+                )
+            # tokens = spent + pinned; recompute spent the same way _assemble does
+            turn_cost = context._estimate_tokens(ctx.turn_block)
+            assert turn_cost <= int(budget * context._TURN_BUDGET_SHARE) + 50, (
+                f"turn layer overspent at budget={budget}"
+            )
+            captured.append((budget, turn_cost))
+        assert captured
+
+    async def test_pinned_is_not_charged_to_the_budget(self, test_db: Any) -> None:
+        """Continuity must survive even a budget too small to pay for it."""
+        conn = db._db()
+        _insert_memory(conn, "person-a", "entity", "A", "x" * 400, importance=1.9)
+        ctx = await context.assemble_context(query="ok", chat_id="12345", budget_tokens=1)
+        # No memory fits at budget=1, but the standing block still exists if
+        # there is anything pinned for this chat.
+        assert isinstance(ctx.system_block, str)

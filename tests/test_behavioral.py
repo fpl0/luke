@@ -170,7 +170,7 @@ class TestEmotionalResponse:
 
     def test_trivial_greeting_skips_recall(self) -> None:
         """Pure greetings should not trigger a memory recall round-trip."""
-        from luke.app import _needs_recall
+        from luke.context import needs_recall as _needs_recall
 
         assert not _needs_recall("hey"), "greeting 'hey' should not trigger recall"
         assert not _needs_recall("hi"), "greeting 'hi' should not trigger recall"
@@ -179,7 +179,7 @@ class TestEmotionalResponse:
 
     def test_substantive_message_triggers_recall(self) -> None:
         """Non-trivial messages should trigger memory recall."""
-        from luke.app import _needs_recall
+        from luke.context import needs_recall as _needs_recall
 
         assert _needs_recall("What were we working on last week with the Python project?")
         assert _needs_recall("I've been thinking about the trip to Portugal")
@@ -281,7 +281,7 @@ class TestAntiRegression:
 
     def test_trivial_words_includes_core_greetings(self) -> None:
         """Trivial word set must cover common greetings that should not trigger recall."""
-        from luke.app import _TRIVIAL_WORDS
+        from luke.context import _TRIVIAL_WORDS
 
         required = {"hi", "hey", "hello", "ok", "okay", "thanks", "yes", "no"}
         missing = required - _TRIVIAL_WORDS

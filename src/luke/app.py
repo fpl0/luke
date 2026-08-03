@@ -30,7 +30,7 @@ from claude_agent_sdk.types import (
 )
 from structlog.stdlib import BoundLogger
 
-from . import db, memory
+from . import context, db, memory
 from .agent import (
     _TG_MAX_MSG_LEN,
     _trunc,
@@ -41,18 +41,13 @@ from .agent import (
 )
 from .bus import bus
 from .config import settings
-from .db import ensure_utc
 from .media import build_prompt, extract_frame, transcribe
 from .memory import (
     MEMORY_DIRS,
-    MemoryResult,
     apply_correction,
     detect_corrections,
     flag_for_review,
-    get_graph_neighbors,
-    get_trigger_matched_skills,
     read_frontmatter,
-    recall,
     touch_memories,
 )
 from .scheduler import start_scheduler_loop, start_wake_socket, write_heartbeat
@@ -75,8 +70,6 @@ _retry_counts: dict[str, int] = {}  # chat_id → consecutive failure count
 # Model routing: one-way ratchet within a session (never downgrade mid-conversation)
 _MODEL_RANK: dict[str, int] = {"haiku": 0, "sonnet": 1, "opus": 2}
 _session_models: dict[str, str] = {}  # chat_id → highest model used in session
-
-_session_lost: dict[str, bool] = {}  # chat_id → whether last session was lost
 
 # Crash context: tracks what the system is doing for richer crash breadcrumbs
 _start_time: float = time.monotonic()
@@ -137,45 +130,6 @@ def _safe_handler(func: _F) -> _F:
             )
 
     return wrapper
-
-
-_TRIVIAL_WORDS = frozenset(
-    {
-        "ok",
-        "okay",
-        "yes",
-        "no",
-        "yeah",
-        "yep",
-        "nope",
-        "sure",
-        "thanks",
-        "thank",
-        "lol",
-        "haha",
-        "hehe",
-        "wow",
-        "cool",
-        "nice",
-        "great",
-        "hi",
-        "hey",
-        "hello",
-        "bye",
-        "goodnight",
-        "gn",
-        "gm",
-    }
-)
-
-
-def _needs_recall(text: str) -> bool:
-    """Heuristic: skip recall for trivial/short messages."""
-    stripped = text.strip()
-    if len(stripped) < 3:
-        return False
-    words = stripped.lower().split()
-    return not (len(words) <= 2 and all(w.strip("!?.,:") in _TRIVIAL_WORDS for w in words))
 
 
 _COMPLEX_KEYWORDS: frozenset[str] = frozenset(
@@ -279,206 +233,11 @@ def _should_send_error(chat_id: str) -> bool:
     return True
 
 
-_CONV_STATE_ID = "conversation-state-latest"
 # Read cap for the raw file before tail-trimming. _save_conv_state can emit
 # ~8.3k chars (10 messages x 500 + batch + an 800-char reply), so this has to
 # clear that comfortably or the trim would operate on already-truncated text.
-_CONV_STATE_READ_MAX = 20_000
-_STALE_HOURS = 24.0
 _COST_ANOMALY_MIN = 2.0  # minimum cost to trigger anomaly check
 _COST_ANOMALY_MULTIPLIER = 3  # times rolling average
-
-
-# A conversation-state message line: "**Filipe Lima** (2026-08-03T09:41): ..."
-_CONV_MSG_LINE = re.compile(r"^\*\*[^*]+\*\* \(")
-
-
-def _trim_conv_state(body: str, limit: int) -> str:
-    """Trim conversation state to *limit* chars, keeping the NEWEST exchange.
-
-    _save_conv_state writes the thread chronologically — a structured header,
-    then messages oldest-first, with the latest reply appended last. A plain
-    ``body[:limit]`` therefore drops the most recent turn and cuts mid-sentence,
-    which is precisely backwards for a block whose entire job is letting the
-    conversation resume seamlessly. The builder packs up to 10 messages at 500
-    chars plus an 800-char reply, so worst case it discarded most of the thread
-    and always the part that mattered.
-
-    Keeps the header (which carries topics, last-active and pending actions)
-    and then as many trailing message lines as fit.
-    """
-    if len(body) <= limit:
-        return body
-
-    lines = body.split("\n")
-    first_msg = next(
-        (i for i, ln in enumerate(lines) if _CONV_MSG_LINE.match(ln)),
-        len(lines),
-    )
-    header = lines[:first_msg]
-    messages = lines[first_msg:]
-
-    header_text = "\n".join(header)
-    room = limit - len(header_text) - 1
-    if room <= 0:
-        # Pathological header — fall back to keeping the newest text we can.
-        return body[-limit:]
-
-    kept: list[str] = []
-    used = 0
-    for line in reversed(messages):
-        cost = len(line) + 1
-        if used + cost > room:
-            break
-        kept.insert(0, line)
-        used += cost
-
-    if not kept:
-        # Even one message will not fit beside the header; the newest exchange
-        # still beats the oldest, so keep the tail of it rather than nothing.
-        return (header_text + "\n" + messages[-1])[-limit:] if messages else header_text[:limit]
-
-    return "\n".join([*header, *kept])
-
-
-def _load_conv_state() -> tuple[str, str | None]:
-    """Read conversation state body and timestamp (sync, for use in to_thread)."""
-    # Read uncapped, then trim from the correct end. read_memory_body's own
-    # limit keeps the FIRST n chars, which drops the newest exchange.
-    body = memory.read_memory_body("episode", _CONV_STATE_ID, _CONV_STATE_READ_MAX)
-    if body:
-        body = _trim_conv_state(body, settings.recall_content_limit)
-    updated = memory.get_memory_updated(_CONV_STATE_ID) if body else None
-    return body, updated
-
-
-def _live_reaction_note(chat_id: str) -> str:
-    """Surface reactions from the last few minutes into the live turn so a fresh
-    ❤ / 👎 shapes my next response while it's warm — the 'presence' gap Filipe
-    named: capture was never the problem, noticing in the moment was. Returns ''
-    when nothing is fresh, so it self-expires and never nags."""
-    reactions = db.get_recent_reactions(chat_id, within_minutes=15)
-    if not reactions:
-        return ""
-    lines = []
-    for r in reactions[:5]:
-        is_own = r.get("msg_sender") == settings.assistant_name
-        target = "your message" if is_own else "their own message"
-        preview = (r.get("msg_preview") or "").replace("\n", " ").strip()
-        snippet = f' "{preview}…"' if preview else ""
-        lines.append(f"- {r['emoji']} ({r['sentiment']}) on {target}{snippet}")
-    return (
-        "[LIVE — Filipe just reacted (last 15 min). Acknowledge it naturally if it "
-        "fits; let it shape your tone. Don't over-perform it.]\n" + "\n".join(lines) + "\n\n"
-    )
-
-
-async def _get_conversation_state(chat_id: str) -> str:
-    """Load conversation state for continuity injection.
-
-    Returns formatted context string (empty if nothing to inject).
-    Falls back to recent message synthesis if no saved state exists.
-    """
-    body, updated = await asyncio.to_thread(_load_conv_state)
-    live_reactions = await asyncio.to_thread(_live_reaction_note, chat_id)
-    if body:
-        # Add session recovery notice if applicable
-        if _session_lost.pop(chat_id, False):
-            body = "[Session was reset — use this context to resume seamlessly]\n" + body
-        if live_reactions:
-            body = live_reactions + body
-        if updated:
-            try:
-                ts = ensure_utc(datetime.fromisoformat(updated))
-                hours_ago = (datetime.now(UTC) - ts).total_seconds() / 3600
-                if hours_ago > _STALE_HOURS:
-                    body = (
-                        f"[Last conversation was {int(hours_ago)}h ago "
-                        f"— context may be outdated]\n{body}"
-                    )
-            except ValueError:
-                pass
-        return f"<conversation-state>\n{body}\n</conversation-state>\n"
-
-    # Fallback: synthesize from recent messages
-    recent = await asyncio.to_thread(db.get_recent_messages, chat_id, limit=20)
-    if not recent:
-        return ""
-    lines = [f"{m['sender_name']}: {m['content'][:500]}" for m in recent[-10:]]
-    ctx = "\n".join(lines)
-    return (
-        "<conversation-state>\n"
-        f"{live_reactions}"
-        "[Recent conversation context (no saved state available)]\n"
-        f"{ctx}\n</conversation-state>\n"
-    )
-
-
-async def _auto_recall(combined_text: str, chat_id: str) -> tuple[str, list[MemoryResult]]:
-    """Run memory recall + graph augmentation + skill trigger matching.
-
-    Trigger-matched skills get a guaranteed slot (displacing the lowest-scoring
-    non-skill memory if the limit is reached).
-    """
-    recall_start = time.monotonic()
-    # Run recall and trigger matching concurrently
-    memories, trigger_skills = await asyncio.gather(
-        asyncio.to_thread(recall, query=combined_text, limit=settings.auto_recall_limit),
-        asyncio.to_thread(get_trigger_matched_skills, combined_text),
-    )
-
-    def is_skill_memory(memory_result: MemoryResult) -> bool:
-        if memory_result.get("type") != "procedure":
-            return False
-        path = settings.memory_dir / MEMORY_DIRS["procedure"] / f"{memory_result['id']}.md"
-        tags = read_frontmatter(path).get("tags", [])
-        return isinstance(tags, list) and ("skill" in tags or "auto-extracted" in tags)
-
-    # Guarantee trigger-matched skills a slot in the recall results
-    seen_ids = {m["id"] for m in memories}
-    for skill in trigger_skills:
-        if skill["id"] not in seen_ids:
-            if len(memories) >= settings.auto_recall_limit:
-                non_skill_indexes = [
-                    idx
-                    for idx, memory_result in enumerate(memories)
-                    if not is_skill_memory(memory_result)
-                ]
-                if not non_skill_indexes:
-                    continue
-                drop_idx = min(non_skill_indexes, key=lambda idx: memories[idx].get("score", 0))
-                memories.pop(drop_idx)
-            memories.append(skill)
-            seen_ids.add(skill["id"])
-
-    memory_context = ""
-    seen: set[str] = set()
-    if memories:
-        mem_ids = [m["id"] for m in memories]
-        neighbors = await asyncio.to_thread(
-            get_graph_neighbors,
-            mem_ids,
-            limit=3,
-        )
-        seen = set(mem_ids)
-        for n in neighbors:
-            if n["id"] not in seen:
-                memories.append(n)
-                seen.add(n["id"])
-        memory_context = await asyncio.to_thread(_format_memory_context, memories)
-        # Speculative touch: non-critical bookkeeping, fire-and-forget
-        _fire_and_forget(asyncio.to_thread(touch_memories, list(seen), useful=False))
-    recall_ms = round((time.monotonic() - recall_start) * 1000)
-    all_ids = list(seen)
-    log.info(
-        "recall_done",
-        chat_id=chat_id,
-        duration_ms=recall_ms,
-        count=len(all_ids),
-        ids=all_ids,
-        trigger_skills=len(trigger_skills),
-    )
-    return memory_context, memories
 
 
 async def process(chat_id: str) -> None:
@@ -513,37 +272,32 @@ async def process(chat_id: str) -> None:
         word_count = sum(len(m.content.split()) for m in messages)
         bus.emit("user_message", {"word_count": word_count})
 
-        # --- Enrichment phase (graceful degradation) ---
-        # If prompt building or memory recall fails, fall back to raw text
-        # so a single bad message doesn't permanently wedge the queue.
+        # --- Prompt building ---
+        # Memory assembly no longer happens here: run_agent is the single call
+        # site, because it is the only place holding the clean user text, the
+        # effort tier AND the prompt before it is sent — which is what lets the
+        # two memory layers dedup against each other at all.
+        #
+        # This also means a memory failure can no longer cost us the prompt.
+        # The old asyncio.gather ran build_prompt alongside recall without
+        # return_exceptions, so a transient embed-server timeout discarded the
+        # built prompt too — dropping images, voice transcripts and the
+        # msg:{id} handles the reply tool needs.
         combined_text = " ".join(m.content for m in messages)
-        _recalled: list[MemoryResult] = []
-        memory_context = ""
         prompt: str | list[dict[str, Any]] = combined_text  # fallback default
-
         try:
-            if _needs_recall(combined_text):
-                prompt, (memory_context, _recalled), conv_state = await asyncio.gather(
-                    build_prompt(messages, chat_id),
-                    _auto_recall(combined_text, chat_id),
-                    _get_conversation_state(chat_id),
-                )
-                memory_context = conv_state + memory_context
-            else:
-                prompt = await build_prompt(messages, chat_id)
+            prompt = await build_prompt(messages, chat_id)
         except Exception:
-            log.exception("enrichment_failed", chat_id=chat_id)
-            # Degrade: use raw text, skip memory context
+            log.exception("prompt_build_failed", chat_id=chat_id)
             prompt = combined_text
-            memory_context = ""
-            _recalled = []
 
         # Classify effort and select model tier dynamically
         effort, thinking, routed_model = _classify_effort(prompt)
-        # Memory-aware boost: if haiku was selected but substantial context was
-        # injected, upgrade to sonnet so the model can process the memories.
-        # Only triggers on trivial messages with heavy context — avoids always-fire.
-        if routed_model == "haiku" and memory_context and len(memory_context) > 500:
+        # Memory-aware boost: a trivial message that will still pull substantial
+        # context needs a model that can use it. Behaviour-preserving: context is
+        # assembled exactly when needs_recall passes, and the pinned
+        # conversation-state alone always cleared the old size threshold.
+        if routed_model == "haiku" and context.needs_recall(combined_text):
             routed_model = "sonnet"
         # One-way ratchet: never downgrade within a session
         prev_model = _session_models.get(chat_id)
@@ -556,13 +310,6 @@ async def process(chat_id: str) -> None:
         # Non-opus models crash on session resume (SDK bug) — start fresh
         if model != "opus" and session_id:
             session_id = None
-
-        if memory_context:
-            log.info("memories_injected", chat=chat_id)
-            if isinstance(prompt, list):
-                prompt.insert(0, {"type": "text", "text": f"{memory_context}\n\n"})
-            else:
-                prompt = f"{memory_context}\n\n{prompt}"
 
         await bot.send_chat_action(chat_id=int(chat_id), action="typing")
         typing_task = asyncio.create_task(_keep_typing(int(chat_id)))
@@ -693,23 +440,32 @@ async def process(chat_id: str) -> None:
         # --- Post-agent bookkeeping (non-critical) ---
         # Failures here are logged but must never prevent the response above.
         try:
-            # Upgrade utility for auto-recalled memories the agent actually referenced
-            if _recalled:
-                recalled_ids = [m["id"] for m in _recalled]
+            # Credit utility for any injected memory the agent actually used —
+            # standing context included. The scan used to cover only the recall
+            # subset, so a fact taken from working memory earned nothing, while
+            # the ranker it feeds scores by exactly that signal.
+            #
+            # useful_only is what makes this safe to widen: it raises
+            # useful_count without raising access_count, so a memory earns
+            # utility credit without earning exposure credit. Crediting exposure
+            # for having been injected is the rich-get-richer loop itself.
+            if result.injected_ids:
                 combined_response = " ".join(result.texts)
                 pattern = re.compile(
-                    r"\b(" + "|".join(re.escape(mid) for mid in recalled_ids) + r")\b"
+                    r"\b(" + "|".join(re.escape(mid) for mid in result.injected_ids) + r")\b"
                 )
                 found = set(pattern.findall(combined_response))
-                referenced = [mid for mid in recalled_ids if mid in found]
+                referenced = [mid for mid in result.injected_ids if mid in found]
                 if referenced:
                     _fire_and_forget(
                         asyncio.to_thread(touch_memories, referenced, useful_only=True)
                     )
 
-            # Memory reconsolidation: detect and apply corrections
-            if _recalled and result.texts:
-                recalled_ids = [m["id"] for m in _recalled]
+            # Memory reconsolidation: detect and apply corrections. Scoped to the
+            # query-ranked subset — detect_corrections does per-id similarity
+            # work, which is cost with no signal over standing context.
+            if result.recalled_ids and result.texts:
+                recalled_ids = result.recalled_ids
                 combined_response = " ".join(result.texts)
                 corrections = detect_corrections(recalled_ids, combined_response)
 
@@ -752,7 +508,7 @@ async def process(chat_id: str) -> None:
                     old=session_id[:8],
                     new=result.session_id[:8] if result.session_id else "none",
                 )
-                _session_lost[chat_id] = True
+                context.note_session_reset(chat_id)
 
             # Cost anomaly detection
             if result.cost_usd > _COST_ANOMALY_MIN:
@@ -1006,11 +762,11 @@ def _save_conv_state(
     type_dir = MEMORY_DIRS["episode"]
     mem_dir = settings.memory_dir / type_dir
     mem_dir.mkdir(parents=True, exist_ok=True)
-    path = mem_dir / f"{_CONV_STATE_ID}.md"
+    path = mem_dir / f"{context._CONV_STATE_ID}.md"
     created = read_frontmatter(path).get("created", now) if path.exists() else now
     fm = yaml.dump(
         {
-            "id": _CONV_STATE_ID,
+            "id": context._CONV_STATE_ID,
             "type": "episode",
             "tags": ["conversation", "state"],
             "created": created,
@@ -1021,7 +777,7 @@ def _save_conv_state(
     )
     path.write_text(f"---\n{fm}---\n\n# Conversation State\n\n{body}\n")
     memory.index_memory(
-        _CONV_STATE_ID,
+        context._CONV_STATE_ID,
         "episode",
         "Last conversation state",
         body,
@@ -1029,7 +785,7 @@ def _save_conv_state(
         importance=0.3,
     )
     # Emit event so event-driven behaviors notice the new episode
-    bus.emit("new_episode", {"id": _CONV_STATE_ID})
+    bus.emit("new_episode", {"id": context._CONV_STATE_ID})
 
 
 _background_tasks: set[asyncio.Task[None]] = set()
@@ -1164,18 +920,6 @@ async def _transcribe_post(dest: Path) -> str:
     return "\n[Voice transcription failed]"
 
 
-def _format_memory_context(memories: list[MemoryResult]) -> str:
-    """Format recalled memories as context prefix for the agent."""
-    lines: list[str] = []
-    for m in memories:
-        body = memory.read_memory_body(m["type"], m["id"], settings.recall_content_limit)
-        content = body or m.get("title", "")
-        lines.append(f"[{m['id']}] ({m['type']}) {content}")
-    body = "\n---\n".join(lines)
-    return f"<context><memories>\n{body}\n</memories></context>"
-
-
-# ---------------------------------------------------------------------------
 # Telegram handlers
 # ---------------------------------------------------------------------------
 

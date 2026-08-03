@@ -8,8 +8,11 @@ Provides runtime context management for the agent:
 
 from __future__ import annotations
 
+import asyncio
 import math
+import re
 from contextlib import suppress
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, NamedTuple
 
@@ -19,6 +22,7 @@ from structlog.stdlib import BoundLogger
 
 from . import attention as _attention_module
 from . import db as _db_module
+from . import memory as _memory_module
 from .config import settings
 from .db import _db, ensure_utc
 from .memory import importance_score, utility_factor
@@ -190,6 +194,11 @@ _SECTION_TITLES: dict[str, str] = {
 # Order sections so the things that shape judgement come before reference
 # material: what we're working toward, who matters, what we've learned.
 _SECTION_ORDER: tuple[str, ...] = ("goal", "entity", "insight", "procedure", "episode")
+
+# Section headers plus the stats comment. _spend charges memory lines only, so
+# without reserving this the rendered block overshoots the budget by whatever
+# the scaffolding costs (~70 tokens measured against the live corpus).
+_SCAFFOLD_TOKENS = 120
 
 
 def _estimate_tokens(text: str) -> int:
@@ -420,7 +429,10 @@ def _build_recent_outputs_block(chat_id: str, limit: int) -> str | None:
     return "\n".join(lines)
 
 
-def build_working_context(budget_tokens: int = _WORKING_MEMORY_BUDGET) -> str:
+def build_working_context(
+    budget_tokens: int = _WORKING_MEMORY_BUDGET,
+    exclude: set[str] | None = None,
+) -> str:
     """Build a working memory block for system prompt injection.
 
     Scores all active memories by importance/recency/access, selects
@@ -431,50 +443,63 @@ def build_working_context(budget_tokens: int = _WORKING_MEMORY_BUDGET) -> str:
 
     Returns empty string if no memories qualify or DB is unavailable.
     """
-    # Recent outputs (L3) — verbatim mirror of Luke's own recent sends.
-    # Built first so we can prepend it even if memory selection fails.
-    recent_outputs: str | None = None
-    if settings.recent_outputs_enabled:
-        recent_outputs = _build_recent_outputs_block(
-            settings.chat_id, settings.recent_outputs_limit
-        )
+    body, _spent = render_background(budget_tokens, exclude)
+    return "\n\n".join(p for p in (_pinned_side_blocks(), body) if p)
 
-    # Active attention (L2) — persistent foreground commitments.
-    attn_block: str | None = None
+
+def _pinned_side_blocks() -> str:
+    """Recent outputs and active attention.
+
+    Pinned like conversation-state, not budgeted: a verbatim mirror of what
+    Luke just sent and the commitments he is holding are not optional context,
+    and they are bounded by their own limits already.
+    """
+    parts: list[str] = []
+    if settings.recent_outputs_enabled:
+        block = _build_recent_outputs_block(settings.chat_id, settings.recent_outputs_limit)
+        if block:
+            parts.append(block)
     if settings.chat_id:
         try:
-            attn_block = _attention_module.build_attention_block(settings.chat_id)
+            attn = _attention_module.build_attention_block(settings.chat_id)
+            if attn:
+                parts.append(attn)
         except Exception as e:
             log.warning("attention_load_failed", error=str(e))
+    return "\n\n".join(parts)
 
-    def _prepended(body: str | None) -> str:
-        """Combine recent-outputs + attention with a base body string."""
-        parts = [p for p in (recent_outputs, attn_block, body) if p]
-        return "\n\n".join(parts)
 
+def render_background(budget_tokens: int, exclude: set[str] | None = None) -> tuple[str, int]:
+    """Render standing memory only — no pinned side blocks. Returns (block, tokens).
+
+    Separate from build_working_context so the assembler can charge the budget
+    for exactly what the budget governs. Bundling the pinned blocks in made
+    `spent` overshoot by ~1,100 tokens and look like a permanent overrun.
+    """
     try:
         memories = _load_priority_memories()
     except Exception as e:
         log.warning("context_load_failed", error=str(e))
-        return _prepended(None)
+        return "", 0
+
+    if exclude:
+        # Already rendered in full by the turn layer. A 500-char preview of
+        # something the agent can read at 1,200 chars two blocks up is pure
+        # duplication — and nothing prevented it before the two layers shared
+        # a decision point.
+        memories = [m for m in memories if m["id"] not in exclude]
 
     if not memories:
-        return _prepended(None)
+        return "", 0
 
-    by_type, spent = _spend(memories, budget_tokens)
+    # Reserve the scaffolding — section headers plus the stats comment — so the
+    # returned block honours the budget rather than overshooting it by whatever
+    # the headers happen to cost.
+    by_type, spent = _spend(memories, max(0, budget_tokens - _SCAFFOLD_TOKENS))
     if not by_type:
-        return _prepended(None)
+        return "", 0
 
-    sections: list[str] = []
-    # Verbatim recent outputs go above the reconstructed working memory so the
-    # agent sees its actual prior sends before any compressed/summarized state.
-    if recent_outputs:
-        sections.append(recent_outputs)
-    # Active attention (L2) sits above memory injection so foreground
-    # commitments have visual priority over reconstructed working memory.
-    if attn_block:
-        sections.append(attn_block)
-    sections.append("# Injected Working Memory")
+    sections: list[str] = ["# Injected Working Memory"]
 
     for mem_type in _SECTION_ORDER:
         lines = by_type.get(mem_type)
@@ -498,7 +523,8 @@ def build_working_context(budget_tokens: int = _WORKING_MEMORY_BUDGET) -> str:
         by_type=counts,
     )
 
-    return "\n\n".join(sections)
+    block = "\n\n".join(sections)
+    return block, _estimate_tokens(block)
 
 
 def build_preservation_manifest() -> str:
@@ -725,3 +751,367 @@ def audit_compression(
             log.warning("compression_audit_persist_failed", error=str(e))
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Unified context assembly
+#
+# Both memory layers used to be built independently and neither could see the
+# other: app.process built the turn prefix, run_agent built the system block,
+# and by the time run_agent ran the turn prefix was already baked into the
+# prompt. So nothing could dedup them, nothing shared a budget, and
+# conversation-state was injected twice on 61% of turns while also burning one
+# of only 8 recall slots.
+#
+# assemble_context is now the single decision point. It emits two blocks
+# because they have genuinely different lifetimes, not because two callers
+# happened to build them:
+#   * system_block — standing state, replaced every run, never accumulates
+#   * turn_block   — this turn's evidence, correctly part of the transcript
+# ---------------------------------------------------------------------------
+
+_CONV_STATE_ID = "conversation-state-latest"
+_STALE_HOURS = 24.0
+# Read cap for the raw conversation-state file before tail-trimming.
+# _save_conv_state can emit ~8.3k chars, so this must clear that comfortably or
+# the trim would operate on already-truncated text.
+_CONV_STATE_READ_MAX = 20_000
+
+# Body chars per recalled memory in the turn block. Eight hits at the old 3,000
+# was ~6.9k tokens, which blew every effort tier on its own. This is the gist;
+# the agent has `recall` and `Read` for the full file.
+_TURN_BODY_CHARS = 1_200
+
+# Share of the budget the turn layer may take, so a run of long recall hits can
+# never starve standing context to nothing.
+_TURN_BUDGET_SHARE = 0.6
+
+_TRIVIAL_WORDS = frozenset(
+    {
+        "ok", "okay", "yes", "no", "yeah", "yep", "nope", "sure", "thanks",
+        "thank", "lol", "haha", "hehe", "wow", "cool", "nice", "great", "hi",
+        "hey", "hello", "bye", "goodnight", "gn", "gm",
+    }
+)  # fmt: skip
+
+# A conversation-state message line: "**Filipe Lima** (2026-08-03T09:41): ..."
+_CONV_MSG_LINE = re.compile(r"^\*\*[^*]+\*\* \(")
+
+# Chats whose SDK session was lost; the next assembly tells the agent so it can
+# resume deliberately instead of acting confused.
+_session_lost: dict[str, bool] = {}
+
+
+def note_session_reset(chat_id: str) -> None:
+    """Record that this chat's agent session was lost."""
+    _session_lost[chat_id] = True
+
+
+def needs_recall(text: str) -> bool:
+    """Heuristic: skip retrieval for trivial/short messages."""
+    stripped = text.strip()
+    if len(stripped) < 3:
+        return False
+    words = stripped.lower().split()
+    return not (len(words) <= 2 and all(w.strip("!?.,:") in _TRIVIAL_WORDS for w in words))
+
+
+def _trim_conv_state(body: str, limit: int) -> str:
+    """Trim conversation state to *limit* chars, keeping the NEWEST exchange.
+
+    _save_conv_state writes the thread chronologically — a structured header,
+    then messages oldest-first, with the latest reply appended last. A plain
+    ``body[:limit]`` therefore drops the most recent turn and cuts mid-sentence,
+    which is precisely backwards for a block whose entire job is letting the
+    conversation resume seamlessly.
+
+    Keeps the header (topics, last-active, pending actions) and then as many
+    trailing message lines as fit.
+    """
+    if len(body) <= limit:
+        return body
+
+    lines = body.split("\n")
+    first_msg = next((i for i, ln in enumerate(lines) if _CONV_MSG_LINE.match(ln)), len(lines))
+    header, messages = lines[:first_msg], lines[first_msg:]
+
+    header_text = "\n".join(header)
+    room = limit - len(header_text) - 1
+    if room <= 0:
+        return body[-limit:]  # pathological header — keep the newest text we can
+
+    kept: list[str] = []
+    used = 0
+    for line in reversed(messages):
+        cost = len(line) + 1
+        if used + cost > room:
+            break
+        kept.insert(0, line)
+        used += cost
+
+    if not kept:
+        return (header_text + "\n" + messages[-1])[-limit:] if messages else header_text[:limit]
+    return "\n".join([*header, *kept])
+
+
+def _live_reaction_note(chat_id: str) -> str:
+    """Surface reactions from the last few minutes so a fresh reaction shapes
+    the next response while it's warm — the 'presence' gap Filipe named:
+    capture was never the problem, noticing in the moment was. Returns '' when
+    nothing is fresh, so it self-expires and never nags."""
+    reactions = _db_module.get_recent_reactions(chat_id, within_minutes=15)
+    if not reactions:
+        return ""
+    lines = []
+    for r in reactions[:5]:
+        is_own = r.get("msg_sender") == settings.assistant_name
+        target = "your message" if is_own else "their own message"
+        preview = (r.get("msg_preview") or "").replace("\n", " ").strip()
+        snippet = f' "{preview}…"' if preview else ""
+        lines.append(f"- {r['emoji']} ({r['sentiment']}) on {target}{snippet}")
+    return (
+        "[LIVE — Filipe just reacted (last 15 min). Acknowledge it naturally if it "
+        "fits; let it shape your tone. Don't over-perform it.]\n" + "\n".join(lines) + "\n\n"
+    )
+
+
+def _pin_conversation_state(chat_id: str) -> str:
+    """The continuity anchor. Pinned, never ranked, never charged against the
+    memory budget — resuming the conversation is not optional context."""
+    body = _memory_module.read_memory_body("episode", _CONV_STATE_ID, _CONV_STATE_READ_MAX)
+    if body:
+        body = _trim_conv_state(body, settings.recall_content_limit)
+    updated = _memory_module.get_memory_updated(_CONV_STATE_ID) if body else None
+    live_reactions = _live_reaction_note(chat_id)
+
+    if body:
+        if _session_lost.pop(chat_id, False):
+            body = "[Session was reset — use this context to resume seamlessly]\n" + body
+        if live_reactions:
+            body = live_reactions + body
+        if updated:
+            try:
+                ts = ensure_utc(datetime.fromisoformat(updated))
+                hours_ago = (datetime.now(UTC) - ts).total_seconds() / 3600
+                if hours_ago > _STALE_HOURS:
+                    body = (
+                        f"[Last conversation was {int(hours_ago)}h ago "
+                        f"— context may be outdated]\n{body}"
+                    )
+            except ValueError:
+                pass
+        return f"<conversation-state>\n{body}\n</conversation-state>\n"
+
+    # Fallback: synthesize from recent messages.
+    recent = _db_module.get_recent_messages(chat_id, limit=20)
+    if not recent:
+        return ""
+    lines = [f"{m['sender_name']}: {m['content'][:500]}" for m in recent[-10:]]
+    return (
+        "<conversation-state>\n"
+        f"{live_reactions}"
+        "[Recent conversation context (no saved state available)]\n"
+        f"{chr(10).join(lines)}\n</conversation-state>\n"
+    )
+
+
+def _rank_turn_candidates(query: str, exclude: set[str]) -> list[dict[str, Any]]:
+    """Query-ranked evidence for this turn: recall hits, guaranteed skills,
+    ranked graph neighbours — deduped against *exclude* and against each other.
+
+    *exclude* is read, never written: the caller owns the running set and
+    updates it from the returned candidates. It contains the pinned
+    conversation-state id, which is why that memory can no longer consume one
+    of the recall slots — it did on 61% of turns, while also being rendered a
+    second time in full.
+    """
+    seen = set(exclude)
+    memories, trigger_skills = (
+        _memory_module.recall(query=query, limit=settings.auto_recall_limit),
+        _memory_module.get_trigger_matched_skills(query),
+    )
+
+    candidates: list[dict[str, Any]] = []
+
+    # Trigger-matched skills are admitted first and unconditionally: a trigger
+    # match is already the authoritative "this procedure is the right answer"
+    # signal, so it does not need to win on score too.
+    for skill in trigger_skills:
+        if skill["id"] not in seen:
+            seen.add(skill["id"])
+            candidates.append({**skill, "source": "skill"})
+
+    for m in memories:
+        if m["id"] not in seen:
+            seen.add(m["id"])
+            candidates.append({**m, "source": "recall"})
+
+    if candidates:
+        neighbours = _memory_module.get_graph_neighbors([c["id"] for c in candidates], limit=3)
+        for n in neighbours:
+            if n["id"] not in seen:
+                seen.add(n["id"])
+                candidates.append({**n, "source": "neighbor"})
+
+    return candidates
+
+
+def _render_turn_block(
+    candidates: list[dict[str, Any]], budget_tokens: int
+) -> tuple[str, int, list[str]]:
+    """Render turn evidence, charging each entry what it prints.
+
+    Returns the block, the tokens spent, and the ids that ACTUALLY rendered.
+    That last one matters: a candidate the budget rejected was never shown to
+    the model, so it must not earn an exposure touch and must not be excluded
+    from the standing layer. Retrieval routinely produces far more candidates
+    than fit — 42 for a single real query — so the gap is not marginal.
+    """
+    lines: list[str] = []
+    rendered: list[str] = []
+    used = 0
+    for c in candidates:
+        body = _memory_module.read_memory_body(c["type"], c["id"], _TURN_BODY_CHARS)
+        line = f"[{c['id']}] ({c['type']}) {body or c.get('title', '')}"
+        cost = _estimate_tokens(line)
+        if used + cost > budget_tokens:
+            continue
+        lines.append(line)
+        rendered.append(c["id"])
+        used += cost
+    if not lines:
+        return "", 0, []
+    block = "<context><memories>\n" + "\n---\n".join(lines) + "\n</memories></context>"
+    return block, used, rendered
+
+
+@dataclass(frozen=True, slots=True)
+class AssembledContext:
+    """Everything one turn injects, decided in one place."""
+
+    system_block: str = ""  # standing state -> system prompt, replaced per run
+    turn_block: str = ""  # this turn's evidence -> user prompt
+    ids: list[str] = field(default_factory=list)  # everything RENDERED
+    recalled_ids: list[str] = field(default_factory=list)  # query-ranked subset
+    tokens: int = 0
+
+
+def _assemble(
+    *, query: str, chat_id: str, budget_tokens: int, turn_scoped: bool
+) -> AssembledContext:
+    """Synchronous body of assemble_context. Runs entirely in one worker thread."""
+    seen: set[str] = {_CONV_STATE_ID}
+
+    pinned_parts: list[str] = []
+    if chat_id:
+        try:
+            state = _pin_conversation_state(chat_id)
+            if state:
+                pinned_parts.append(state)
+        except Exception as e:
+            log.warning("conversation_state_failed", error=str(e))
+    try:
+        side = _pinned_side_blocks()
+        if side:
+            pinned_parts.append(side)
+    except Exception as e:
+        log.warning("pinned_side_blocks_failed", error=str(e))
+    pinned = "\n\n".join(pinned_parts)
+
+    turn_block = ""
+    recalled_ids: list[str] = []
+    turn_tokens = 0
+    if turn_scoped and query and needs_recall(query):
+        try:
+            candidates = _rank_turn_candidates(query, seen)
+            turn_block, turn_tokens, recalled_ids = _render_turn_block(
+                candidates, int(budget_tokens * _TURN_BUDGET_SHARE)
+            )
+            # The caller owns `seen`; the turn layer only reads it. Updating
+            # here is what makes the standing layer's exclusion hold.
+            seen.update(recalled_ids)
+            # Speculative touch: exposure without evidence of use. Deliberately
+            # scoped to the turn layer. Doing the same for standing context
+            # would be a closed loop — injecting a memory because it ranks, then
+            # raising its rank because it was injected. Standing memories earn
+            # credit only via the reference scan (useful_only), which raises
+            # useful_count without raising access_count.
+            if recalled_ids:
+                _memory_module.touch_memories(recalled_ids, useful=False)
+        except Exception as e:
+            log.warning("turn_recall_failed", error=str(e))
+
+    # Standing context spends what the turn layer left. Memories already
+    # rendered in full above are excluded — a 500-char preview of something the
+    # agent can already read at 1,200 chars is pure duplication.
+    background, background_tokens = "", 0
+    try:
+        background, background_tokens = render_background(
+            max(0, budget_tokens - turn_tokens), exclude=seen
+        )
+    except Exception as e:
+        log.warning("background_context_failed", error=str(e))
+
+    system_block = "\n\n".join(p for p in (pinned, background) if p)
+    rendered = _rendered_ids(background) + recalled_ids
+
+    # Two numbers, deliberately. `spent` is what the budget actually governs —
+    # turn evidence plus standing memory — and must stay under it. `pinned` is
+    # the continuity anchor, attention and recent-outputs: not optional, so not
+    # budgeted. Reporting only the sum would look like a permanent overrun.
+    pinned_tokens = _estimate_tokens(pinned)
+    spent = turn_tokens + background_tokens
+
+    log.info(
+        "context_assembled",
+        chat_id=chat_id,
+        budget=budget_tokens,
+        spent=spent,
+        pinned_tokens=pinned_tokens,
+        turn_tokens=turn_tokens,
+        recalled=len(recalled_ids),
+        rendered=len(rendered),
+    )
+    total = spent + pinned_tokens
+    return AssembledContext(
+        system_block=system_block,
+        turn_block=turn_block,
+        ids=rendered,
+        recalled_ids=recalled_ids,
+        tokens=total,
+    )
+
+
+_ID_IN_LINE = re.compile(r"^\s*\[([^\]]+)\]", re.MULTILINE)
+
+
+def _rendered_ids(block: str) -> list[str]:
+    """Memory ids actually present in a rendered block."""
+    return _ID_IN_LINE.findall(block)
+
+
+async def assemble_context(
+    *,
+    query: str,
+    chat_id: str,
+    budget_tokens: int,
+    turn_scoped: bool = True,
+) -> AssembledContext:
+    """Assemble every memory layer under one budget. Never raises.
+
+    One to_thread hop: the DB scan, file reads and any embedding all happen off
+    the event loop, so a slow corpus or a hung embed server cannot stall other
+    chats. Returning an empty context on failure is deliberate — memory is an
+    enhancement, and losing it must never cost the caller its prompt.
+    """
+    try:
+        return await asyncio.to_thread(
+            _assemble,
+            query=query,
+            chat_id=chat_id,
+            budget_tokens=budget_tokens,
+            turn_scoped=turn_scoped,
+        )
+    except Exception as e:
+        log.warning("context_assembly_failed", error=str(e))
+        return AssembledContext()
