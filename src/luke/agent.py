@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import html
 import json
 import re
 import time
@@ -264,6 +265,36 @@ def _ok(text: str) -> dict[str, Any]:
     return {"content": [{"type": "text", "text": text}]}
 
 
+# The bot sends with parse_mode=HTML, so a backtick or a ** reaches Filipe as a
+# literal character. 21 messages carried one in 30 days despite the persona's
+# "don't use markdown" rule — a rule the model must remember every single turn
+# is not a guarantee, and this is. Fences first: the inline pattern would
+# otherwise eat a fence's delimiters.
+_MD_FENCE_RE = re.compile(r"```[a-zA-Z0-9_+-]*\n?(.*?)```", re.S)
+_MD_CODE_RE = re.compile(r"`([^`\n]+)`")
+_MD_BOLD_RE = re.compile(r"\*\*(\S(?:[^*\n]*\S)?)\*\*")
+
+
+def _md_to_html(text: str) -> str:
+    """Rewrite stray markdown as the HTML Telegram actually renders.
+
+    Code spans are HTML-escaped on the way in. That is not incidental: a
+    ``<tag>`` inside backticks used to make Telegram reject the whole message,
+    which dropped it to the plaintext fallback and showed every real tag raw
+    (28 html_parse_failed events). Escaping the span fixes both defects at once.
+    """
+
+    def _fence(m: re.Match[str]) -> str:
+        return "<pre>" + html.escape(m.group(1).strip("\n"), quote=False) + "</pre>"
+
+    def _code(m: re.Match[str]) -> str:
+        return "<code>" + html.escape(m.group(1), quote=False) + "</code>"
+
+    text = _MD_FENCE_RE.sub(_fence, text)
+    text = _MD_CODE_RE.sub(_code, text)
+    return _MD_BOLD_RE.sub(r"<b>\1</b>", text)
+
+
 async def _send_chunk(bot: Bot, chat_id: int, text: str, **kwargs: Any) -> None:
     """Send a single chunk with retry + exponential backoff.
 
@@ -316,6 +347,10 @@ async def _send_chunk(bot: Bot, chat_id: int, text: str, **kwargs: Any) -> None:
 
 async def send_long_message(bot: Bot, chat_id: int, text: str, **kwargs: Any) -> None:
     """Send a message, splitting into chunks if it exceeds Telegram's 4096 char limit."""
+    # Convert before hashing and chunking: the converted string is what actually
+    # ships, so it must be what dedup and the 4096-char split see.
+    if kwargs.get("parse_mode", "html") is not None:
+        text = _md_to_html(text)
     # Duplicate detection: skip if same content was sent recently
     content_hash = hashlib.sha256(text.encode()).hexdigest()[:16]
     if db.is_duplicate_outbound(str(chat_id), content_hash):

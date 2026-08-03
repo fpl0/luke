@@ -21,6 +21,7 @@ from luke.agent import (
     _build_stop_hook,
     _context_query,
     _duplicate_pending_task,
+    _md_to_html,
     _ok,
     _requests_file_artifact,
     _requests_source_read,
@@ -71,6 +72,63 @@ class TestSendLongMessage:
             "text", mock_bot.send_message.call_args_list[0][1].get("text", "")
         )
         assert first_call_text.endswith("\n…")
+
+
+# ---------------------------------------------------------------------------
+# Markdown never reaches Telegram
+#
+# parse_mode is HTML, so a stray backtick renders as a literal backtick. The
+# persona forbids markdown, but 21 messages carried some in 30 days — the rule
+# depends on the model remembering it every turn, and these tests do not.
+# ---------------------------------------------------------------------------
+
+
+class TestMarkdownToHtml:
+    def test_inline_code_becomes_code_tag(self) -> None:
+        assert _md_to_html("run `pytest -v` now") == "run <code>pytest -v</code> now"
+
+    def test_bold_becomes_b_tag(self) -> None:
+        assert _md_to_html("that is **28 of 32** files") == "that is <b>28 of 32</b> files"
+
+    def test_fence_becomes_pre_tag(self) -> None:
+        assert _md_to_html("```python\nx = 1\n```") == "<pre>x = 1</pre>"
+
+    def test_fence_wins_over_inline(self) -> None:
+        """The inline pattern would otherwise chew through a fence's delimiters."""
+        assert "<pre>" in _md_to_html("```\na `b` c\n```")
+
+    def test_tag_inside_code_is_escaped(self) -> None:
+        """The older, louder bug: a <tag> in backticks made Telegram reject the
+        whole message, dropping it to plaintext with every real tag showing raw."""
+        assert _md_to_html("use `<b>` for bold") == "use <code>&lt;b&gt;</code> for bold"
+
+    def test_existing_html_is_left_alone(self) -> None:
+        text = "<b>real</b> tags and <code>spans</code> survive"
+        assert _md_to_html(text) == text
+
+    def test_bare_asterisks_are_not_bold(self) -> None:
+        assert _md_to_html("2 * 3 * 4") == "2 * 3 * 4"
+
+    async def test_conversion_happens_before_the_wire(self) -> None:
+        bot = AsyncMock(spec=Bot)
+        with (
+            patch("luke.agent.db.store_message"),
+            patch("luke.agent.db.is_duplicate_outbound", return_value=False),
+            patch("luke.agent.db.log_outbound"),
+        ):
+            await send_long_message(bot, chat_id=123, text="commit `abc123`")
+        assert "<code>abc123</code>" in bot.send_message.call_args.kwargs["text"]
+
+    async def test_plaintext_sends_are_not_converted(self) -> None:
+        """A caller that explicitly opts out of HTML must get its text verbatim."""
+        bot = AsyncMock(spec=Bot)
+        with (
+            patch("luke.agent.db.store_message"),
+            patch("luke.agent.db.is_duplicate_outbound", return_value=False),
+            patch("luke.agent.db.log_outbound"),
+        ):
+            await send_long_message(bot, chat_id=123, text="`raw`", parse_mode=None)
+        assert bot.send_message.call_args.kwargs["text"] == "`raw`"
 
 
 # ---------------------------------------------------------------------------
