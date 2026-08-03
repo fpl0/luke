@@ -667,6 +667,41 @@ class TestGraphNeighbors:
         neighbors = memory.get_graph_neighbors(["hub"], limit=2)
         assert len(neighbors) <= 2
 
+    def test_neighbors_are_scored(self, test_db: Any) -> None:
+        """Neighbours must carry a real score — they compete for prompt space."""
+        memory.index_memory("a", "entity", "A", "a")
+        memory.index_memory("b", "entity", "B", "b")
+        memory.link_memories("a", "b", "knows")
+        neighbors = memory.get_graph_neighbors(["a"])
+        assert neighbors
+        assert all(n["score"] > 0 for n in neighbors)
+
+    def test_neighbors_carry_updated(self, test_db: Any) -> None:
+        """`updated` lets the caller date what it renders."""
+        memory.index_memory("a", "entity", "A", "a")
+        memory.index_memory("b", "entity", "B", "b")
+        memory.link_memories("a", "b", "knows")
+        neighbors = memory.get_graph_neighbors(["a"])
+        assert all(n.get("updated") for n in neighbors)
+
+    def test_stronger_link_outranks_weaker(self, test_db: Any) -> None:
+        """The limit must drop the weakest edge, not an arbitrary one.
+
+        Before scoring, neighbours came back in SQLite's order with score 0.0,
+        so `limit` truncated at random — the whole reason this ranks now.
+        """
+        memory.index_memory("hub", "entity", "Hub", "hub")
+        memory.index_memory("weak", "entity", "Weak", "weak")
+        memory.index_memory("strong", "entity", "Strong", "strong")
+        memory.link_memories("hub", "weak", "connected")
+        memory.link_memories("hub", "strong", "connected")
+        # Hebbian co-access strengthens the hub->strong edge.
+        for _ in range(20):
+            memory.touch_memories(["hub", "strong"])
+
+        top = memory.get_graph_neighbors(["hub"], limit=1)
+        assert [n["id"] for n in top] == ["strong"]
+
 
 # ---------------------------------------------------------------------------
 # Importance initialization
@@ -779,6 +814,29 @@ class TestBoundedImportance:
 
 
 class TestUtilityTracking:
+    def test_utility_rate_clamped_above_one(self, test_db: Any) -> None:
+        """useful_count > access_count must not inflate the score.
+
+        touch_memories(useful_only=True) credits utility without an access, so
+        the raw ratio can exceed 1.0. Unclamped it pushed access_score past the
+        ceiling the weights assume, letting a memory outrank one that was
+        genuinely accessed more.
+        """
+        memory.index_memory("runaway", "entity", "Runaway", "keyword alpha")
+        memory.index_memory("normal", "entity", "Normal", "keyword alpha")
+        conn = db._db()
+        # 1 access, 50 useful — only reachable via the useful_only path.
+        conn.execute(
+            "UPDATE memory_meta SET access_count = 1, useful_count = 50 WHERE id = 'runaway'"
+        )
+        conn.execute(
+            "UPDATE memory_meta SET access_count = 1, useful_count = 1 WHERE id = 'normal'"
+        )
+        conn.commit()
+
+        scores = {m["id"]: m["score"] for m in memory.recall(query="keyword alpha")}
+        assert scores["runaway"] <= scores["normal"] * 1.05
+
     def test_touch_increments_both_counts(self, test_db: Any) -> None:
         """Intentional touch increments both access_count and useful_count."""
         memory.index_memory("e1", "entity", "Test", "content")

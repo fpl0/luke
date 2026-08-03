@@ -104,6 +104,9 @@ class MemoryResult(TypedDict):
     score: float
     relationship: NotRequired[str]
     created: NotRequired[str]
+    # When present, lets a caller show the reader how old a memory is. Without
+    # it a March episode and yesterday's fact render identically.
+    updated: NotRequired[str]
 
 
 # ---------------------------------------------------------------------------
@@ -1115,8 +1118,11 @@ def _apply_composite_scores(results: dict[str, dict[str, Any]]) -> None:
         taxonomy: str = entry.get("taxonomy", "")
         recency = _recency_score(updated)
         access_score = math.log(1 + access_count) / log_101  # ~1.0 at 100 accesses
-        # Utility modulation: penalize memories that get accessed but never used
-        utility_rate = useful_count / max(access_count, 1)
+        # Utility modulation: penalize memories that get accessed but never used.
+        # Clamped: useful_count is incremented on its own (touch_memories'
+        # useful_only path) for memories credited without a matching access, so
+        # the raw rate can exceed 1.0 and inflate access_score past its ceiling.
+        utility_rate = min(1.0, useful_count / max(access_count, 1))
         access_score *= settings.utility_floor + settings.utility_weight * utility_rate
 
         # Select weights based on taxonomy
@@ -1181,40 +1187,46 @@ def touch_memories(mem_ids: list[str], *, useful: bool = True, useful_only: bool
 
 
 def get_graph_neighbors(mem_ids: list[str], *, limit: int = 3) -> list[MemoryResult]:
-    """Get unique 1-hop neighbors of the given memory IDs, excluding the inputs."""
+    """Get the highest-scoring 1-hop neighbors of the given memory IDs.
+
+    Neighbors are ranked by the same composite scorer recall() uses, seeded
+    with the link weight and decayed one hop — identical to recall's own graph
+    strategy. Previously they came back with ``score: 0.0`` and were taken in
+    whatever order SQLite returned, which meant an arbitrary neighbor rode into
+    the prompt at full body length while a strongly-linked one was dropped.
+
+    Returns ``updated`` so callers can date what they render.
+    """
     if not mem_ids:
         return []
     conn = _db()
-    ph = ",".join("?" for _ in mem_ids)
-    valid = _valid_link_clause("ml")
-    rows = conn.execute(
-        f"""SELECT DISTINCT m.id, m.type, f.title, ml.relationship
-            FROM memory_links ml
-            JOIN memory_meta m ON ml.to_id = m.id
-            JOIN memory_fts f ON ml.to_id = f.id
-            WHERE ml.from_id IN ({ph}) AND m.status = 'active'
-              AND ml.to_id NOT IN ({ph}) {valid}
-            UNION
-            SELECT DISTINCT m.id, m.type, f.title, ml.relationship
-            FROM memory_links ml
-            JOIN memory_meta m ON ml.from_id = m.id
-            JOIN memory_fts f ON ml.from_id = f.id
-            WHERE ml.to_id IN ({ph}) AND m.status = 'active'
-              AND ml.from_id NOT IN ({ph}) {valid}
-            LIMIT ?""",
-        (*mem_ids, *mem_ids, *mem_ids, *mem_ids, limit),
-    ).fetchall()
+    inputs = set(mem_ids)
+    hop = settings.graph_decay_per_hop
+    candidates: dict[str, dict[str, Any]] = {}
+    for n in _get_neighbors_batch(conn, mem_ids):
+        if n["id"] in inputs or n["id"] in candidates:
+            continue
+        # Link weight seeds relevance, exactly as recall()'s graph strategy
+        # does, so a well-worn edge outranks an incidental one.
+        n["score"] = n["weight"] * hop
+        candidates[n["id"]] = n
+    if not candidates:
+        return []
+
+    _apply_composite_scores(candidates)
+    ranked = sorted(candidates.values(), key=lambda n: n["score"], reverse=True)[:limit]
     return cast(
         list[MemoryResult],
         [
             {
-                "id": r["id"],
-                "type": r["type"],
-                "title": r["title"],
-                "score": 0.0,
-                "relationship": r["relationship"],
+                "id": n["id"],
+                "type": n["type"],
+                "title": n["title"],
+                "score": n["score"],
+                "relationship": n["relationship"],
+                "updated": n["updated"],
             }
-            for r in rows
+            for n in ranked
         ],
     )
 
