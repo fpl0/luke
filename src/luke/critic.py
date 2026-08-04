@@ -27,6 +27,7 @@ from claude_agent_sdk import (
 from structlog.stdlib import BoundLogger
 
 from .config import settings
+from .sdk_io import cli_stderr
 
 log: BoundLogger = structlog.get_logger()
 
@@ -147,6 +148,7 @@ async def _collect_text(prompt: str, system_prompt: str) -> str:
         max_turns=1,
         permission_mode="bypassPermissions",
         allowed_tools=[],
+        stderr=cli_stderr,
     )
     chunks: list[str] = []
     async for msg in query(prompt=prompt, options=options):

@@ -61,6 +61,7 @@ from . import context, db, memory
 from .bus import bus
 from .config import settings
 from .memory import MEMORY_DIRS, read_frontmatter, read_memory_body, sanitize_memory_id
+from .sdk_io import cli_stderr
 
 log: BoundLogger = structlog.get_logger()
 
@@ -2890,6 +2891,7 @@ async def run_agent(
         allowed_tools=allowed,
         permission_mode="bypassPermissions",
         setting_sources=["project", "user"],
+        stderr=cli_stderr,
         mcp_servers={
             "luke": _build_tools(chat_id, bot),
         },
