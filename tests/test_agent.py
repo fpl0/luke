@@ -384,6 +384,59 @@ class TestRequestsSourceRead:
         assert _requests_source_read(text) is False
 
 
+class TestIsReask:
+    """Every true-positive here is a verbatim message Filipe actually sent.
+
+    The 2026-08-03 14:49-14:52 run is the incident that motivated the gate: five
+    re-asks in three minutes, answered with three reworded copies of one answer.
+    """
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "so?",
+            "So?",
+            "??",
+            "???",
+            "again?",
+            "I mean, how do you evaluate these chanes",
+            "Luke, I mean, do you find them useful?1",  # vocative prefix
+            "I meant, give me a summary of the day!",
+            "I mean how do you know the visa date is correct",
+            "Why are you giving me these mechanic answers?",
+            "yes, I am forcing you to answer externally. Its ok. "
+            "I just want you to say if these changes are useful!",
+            "I asked a pdf for the visa stuff",
+            "I mean, Luke won't you do anything else? I literally asked you to self-improve",
+        ],
+    )
+    def test_true_positives(self, text: str) -> None:
+        from luke.agent import _is_reask
+
+        assert _is_reask(text) is not None
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "how do you find these changes?",  # the FIRST ask, not a re-ask
+            "whats the state of the visa thing",
+            "Alright, how are you feeling now?",
+            "I will do some work on this now",
+            "I am the one making the changes, this is not your fault!",
+            "Get ride of the remaining letta sessions",
+            "how big is your log file atm?!",
+            "Amazing",
+            "Ok?",
+            "So I was thinking we could go on Friday",  # 'so' with content
+            "",
+        ],
+    )
+    def test_true_negatives(self, text: str) -> None:
+        from luke.agent import _is_reask
+
+        assert _is_reask(text) is None
+
+
 class TestSourceReadGate:
     @pytest.fixture(autouse=True)
     def _isolated_db(self, test_db: Any) -> None:

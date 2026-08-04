@@ -593,6 +593,52 @@ def _requests_source_read(text: str) -> bool:
     return bool(_SOURCE_READ_VERBS.search(text)) and bool(_SOURCE_READ_NOUNS.search(text))
 
 
+# --- Re-ask (conversational repair) detection ---
+# Filipe re-asking is the loudest available signal that my previous answer
+# missed. The failure this guards: rephrasing the SAME answer instead of hearing
+# the different question. On 2026-08-03 he asked "how do you evaluate these
+# changes" three times in 80 seconds and got three reworded copies of the same
+# state-file-diffing paragraph, ending in "Why are you giving me these mechanic
+# answers?". LUKE.md already forbids exactly this ("Three rephrasings of the same
+# answer is worse than one honest 'I don't know what you're after'") — advisory
+# prose did not hold, so it becomes an executed gate
+# (insight-insight-accumulation-as-surrogate, proc-recurring-failure-to-guardrail).
+#
+# Similarity between MY drafts was measured and REJECTED as the signal: I reword
+# deliberately, so two of the three duplicate answers scored only 0.39-0.41
+# containment overlap — under any threshold that still spared a legitimate
+# follow-up pair in the same window (0.43). Detection therefore reads the INBOUND
+# side only. A near-verbatim-repeat signal was also built and dropped: over five
+# weeks it produced no unique true positives and every false positive (pasted
+# draft revisions, `[Document saved: ...]` envelopes). Markers alone fired on 20
+# of 470 messages since 2026-07-01, all genuine re-asks.
+_REASK_VOCATIVE = re.compile(r"(?i)^\s*(?:luke|hey|ok|okay|no|yeah|yes|well|sorry)\s*[,!]+\s*")
+_REASK_MARKERS = re.compile(
+    r"(?i)(?:^|[.!?]\s+|\n)\s*(?:"
+    r"i\s+mean\b|i\s+meant\b|no,?\s+i\s+(?:mean|meant|said|asked)\b|"
+    r"that'?s\s+not\s+what\s+i\b|you'?re\s+not\s+answering\b|"
+    r"why\s+are\s+you\s+(?:giving|saying|repeating|telling)\b|"
+    r"i\s+(?:already\s+)?asked\b|i'?m\s+asking\b|i\s+just\s+want\s+you\s+to\b|"
+    r"read\s+(?:it|the\s+question)\s+again\b|answer\s+the\s+question\b"
+    r")"
+)
+# A bare re-prompt ("so?", "??", "again") carries no new content — it exists only
+# to say the previous answer did not land.
+_REASK_STANDALONE = re.compile(r"(?i)^\s*(?:so\s*\??|and\s*\??|\?+|again\s*\??)\s*$")
+
+
+def _is_reask(text: str) -> str | None:
+    """Return the reason this inbound message reads as a RE-ask, else None."""
+    if not text:
+        return None
+    stripped = _REASK_VOCATIVE.sub("", text.strip())
+    if _REASK_STANDALONE.match(stripped):
+        return "bare re-prompt"
+    if _REASK_MARKERS.search(stripped):
+        return "repair marker"
+    return None
+
+
 def _context_query(prompt: str | list[dict[str, Any]], user_text: str | None) -> str:
     """The text that should drive memory retrieval and the Stop gates.
 
@@ -2337,6 +2383,11 @@ async def run_agent(
     # Detect an explicit inbound request to consult a readable SOURCE so the
     # Stop hook can enforce an actual read before the turn closes.
     source_read_requested = not autonomous and _requests_source_read(prompt_text_for_context)
+    # Detect that this turn is Filipe RE-asking, so the send gate can stop the
+    # first draft once and force a reframe instead of a reworded repeat.
+    # Reactive only: an autonomous run has no inbound message to be a re-ask of.
+    reask_reason = None if autonomous else _is_reask(prompt_text_for_context)
+    reask_gate_fired = {"n": 0}  # one-shot guard for the re-ask gate
     tool_start_times: dict[str, float] = {}  # tool_use_id -> monotonic start
     subagent_start_times: dict[str, float] = {}  # agent_id -> monotonic start
     effective_max_sends = max_sends if max_sends is not None else settings.max_sends_per_run
@@ -2506,6 +2557,41 @@ async def run_agent(
                     },
                 )
                 return {"decision": "block", "reason": weekday_error}
+
+            # --- Re-ask gate (all runs; reactive turns only in practice) ---
+            # Fires ONCE per turn when the inbound message is a re-ask. Blocking
+            # the first draft is the whole mechanism: it forces me to re-read what
+            # was actually asked before answering, instead of reaching for the
+            # previous answer's shape. The retry is always allowed through — this
+            # steers a draft, it never silences a reply.
+            if reask_reason and reask_gate_fired["n"] == 0:
+                reask_gate_fired["n"] = 1
+                log.warning(
+                    "reask_blocked",
+                    chat_id=chat_id,
+                    tool=tool_name,
+                    reason=reask_reason,
+                    preview=msg_text[:100],
+                )
+                bus.emit(
+                    "reask_blocked",
+                    {
+                        "tool": tool_name,
+                        "reason": reask_reason,
+                        "preview": msg_text[:100],
+                    },
+                )
+                return {
+                    "decision": "block",
+                    "reason": (
+                        f"Re-ask detected ({reask_reason}): Filipe is asking again "
+                        "because the previous answer missed. Do NOT rephrase or "
+                        "re-explain it — a reworded repeat is worse than admitting "
+                        "the miss. Work out which DIFFERENT question he is actually "
+                        "asking and answer that; if you genuinely cannot tell, ask "
+                        "him which part you didn't answer. Then send."
+                    ),
+                }
 
             # Global hourly attention budget for autonomous runs (behaviors + crons).
             # Urgent behaviors (e.g. proactive_scan) can draw from a small reserve
