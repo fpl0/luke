@@ -109,10 +109,16 @@ class Settings(BaseSettings):
     model_high: str = "opus"  # deep reasoning, research, multi-step
 
     # Outbound critic (F4) — last-mile quality gate on autonomous sends.
-    # The timeout is the only bound: the call takes ~6.4s wall, 5s clipped it.
+    # Idle the call is ~5.6s; under contention (main agent loop running its
+    # own SDK subprocesses) it blows out ~3x and blew past the old 15s ceiling
+    # on 58 of 190 runs over 30 days — a 31% silent fail-open, recorded as
+    # "pass". Both call sites (critique_outbound, check_freshness) live inside
+    # the `if autonomous:` branch in agent.py, so this timeout NEVER sits in
+    # front of an interactive reply to Filipe; the latency it buys is free.
+    # That is why 60s is correct here and would not have been at 15s.
     critic_enabled: bool = True
     critic_model: str = "claude-haiku-4-5-20251001"
-    critic_timeout_s: float = 15.0
+    critic_timeout_s: float = 60.0
 
     # Freshness gate (L1) — abort sends that have gone stale relative to
     # the user's latest inbound message. Reuses critic infrastructure.

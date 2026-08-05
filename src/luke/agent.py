@@ -207,6 +207,33 @@ def _weekday_claim_error(text: str, today: date | None = None) -> str | None:
     return None
 
 
+def _emit_failopen(bus: Any, gate: str, tool_name: str, verdict: Any, msg_text: str) -> None:
+    """Record an LLM gate that fail-opened instead of judging.
+
+    The critic and freshness gates return ``pass`` with a ``critic-error:``
+    reason when they time out or blow up, so a dead gate is indistinguishable
+    from a healthy one in ``critic_ran`` — which is exactly how a 31%
+    fail-open rate survived two prior diagnoses (2026-05-16, 2026-07-05)
+    without anyone noticing it had never been fixed. A fail-open is zero
+    protection delivered; it gets its own event so audits can count it.
+
+    Enforces reflexion-failopen-gate-invisible-in-its-own-telemetry-2026-08-05.
+    """
+    reason = str(getattr(verdict, "reason", ""))
+    if not reason.startswith("critic-error"):
+        return
+    log.warning("gate_failopen", gate=gate, tool=tool_name, reason=reason)
+    bus.emit(
+        "gate_failopen",
+        {
+            "gate": gate,
+            "tool": tool_name,
+            "reason": reason,
+            "preview": msg_text[:100],
+        },
+    )
+
+
 def _check_outbound_quality(text: str) -> str | None:
     """Check an outbound message against quality rules. Returns rejection reason or None."""
     if not text or not text.strip():
@@ -2705,6 +2732,7 @@ async def run_agent(
                                     "age_minutes": round(age_minutes, 1),
                                 },
                             )
+                            _emit_failopen(bus, "freshness", tool_name, fresh_verdict, msg_text)
                             if fresh_verdict.decision != "pass":
                                 log.warning(
                                     "freshness_blocked",
@@ -2749,6 +2777,7 @@ async def run_agent(
                             "msg_len": len(msg_text),
                         },
                     )
+                    _emit_failopen(bus, "critic", tool_name, verdict, msg_text)
                     if verdict.decision != "pass":
                         log.warning(
                             "critic_blocked",
