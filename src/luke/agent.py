@@ -477,6 +477,37 @@ _TEMPORAL_PHRASES: tuple[str, ...] = (
 )
 
 
+def _commitment_block_reason(attempt: int) -> str:
+    """Block reason for the commitment gate, escalating on repeat attempts.
+
+    On 2026-08-05 18:31 the gate fired three times in 20 seconds on one draft
+    (send_message, send_message, then send_buttons — a tool-switch to get
+    around it), after which the message was abandoned and never reached
+    Filipe. Retrying identical text cannot pass a deterministic gate, and
+    swapping send tools is evasion rather than adaptation. From attempt 2 the
+    reason says so explicitly and names the only two valid exits.
+    """
+    base = (
+        "Commitment to future delivery detected but no "
+        "agent or scheduled task was spawned this turn. "
+        "Either spawn the work via Task / schedule_task "
+        "before sending, or rephrase the message to "
+        "remove the commitment."
+    )
+    if attempt > 1:
+        base += (
+            f" THIS IS BLOCK #{attempt} THIS TURN. "
+            "Re-sending the same text — or switching to a different "
+            "send tool — will not pass; the gate covers every send "
+            "tool and the check is deterministic. Do ONE of: "
+            "(a) call schedule_task/Task to actually create the work, "
+            "THEN send; (b) delete the commitment sentence and send "
+            "the rest. Do NOT abandon the message silently — a "
+            "dropped message is a failure, not a clean block."
+        )
+    return base
+
+
 def _commits_future_work(text: str) -> bool:
     """Heuristic: does the draft commit to delivering work by a future time?
 
@@ -2404,6 +2435,7 @@ async def run_agent(
     artifact_gate_fired = {"n": 0}  # one-shot guard for the Stop-hook artifact gate
     source_read_count = {"n": 0}  # incremented when a read/fetch tool runs
     source_gate_fired = {"n": 0}  # one-shot guard for the Stop-hook source gate
+    commit_block_count = {"n": 0}  # consecutive commitment-gate blocks this run
     tool_count: dict[str, int] = {"n": 0}
     # Detect an explicit inbound FILE-artifact request so the Stop hook can
     # enforce delivery-or-durable-handle before the turn closes.
@@ -2538,28 +2570,25 @@ async def run_agent(
             else:
                 msg_text = ""
             if work_scheduled_count["n"] == 0 and _commits_future_work(msg_text):
+                commit_block_count["n"] += 1
                 log.warning(
                     "commitment_blocked_no_execution",
                     chat_id=chat_id,
                     tool=tool_name,
                     preview=msg_text[:100],
+                    attempt=commit_block_count["n"],
                 )
                 bus.emit(
                     "commitment_blocked_no_execution",
                     {
                         "tool": tool_name,
                         "preview": msg_text[:100],
+                        "attempt": commit_block_count["n"],
                     },
                 )
                 return {
                     "decision": "block",
-                    "reason": (
-                        "Commitment to future delivery detected but no "
-                        "agent or scheduled task was spawned this turn. "
-                        "Either spawn the work via Task / schedule_task "
-                        "before sending, or rephrase the message to "
-                        "remove the commitment."
-                    ),
+                    "reason": _commitment_block_reason(commit_block_count["n"]),
                 }
 
             # --- Weekday/date consistency gate (all runs) ---

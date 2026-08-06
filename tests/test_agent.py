@@ -2862,3 +2862,35 @@ class TestCronLocalTimeGate:
             self._inp("0 8 * * 1", "Monday review at 00:30 Dublin."), self.NOW
         )
         assert msg is not None and "crosses midnight" in msg
+
+
+class TestCommitmentBlockEscalation:
+    """The commitment gate must get LOUDER when I hammer it.
+
+    Root cause, 2026-08-05 18:31: three blocks in 20 seconds on one draft
+    (send_message, send_message, send_buttons), then the message was
+    abandoned and Filipe never got it. A constant block reason gave the
+    retry loop nothing new to react to.
+    """
+
+    def test_first_block_is_the_plain_reason(self) -> None:
+        from luke.agent import _commitment_block_reason
+
+        r = _commitment_block_reason(1)
+        assert "no agent or scheduled task was spawned" in r.replace("\n", " ")
+        assert "THIS IS BLOCK" not in r
+
+    def test_repeat_blocks_escalate_and_name_the_two_exits(self) -> None:
+        from luke.agent import _commitment_block_reason
+
+        r = _commitment_block_reason(2)
+        assert "THIS IS BLOCK #2 THIS TURN" in r
+        assert "switching to a different" in r  # tool-switch evasion called out
+        assert "schedule_task" in r  # exit (a)
+        assert "delete the commitment sentence" in r  # exit (b)
+        assert "dropped message is a failure" in r  # no silent abandon
+
+    def test_attempt_number_is_reported(self) -> None:
+        from luke.agent import _commitment_block_reason
+
+        assert "THIS IS BLOCK #3 THIS TURN" in _commitment_block_reason(3)
