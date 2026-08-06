@@ -234,6 +234,51 @@ def _emit_failopen(bus: Any, gate: str, tool_name: str, verdict: Any, msg_text: 
     )
 
 
+BLOCKED_SENDS_PATH_PARTS = ("workspace", "state", "blocked_sends.jsonl")
+
+
+def blocked_sends_path() -> Path:
+    """Where budget-blocked outbound payloads are parked for later delivery."""
+    return settings.store_dir.joinpath(*BLOCKED_SENDS_PATH_PARTS)
+
+
+def persist_blocked_send(
+    *,
+    chat_id: str,
+    tool_name: str,
+    tool_input: Mapping[str, Any] | None,
+    reason: str,
+) -> Path | None:
+    """Append a blocked outbound payload to disk so the text is not silently lost.
+
+    The hourly budget used to drop composed messages with no trace anywhere:
+    ``outbound_log`` only records successful sends, so a correction written and
+    blocked was indistinguishable from one never written. Three of those were
+    lost in a single evening (2026-08-06) before anyone noticed. Persisting the
+    full payload means a later run can find it and deliver it, instead of
+    relying on the message surviving in a pinned note.
+
+    Never raises — a failure here must not turn a blocked send into a crash.
+    """
+    try:
+        path = blocked_sends_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        record = {
+            "blocked_at": datetime.now(UTC).isoformat(),
+            "chat_id": chat_id,
+            "tool": tool_name,
+            "reason": reason,
+            "delivered": False,
+            "payload": dict(tool_input or {}),
+        }
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+        return path
+    except Exception as exc:  # pragma: no cover - defensive
+        log.warning("blocked_send_persist_failed", error=str(exc), tool=tool_name)
+        return None
+
+
 def _check_outbound_quality(text: str) -> str | None:
     """Check an outbound message against quality rules. Returns rejection reason or None."""
     if not text or not text.strip():
@@ -2667,7 +2712,33 @@ async def run_agent(
                         limit=effective_limit,
                         urgent=urgent,
                     )
-                    return {"decision": "block", "reason": "Hourly message budget exceeded"}
+                    raw_input = input_data.get("tool_input", {})
+                    parked = persist_blocked_send(
+                        chat_id=chat_id,
+                        tool_name=tool_name,
+                        tool_input=raw_input if isinstance(raw_input, dict) else None,
+                        reason="hourly_budget_exceeded",
+                    )
+                    bus.emit(
+                        "outbound_blocked_by_budget",
+                        {
+                            "tool": tool_name,
+                            "hourly_count": hourly_count,
+                            "limit": effective_limit,
+                            "parked": str(parked) if parked else None,
+                        },
+                    )
+                    return {
+                        "decision": "block",
+                        "reason": (
+                            f"Hourly message budget exceeded ({hourly_count}/{effective_limit} "
+                            "sent this hour). The text you just composed has been parked at "
+                            f"{parked or 'workspace/state/blocked_sends.jsonl'} — it was NOT "
+                            "delivered. Do not assume a later turn will pick it up on its own: "
+                            "if it still needs to reach Filipe, schedule a one-off task that "
+                            "carries the message verbatim at a sensible hour, then move on."
+                        ),
+                    }
 
                 # --- Outbound message quality gate (autonomous only) ---
                 # Read the caption as a fallback so document/media sends are

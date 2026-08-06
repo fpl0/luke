@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -2894,3 +2895,73 @@ class TestCommitmentBlockEscalation:
         from luke.agent import _commitment_block_reason
 
         assert "THIS IS BLOCK #3 THIS TURN" in _commitment_block_reason(3)
+
+
+# --- budget-blocked sends are persisted, not silently dropped -------------
+# Regression: the hourly budget returned {"decision": "block"} and threw the
+# composed text away. outbound_log only records successes, so three corrections
+# written on 2026-08-06 vanished with no trace. persist_blocked_send parks the
+# payload so a later run can still deliver it.
+
+
+def test_persist_blocked_send_writes_payload(tmp_path, monkeypatch):
+    from luke import agent as agent_mod
+    from luke.config import settings
+
+    monkeypatch.setattr(settings, "store_dir", tmp_path)
+    path = agent_mod.persist_blocked_send(
+        chat_id="8201332044",
+        tool_name="mcp__luke__send_message",
+        tool_input={"text": "the correction that must not be lost"},
+        reason="hourly_budget_exceeded",
+    )
+    assert path is not None and path.exists()
+    record = json.loads(path.read_text(encoding="utf-8").strip())
+    assert record["delivered"] is False
+    assert record["chat_id"] == "8201332044"
+    assert record["reason"] == "hourly_budget_exceeded"
+    assert record["payload"]["text"] == "the correction that must not be lost"
+    assert record["blocked_at"]
+
+
+def test_persist_blocked_send_appends_each_block(tmp_path, monkeypatch):
+    from luke import agent as agent_mod
+    from luke.config import settings
+
+    monkeypatch.setattr(settings, "store_dir", tmp_path)
+    for n in range(3):
+        agent_mod.persist_blocked_send(
+            chat_id="c",
+            tool_name="mcp__luke__send_message",
+            tool_input={"text": f"msg {n}"},
+            reason="hourly_budget_exceeded",
+        )
+    lines = agent_mod.blocked_sends_path().read_text(encoding="utf-8").strip().splitlines()
+    assert [json.loads(x)["payload"]["text"] for x in lines] == ["msg 0", "msg 1", "msg 2"]
+
+
+def test_persist_blocked_send_tolerates_missing_input(tmp_path, monkeypatch):
+    from luke import agent as agent_mod
+    from luke.config import settings
+
+    monkeypatch.setattr(settings, "store_dir", tmp_path)
+    path = agent_mod.persist_blocked_send(
+        chat_id="c", tool_name="mcp__luke__send_document", tool_input=None, reason="r"
+    )
+    assert path is not None
+    assert json.loads(path.read_text(encoding="utf-8").strip())["payload"] == {}
+
+
+def test_persist_blocked_send_never_raises(monkeypatch):
+    """A failure to park must not escalate a blocked send into a crash."""
+    from luke import agent as agent_mod
+
+    monkeypatch.setattr(
+        agent_mod, "blocked_sends_path", lambda: (_ for _ in ()).throw(OSError("nope"))
+    )
+    assert (
+        agent_mod.persist_blocked_send(
+            chat_id="c", tool_name="t", tool_input={"text": "x"}, reason="r"
+        )
+        is None
+    )
