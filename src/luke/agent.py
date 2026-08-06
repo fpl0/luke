@@ -776,6 +776,35 @@ _SOURCE_READ_TOOLS: frozenset[str] = frozenset(
     }
 )
 
+# The one Bash exception, and it exists because of a real false positive on
+# 2026-08-06: Filipe said "Read Prerna latest email", I opened it in Mail.app
+# via osascript and quoted it verbatim, and the gate still fired — Bash is
+# excluded above, so the single highest-stakes case this gate was BUILT for
+# (email, the Prerna thread) is structurally unsatisfiable by any tool it
+# counts. Mail and Calendar on this machine are only readable through
+# osascript or the workspace mail tools.
+#
+# Kept deliberately narrow: a Bash call satisfies the gate only when the
+# command actually touches a mail/calendar read path. Anything broader would
+# re-admit "nearly every turn runs Bash" and neuter the gate.
+_SOURCE_READ_BASH = re.compile(
+    r"""(?ix)
+    (osascript .*? \b tell \s+ application \s+ "?(Mail|Calendar)"? )
+    | \b (mail_scan|mail_triage|mail_immigration_watch|calendar_scan|calendar_state_check) \.py \b
+    """,
+    re.VERBOSE | re.DOTALL,
+)
+
+
+def _bash_reads_a_source(tool_input: object) -> bool:
+    """True when a Bash command opens Mail/Calendar — see _SOURCE_READ_BASH."""
+    if not isinstance(tool_input, dict):
+        return False
+    command = tool_input.get("command")
+    if not isinstance(command, str):
+        return False
+    return bool(_SOURCE_READ_BASH.search(command))
+
 
 # Tools that count as "recall" for the recall-before-reference gate
 _RECALL_TOOLS: frozenset[str] = frozenset(
@@ -2518,8 +2547,11 @@ async def run_agent(
         # Track actual file/attachment deliveries for the artifact-request gate.
         if tool_name in _ARTIFACT_SEND_TOOLS:
             artifact_delivered_count["n"] += 1
-        # Track read/fetch calls for the primary-source gate.
-        if tool_name in _SOURCE_READ_TOOLS:
+        # Track read/fetch calls for the primary-source gate. Bash counts only
+        # when it opens Mail/Calendar — the one source no counted tool reaches.
+        if tool_name in _SOURCE_READ_TOOLS or (
+            tool_name == "Bash" and _bash_reads_a_source(input_data["tool_input"])
+        ):
             source_read_count["n"] += 1
         # --- Background-work routing gate (interactive turns only) ---
         # Harness `Task` sub-agents are children of the per-turn client: they

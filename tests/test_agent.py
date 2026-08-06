@@ -26,6 +26,7 @@ from luke.agent import (
     _md_to_html,
     _ok,
     _requests_file_artifact,
+    _bash_reads_a_source,
     _requests_source_read,
     _task_overlap,
     send_long_message,
@@ -2965,3 +2966,56 @@ def test_persist_blocked_send_never_raises(monkeypatch):
         )
         is None
     )
+
+
+class TestBashReadsASource:
+    """Bash counts toward the primary-source gate ONLY when it opens
+    Mail/Calendar.
+
+    Regression for 2026-08-06: Filipe said "Read Prerna latest email", the mail
+    was opened in Mail.app via osascript and quoted verbatim, and the Stop gate
+    still fired — Bash is excluded from _SOURCE_READ_TOOLS, so the single
+    highest-stakes case the gate exists for was unsatisfiable by any tool it
+    counted. A false positive here is not harmless: it trains me to treat the
+    gate's complaint as noise, which is exactly how a real miss gets waved past.
+    """
+
+    def test_osascript_heredoc_tell_mail_counts(self) -> None:
+        cmd = (
+            "osascript <<'EOF'\n"
+            'tell application "Mail"\n'
+            '\tset msgs to (every message of inbox whose subject is "x")\n'
+            "end tell\nEOF"
+        )
+        assert _bash_reads_a_source({"command": cmd}) is True
+
+    def test_osascript_inline_tell_mail_counts(self) -> None:
+        cmd = "osascript -e '\ntell application \"Mail\"\nset out to \"\"\nend tell'"
+        assert _bash_reads_a_source({"command": cmd}) is True
+
+    def test_calendar_counts(self) -> None:
+        cmd = "osascript -e 'tell application \"Calendar\" to get events'"
+        assert _bash_reads_a_source({"command": cmd}) is True
+
+    def test_workspace_mail_tools_count(self) -> None:
+        for tool in ("mail_scan", "mail_triage", "mail_immigration_watch"):
+            cmd = f"python3 workspace/tools/{tool}.py"
+            assert _bash_reads_a_source({"command": cmd}) is True, tool
+        assert _bash_reads_a_source(
+            {"command": "python3 workspace/tools/calendar_state_check.py"}
+        ) is True
+
+    def test_ordinary_bash_does_not_count(self) -> None:
+        """The gate stays sharp — Bash runs nearly every turn."""
+        for cmd in (
+            'sqlite3 luke.db "select 1"',
+            "ls workspace/tools/",
+            'echo "tell application Mail"',
+            "osascript -e 'tell application \"Finder\" to close windows'",
+            'git commit -m "read the email"',
+        ):
+            assert _bash_reads_a_source({"command": cmd}) is False, cmd
+
+    def test_malformed_input_is_false_not_raising(self) -> None:
+        for junk in (None, {}, {"command": 123}, "notadict", []):
+            assert _bash_reads_a_source(junk) is False
