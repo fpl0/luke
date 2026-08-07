@@ -1518,3 +1518,134 @@ class TestTrailingOwnCount:
             1 for ln in body.split("\n") if ln.startswith(f"**{settings.assistant_name}** (")
         )
         assert claimed == shown, f"Note claims {claimed}, block shows {shown}"
+
+
+# ---------------------------------------------------------------------------
+# Session continuity — a live conversation must never be answered cold
+#
+# 2026-08-07: every short message routed cheap, every cheap route silently
+# discarded the session, and 115 of 132 runs that day ran with no transcript.
+# The visible symptom was a headache answered as a standalone puzzle twenty
+# hours into a fast the same process had been coaching all afternoon.
+# ---------------------------------------------------------------------------
+
+
+def _msg(mid: int, content: str, ts: str, sender: str = "Filipe Lima") -> Any:
+    m = MagicMock()
+    m.id = mid
+    m.sender_name = sender
+    m.content = content
+    m.message_id = mid
+    m.timestamp = ts
+    return m
+
+
+def _iso(minutes_ago: float) -> str:
+    from datetime import timedelta
+
+    return (datetime.now(UTC) - timedelta(minutes=minutes_ago)).isoformat()
+
+
+class TestConversationIsLive:
+    def test_recent_prior_message_is_live(self) -> None:
+        batch = [_msg(2, "Strong headache!", _iso(0))]
+        rows = [
+            {"sender_name": "Filipe Lima", "content": "72h fast", "timestamp": _iso(3)},
+            {"sender_name": "Filipe Lima", "content": "Strong headache!", "timestamp": _iso(0)},
+        ]
+        with patch("luke.app.db") as mock_db:
+            mock_db.get_recent_messages.return_value = rows
+            assert app_mod._conversation_is_live("1", batch) is True
+
+    def test_own_prior_message_counts(self) -> None:
+        """Luke's own last line is still an open thread — sender is irrelevant."""
+        batch = [_msg(2, "Yes", _iso(0))]
+        rows = [
+            {"sender_name": settings.assistant_name, "content": "salt?", "timestamp": _iso(1)},
+            {"sender_name": "Filipe Lima", "content": "Yes", "timestamp": _iso(0)},
+        ]
+        with patch("luke.app.db") as mock_db:
+            mock_db.get_recent_messages.return_value = rows
+            assert app_mod._conversation_is_live("1", batch) is True
+
+    def test_stale_prior_message_is_not_live(self) -> None:
+        batch = [_msg(2, "morning", _iso(0))]
+        rows = [
+            {"sender_name": "Filipe Lima", "content": "night", "timestamp": _iso(600)},
+            {"sender_name": "Filipe Lima", "content": "morning", "timestamp": _iso(0)},
+        ]
+        with patch("luke.app.db") as mock_db:
+            mock_db.get_recent_messages.return_value = rows
+            assert app_mod._conversation_is_live("1", batch) is False
+
+    def test_batch_alone_is_not_live(self) -> None:
+        """The incoming batch is already stored; it must not vouch for itself."""
+        batch = [_msg(1, "hello", _iso(0))]
+        rows = [{"sender_name": "Filipe Lima", "content": "hello", "timestamp": _iso(0)}]
+        with patch("luke.app.db") as mock_db:
+            mock_db.get_recent_messages.return_value = rows
+            assert app_mod._conversation_is_live("1", batch) is False
+
+    def test_no_history_is_not_live(self) -> None:
+        with patch("luke.app.db") as mock_db:
+            mock_db.get_recent_messages.return_value = []
+            assert app_mod._conversation_is_live("1", [_msg(1, "hi", _iso(0))]) is False
+
+    def test_unparseable_timestamp_is_skipped(self) -> None:
+        batch = [_msg(2, "hi", _iso(0))]
+        rows = [
+            {"sender_name": "Filipe Lima", "content": "old", "timestamp": "not-a-date"},
+            {"sender_name": "Filipe Lima", "content": "hi", "timestamp": _iso(0)},
+        ]
+        with patch("luke.app.db") as mock_db:
+            mock_db.get_recent_messages.return_value = rows
+            assert app_mod._conversation_is_live("1", batch) is False
+
+
+class TestSessionContinuity:
+    async def _run(self, chat_id: str, live: bool) -> Any:
+        mock_result = MagicMock()
+        mock_result.texts = ["response"]
+        mock_result.session_id = "sess-123"
+        mock_result.cost_usd = 0.01
+        mock_result.num_turns = 1
+        mock_result.duration_api_ms = 100
+        mock_result.sent_messages = 0
+
+        app_mod._session_models.pop(chat_id, None)
+        run_agent = AsyncMock(return_value=mock_result)
+
+        with (
+            patch("luke.app.db") as mock_db,
+            patch("luke.app.bot") as mock_bot,
+            patch("luke.app.settings") as mock_settings,
+            patch("luke.app.bus"),
+            patch("luke.app.build_prompt", new_callable=AsyncMock, return_value="prompt"),
+            patch("luke.app.run_agent", run_agent),
+            patch("luke.app.send_long_message", new_callable=AsyncMock),
+            patch("luke.app._conversation_is_live", return_value=live),
+            patch("luke.app._classify_effort", return_value=("low", None, "sonnet")),
+        ):
+            mock_settings.chat_id = chat_id
+            mock_settings.agent_timeout = 10
+            mock_settings.auto_recall_limit = 5
+            mock_settings.max_concurrent = 5
+            mock_db.get_pending_messages.return_value = [_msg(1, "Strong headache!", _iso(0))]
+            mock_db.get_session.return_value = "sess-abc"
+            mock_bot.send_chat_action = AsyncMock()
+            mock_bot.send_message = AsyncMock()
+
+            await app_mod.process(chat_id)
+
+        app_mod._session_models.pop(chat_id, None)
+        return run_agent.call_args.kwargs
+
+    async def test_live_conversation_keeps_session_and_upgrades_model(self) -> None:
+        kwargs = await self._run("900101", live=True)
+        assert kwargs["session_id"] == "sess-abc", "live turn was answered with no transcript"
+        assert kwargs["model"] == "opus"
+
+    async def test_idle_chat_still_starts_fresh_on_cheap_model(self) -> None:
+        kwargs = await self._run("900102", live=False)
+        assert kwargs["session_id"] is None
+        assert kwargs["model"] == "sonnet"

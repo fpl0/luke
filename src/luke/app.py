@@ -41,6 +41,7 @@ from .agent import (
 )
 from .bus import bus
 from .config import settings
+from .db import ensure_utc
 from .media import build_prompt, extract_frame, transcribe
 from .memory import (
     MEMORY_DIRS,
@@ -70,6 +71,10 @@ _retry_counts: dict[str, int] = {}  # chat_id → consecutive failure count
 # Model routing: one-way ratchet within a session (never downgrade mid-conversation)
 _MODEL_RANK: dict[str, int] = {"haiku": 0, "sonnet": 1, "opus": 2}
 _session_models: dict[str, str] = {}  # chat_id → highest model used in session
+
+# A conversation is "live" if the previous message landed within this window.
+# Inside it, continuity outranks cost — see _conversation_is_live.
+_LIVE_CONVERSATION_MIN = 30.0
 
 # Crash context: tracks what the system is doing for richer crash breadcrumbs
 _start_time: float = time.monotonic()
@@ -240,6 +245,32 @@ _COST_ANOMALY_MIN = 2.0  # minimum cost to trigger anomaly check
 _COST_ANOMALY_MULTIPLIER = 3  # times rolling average
 
 
+def _conversation_is_live(chat_id: str, batch: list[db.StoredMessage]) -> bool:
+    """True when this batch is a reply inside an exchange already in flight.
+
+    "Live" means a message — his or mine — landed in the last
+    ``_LIVE_CONVERSATION_MIN`` minutes, before the current batch. It is
+    deliberately blind to who spoke: what matters is that a thread is open and
+    the turn cannot be answered from a standing summary alone.
+    """
+    rows = db.get_recent_messages(chat_id, limit=20)
+    if not rows:
+        return False
+
+    batch_ts = min((m.timestamp for m in batch), default="")
+    now = datetime.now(UTC)
+    for row in reversed(rows):
+        ts = str(row.get("timestamp") or "")
+        if batch_ts and ts >= batch_ts:
+            continue  # this batch, already stored — not prior context
+        try:
+            prior = ensure_utc(datetime.fromisoformat(ts))
+        except ValueError:
+            continue
+        return (now - prior).total_seconds() / 60.0 <= _LIVE_CONVERSATION_MIN
+    return False
+
+
 async def process(chat_id: str) -> None:
     """Process all pending messages for a chat."""
     lock = _active.setdefault(chat_id, asyncio.Lock())
@@ -307,9 +338,33 @@ async def process(chat_id: str) -> None:
             model = routed_model
 
         session_id = db.get_session(chat_id)
-        # Non-opus models crash on session resume (SDK bug) — start fresh
+        # Non-opus models crash on session resume (SDK bug), so a cheap route
+        # used to silently discard the session and answer with NO transcript —
+        # 115 of 132 runs on 2026-08-07. That is how "Strong headache!" got
+        # answered as a standalone symptom twenty hours into a 72-hour fast we
+        # had been coaching all afternoon: every short message routes cheap,
+        # and every cheap turn arrived cold.
+        #
+        # Inside a live exchange, continuity outranks cost — pay for the model
+        # that can resume. Outside one, a fresh session is harmless, but it is
+        # now logged loudly instead of vanishing into a `resume: false` field.
         if model != "opus" and session_id:
-            session_id = None
+            if _conversation_is_live(chat_id, messages):
+                log.info(
+                    "session_continuity_upgrade",
+                    chat_id=chat_id,
+                    routed=model,
+                    reason="live_conversation",
+                )
+                model = "opus"
+            else:
+                log.warning(
+                    "session_dropped_cold_start",
+                    chat_id=chat_id,
+                    model=model,
+                    detail="non-opus route cannot resume; turn runs without transcript",
+                )
+                session_id = None
 
         await bot.send_chat_action(chat_id=int(chat_id), action="typing")
         typing_task = asyncio.create_task(_keep_typing(int(chat_id)))
