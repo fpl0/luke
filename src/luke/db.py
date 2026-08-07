@@ -261,7 +261,11 @@ CREATE TABLE IF NOT EXISTS outbound_log (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     chat_id      TEXT NOT NULL,
     content_hash TEXT NOT NULL,
-    timestamp    TEXT NOT NULL DEFAULT (datetime('now'))
+    timestamp    TEXT NOT NULL DEFAULT (datetime('now')),
+    -- 1 = a send Luke initiated (cron, behavior, autonomous run); 0 = a reply
+    -- to something Filipe just said. Only autonomous rows count against the
+    -- hourly attention budget — see count_recent_outbound.
+    autonomous   INTEGER NOT NULL DEFAULT 1
 );
 CREATE INDEX IF NOT EXISTS idx_outbound_hash ON outbound_log(chat_id, content_hash);
 
@@ -521,6 +525,24 @@ _MIGRATIONS: list[tuple[int, str, list[str]]] = [
             "UPDATE memory_meta SET importance = 1.0 "
             "WHERE type = 'procedure' AND importance >= 1.9 "
             "AND tags_json LIKE '%auto-extracted%'",
+        ],
+    ),
+    (
+        16,
+        "outbound_log.autonomous — stop Filipe's own conversation eating the hourly budget",
+        [
+            # 2026-08-07. He asked a direct question, we went thirteen turns in
+            # ten minutes, and every one of my replies counted against the
+            # hourly attention cap. The cap exists to stop me INTERRUPTING him
+            # unprompted; it is not a quota on answering him. Result: the one
+            # message he explicitly asked for ("Fix yourself Luke, right now")
+            # was blocked four times in a row — 20/8, 20/8, 16/8, 14/8 — while
+            # the budget it lost to was made almost entirely of his own thread.
+            #
+            # Backfill is deliberately 1 (autonomous). Existing rows carry no
+            # provenance, so the conservative reading is the old behaviour, and
+            # the window is an hour — it self-corrects almost immediately.
+            "ALTER TABLE outbound_log ADD COLUMN autonomous INTEGER NOT NULL DEFAULT 1",
         ],
     ),
 ]
@@ -1387,12 +1409,18 @@ def get_cost_report(period: str = "month") -> str:
 # ---------------------------------------------------------------------------
 
 
-def log_outbound(chat_id: str, content_hash: str) -> None:
-    """Record an outbound message hash for dedup detection."""
+def log_outbound(chat_id: str, content_hash: str, autonomous: bool = True) -> None:
+    """Record an outbound message hash for dedup detection.
+
+    ``autonomous`` marks whether Luke initiated the send. Replies to a live
+    message from Filipe are not interruptions and must not consume the hourly
+    attention budget, so they are recorded as 0. Defaults to True because an
+    unlabelled send is the conservative case.
+    """
     db = _db()
     db.execute(
-        "INSERT INTO outbound_log (chat_id, content_hash) VALUES (?, ?)",
-        (chat_id, content_hash),
+        "INSERT INTO outbound_log (chat_id, content_hash, autonomous) VALUES (?, ?, ?)",
+        (chat_id, content_hash, 1 if autonomous else 0),
     )
     _commit(db)
 
@@ -1413,12 +1441,18 @@ def is_duplicate_outbound(chat_id: str, content_hash: str, window_seconds: int =
 
 
 def count_recent_outbound(chat_id: str, window_seconds: int = 3600) -> int:
-    """Count outbound messages sent within the given time window."""
+    """Count Luke-initiated messages sent within the given time window.
+
+    Replies to Filipe are excluded on purpose: this figure feeds the hourly
+    attention budget, which caps how often Luke interrupts, not how often he
+    answers. Counting his own back-and-forth against him let a fast exchange
+    lock out the follow-up he had just asked for (2026-08-07).
+    """
     row = (
         _db()
         .execute(
             "SELECT COUNT(*) FROM outbound_log "
-            "WHERE chat_id = ? AND timestamp >= datetime('now', ?)",
+            "WHERE chat_id = ? AND autonomous = 1 AND timestamp >= datetime('now', ?)",
             (chat_id, f"-{window_seconds} seconds"),
         )
         .fetchone()

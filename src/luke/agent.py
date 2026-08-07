@@ -419,8 +419,22 @@ async def _send_chunk(bot: Bot, chat_id: int, text: str, **kwargs: Any) -> None:
             await asyncio.sleep(delay)
 
 
-async def send_long_message(bot: Bot, chat_id: int, text: str, **kwargs: Any) -> None:
-    """Send a message, splitting into chunks if it exceeds Telegram's 4096 char limit."""
+async def send_long_message(
+    bot: Bot,
+    chat_id: int,
+    text: str,
+    autonomous: bool | None = None,
+    **kwargs: Any,
+) -> None:
+    """Send a message, splitting into chunks if it exceeds Telegram's 4096 char limit.
+
+    ``autonomous`` decides whether this send counts against the hourly attention
+    budget. Left as None it is inferred from the current turn: a reply written
+    during a human turn is not an interruption. Callers that know better (the
+    reactive reply path in app.py) pass it explicitly.
+    """
+    if autonomous is None:
+        autonomous = not memory.human_turn.get()
     # Convert before hashing and chunking: the converted string is what actually
     # ships, so it must be what dedup and the 4096-char split see.
     if kwargs.get("parse_mode", "html") is not None:
@@ -443,7 +457,7 @@ async def send_long_message(bot: Bot, chat_id: int, text: str, **kwargs: Any) ->
             cut = max_len
         await _send_chunk(bot, chat_id=chat_id, text=text[:cut] + "\n…", **kwargs)
         text = text[cut:].lstrip("\n")
-    db.log_outbound(str(chat_id), content_hash)
+    db.log_outbound(str(chat_id), content_hash, autonomous=autonomous)
 
 
 _VALID_MEMORY_TYPES: frozenset[str] = frozenset(MEMORY_DIRS)
@@ -1176,8 +1190,13 @@ class AgentResult:
 # ---------------------------------------------------------------------------
 
 
-def _build_tools(chat_id: str, bot: Bot) -> Any:
-    """Create the in-process MCP server with all tools."""
+def _build_tools(chat_id: str, bot: Bot, autonomous: bool = True) -> Any:
+    """Create the in-process MCP server with all tools.
+
+    ``autonomous`` is the run's own flag, threaded here rather than read from a
+    ContextVar so tool sends are attributed correctly no matter which asyncio
+    task the SDK happens to invoke them from.
+    """
     root = settings.luke_dir
 
     # Allowed roots for file-sending tools (prevents arbitrary path access)
@@ -1216,6 +1235,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
             bot,
             chat_id=_target(args),
             text=args["text"],
+            autonomous=autonomous,
             disable_notification=args.get("silent", False),
         )
         return _ok("Sent")
@@ -1360,6 +1380,7 @@ def _build_tools(chat_id: str, bot: Bot) -> Any:
             bot,
             chat_id=_target(args),
             text=args["text"],
+            autonomous=autonomous,
             reply_parameters=ReplyParameters(message_id=int(args["message_id"])),
         )
         return _ok("Replied")
@@ -3054,7 +3075,7 @@ async def run_agent(
         setting_sources=["project", "user"],
         stderr=cli_stderr,
         mcp_servers={
-            "luke": _build_tools(chat_id, bot),
+            "luke": _build_tools(chat_id, bot, autonomous),
         },
         thinking=thinking if thinking is not None else ThinkingConfigAdaptive(type="adaptive"),
         effort=effort if effort is not None else "high",

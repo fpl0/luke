@@ -634,6 +634,26 @@ class TestCountRecentOutbound:
         # Use a more realistic check — just verify the parameter works
         assert test_db.count_recent_outbound("12345", window_seconds=7200) == 1
 
+    def test_replies_to_filipe_do_not_count(self, test_db: Any) -> None:
+        # 2026-08-07: a thirteen-turn exchange he started burned the whole
+        # hourly budget, and the follow-up he had explicitly asked for was
+        # blocked four times. Answering him is not an interruption.
+        for i in range(12):
+            test_db.log_outbound("12345", f"reply{i}", autonomous=False)
+        assert test_db.count_recent_outbound("12345") == 0
+
+    def test_mixed_counts_only_autonomous(self, test_db: Any) -> None:
+        test_db.log_outbound("12345", "reply1", autonomous=False)
+        test_db.log_outbound("12345", "cron1", autonomous=True)
+        test_db.log_outbound("12345", "reply2", autonomous=False)
+        test_db.log_outbound("12345", "cron2")  # default is autonomous
+        assert test_db.count_recent_outbound("12345") == 2
+
+    def test_dedup_still_sees_replies(self, test_db: Any) -> None:
+        # The budget ignores replies; duplicate detection must not.
+        test_db.log_outbound("12345", "samehash", autonomous=False)
+        assert test_db.is_duplicate_outbound("12345", "samehash") is True
+
 
 # ---------------------------------------------------------------------------
 # Migrations
