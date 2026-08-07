@@ -1413,9 +1413,7 @@ def cleanup_archived_fts() -> None:
             "DELETE FROM memory_vec WHERE memory_id IN "
             "(SELECT id FROM memory_meta WHERE status = 'archived')"
         )
-        db.execute(
-            "DELETE FROM memory_vec WHERE memory_id NOT IN (SELECT id FROM memory_meta)"
-        )
+        db.execute("DELETE FROM memory_vec WHERE memory_id NOT IN (SELECT id FROM memory_meta)")
         _commit(db)
     except sqlite3.OperationalError:
         db.rollback()
@@ -1552,6 +1550,16 @@ def expire_working_memories(max_age_hours: int = 24) -> int:
     Working memories are ephemeral by design — they represent transient context
     (scratch notes, in-progress state, temporary plans) that should not persist.
     Returns the number of archived memories.
+
+    Goals are EXEMPT, unconditionally. `_DEFAULT_TAXONOMY` classifies every goal
+    as 'working', so before this exemption existed any active goal untouched for
+    24h was silently archived — and `reconcile_stale_plans()`, which runs in the
+    same maintenance tick, then paused its plan file. That killed
+    goal-irish-citizenship on 2026-08-07, ~24h after Filipe called it "super
+    priority", with no event and no memory_history row. A goal ends when it is
+    completed or abandoned, never because nobody edited it for a day; staleness
+    is the decay ranker's job (working taxonomy already decays 3x), and decay is
+    recoverable where archiving deletes the FTS row.
     """
     if max_age_hours <= 0:
         return 0
@@ -1560,6 +1568,7 @@ def expire_working_memories(max_age_hours: int = 24) -> int:
     rows = conn.execute(
         """SELECT id FROM memory_meta
            WHERE taxonomy = 'working' AND status = 'active'
+           AND type != 'goal'
            AND updated < ?""",
         (cutoff,),
     ).fetchall()

@@ -446,8 +446,7 @@ class TestDecayAndArchiving:
         memory.cleanup_archived_fts()
         conn = db._db()
         assert (
-            conn.execute("SELECT 1 FROM memory_vec WHERE memory_id = ?", ("e1",)).fetchone()
-            is None
+            conn.execute("SELECT 1 FROM memory_vec WHERE memory_id = ?", ("e1",)).fetchone() is None
         )
 
         memory.restore_memory("e1")
@@ -1471,7 +1470,7 @@ class TestTaxonomyScoring:
 class TestWorkingMemoryExpiry:
     def test_expire_working_memories(self, test_db: Any) -> None:
         """Working memories older than max_age_hours are archived."""
-        memory.index_memory("w1", "goal", "Temp Goal", "scratch", taxonomy="working")
+        memory.index_memory("w1", "episode", "Temp Note", "scratch", taxonomy="working")
         # Backdate the updated timestamp to 48h ago
         old = (datetime.now(UTC) - timedelta(hours=48)).isoformat()
         conn = db._db()
@@ -1485,9 +1484,48 @@ class TestWorkingMemoryExpiry:
 
     def test_recent_working_not_expired(self, test_db: Any) -> None:
         """Recently updated working memories are kept."""
-        memory.index_memory("w1", "goal", "Active Goal", "content", taxonomy="working")
+        memory.index_memory("w1", "episode", "Active Note", "content", taxonomy="working")
         expired = memory.expire_working_memories(max_age_hours=24)
         assert expired == 0
+
+    def test_stale_goal_never_expired(self, test_db: Any) -> None:
+        """A goal is never archived for being untouched — regression, 2026-08-07.
+
+        Every goal is taxonomy='working' by default (_DEFAULT_TAXONOMY), so this
+        function used to archive any active goal 24h after its last edit, then
+        reconcile_stale_plans() paused its plan in the same tick. It killed
+        goal-irish-citizenship a day after Filipe called it super priority.
+        """
+        memory.index_memory("goal-live", "goal", "Live Goal", "content", taxonomy="working")
+        old = (datetime.now(UTC) - timedelta(days=30)).isoformat()
+        conn = db._db()
+        conn.execute("UPDATE memory_meta SET updated = ? WHERE id = ?", (old, "goal-live"))
+        conn.commit()
+
+        expired = memory.expire_working_memories(max_age_hours=24)
+        assert expired == 0
+        row = conn.execute("SELECT status FROM memory_meta WHERE id = ?", ("goal-live",)).fetchone()
+        assert row["status"] == "active"
+
+    def test_stale_goal_exempt_but_siblings_still_expire(self, test_db: Any) -> None:
+        """The goal exemption must not disable expiry for everything else."""
+        memory.index_memory("goal-live", "goal", "Live Goal", "content", taxonomy="working")
+        memory.index_memory("w1", "episode", "Scratch", "content", taxonomy="working")
+        old = (datetime.now(UTC) - timedelta(days=30)).isoformat()
+        conn = db._db()
+        conn.execute(
+            "UPDATE memory_meta SET updated = ? WHERE id IN (?, ?)", (old, "goal-live", "w1")
+        )
+        conn.commit()
+
+        assert memory.expire_working_memories(max_age_hours=24) == 1
+        statuses = dict(
+            conn.execute(
+                "SELECT id, status FROM memory_meta WHERE id IN ('goal-live', 'w1')"
+            ).fetchall()
+        )
+        assert statuses["goal-live"] == "active"
+        assert statuses["w1"] == "archived"
 
     def test_non_working_not_expired(self, test_db: Any) -> None:
         """Factual/experiential memories are never expired by this function."""
