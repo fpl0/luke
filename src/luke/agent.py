@@ -2826,6 +2826,53 @@ async def run_agent(
                     )
                     return {"decision": "block", "reason": f"Quality gate: {rejection}"}
 
+                # --- State reconciliation gate (ALL sends, not just autonomous) ---
+                # Blocks a draft asserting something Filipe already superseded
+                # earlier TODAY. Deliberately not gated on `autonomous`: on
+                # 2026-08-08 the misses came from crons AND from interactive
+                # turns, and he asked for reconciliation on new information
+                # rather than a per-surface patch.
+                #
+                # Deliberately NOT recency-windowed either. check_freshness
+                # only runs inside freshness_window_minutes (15); the fast
+                # break was 7h29m old when the 21:00 check-in said "hour 47",
+                # so that gate was structurally unable to fire. Deterministic,
+                # no model call, fails open — see state_reconcile.py.
+                if msg_text and msg_text.strip():
+                    from .state_reconcile import block_reason, reconcile
+
+                    recent_rows = db.get_recent_messages(chat_id, limit=60)
+                    todays_user_msgs = [
+                        {
+                            "content": r.get("content", ""),
+                            "timestamp": r.get("timestamp", ""),
+                        }
+                        for r in recent_rows
+                        if r.get("sender_name") != settings.assistant_name
+                    ]
+                    sr = reconcile(msg_text, todays_user_msgs)
+                    if sr.error:
+                        bus.emit("state_reconcile_failopen", {"tool": tool_name, "error": sr.error})
+                    elif sr.blocked:
+                        log.warning(
+                            "state_reconcile_blocked",
+                            chat_id=chat_id,
+                            tool=tool_name,
+                            rule=sr.rule,
+                            quote=sr.quote,
+                            preview=msg_text[:100],
+                        )
+                        bus.emit(
+                            "state_reconcile_blocked",
+                            {
+                                "tool": tool_name,
+                                "rule": sr.rule,
+                                "quote": sr.quote,
+                                "preview": msg_text[:100],
+                            },
+                        )
+                        return {"decision": "block", "reason": block_reason(sr)}
+
                 # --- Recall-before-reference gate (autonomous only) ---
                 # If the draft references past events but no recall was called
                 # this turn, block so the agent grounds in actual memory before
