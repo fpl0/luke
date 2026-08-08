@@ -348,7 +348,24 @@ async def process(chat_id: str) -> None:
         # Inside a live exchange, continuity outranks cost — pay for the model
         # that can resume. Outside one, a fresh session is harmless, but it is
         # now logged loudly instead of vanishing into a `resume: false` field.
-        if model != "opus" and session_id:
+        #
+        # The guard below only covers the case where a session EXISTS. The far
+        # commoner cold turn has no session at all — `clear_sessions()` wipes
+        # the table on every process restart, and the hourly sweep drops any
+        # session idle for an hour. Both of Filipe's conversational turns on the
+        # evening of 2026-08-07 ran that way, minutes after a restart, and the
+        # log recorded neither branch: zero upgrades, zero cold starts, which
+        # read as healthy. A turn answered without its own transcript must say
+        # so whatever the reason, or the metric is a lie.
+        if not session_id and _conversation_is_live(chat_id, messages):
+            log.warning(
+                "live_turn_without_session",
+                chat_id=chat_id,
+                model=model,
+                detail="no session to resume (restart or idle sweep); "
+                "continuity rests on the conversation-state block alone",
+            )
+        elif model != "opus" and session_id:
             if _conversation_is_live(chat_id, messages):
                 log.info(
                     "session_continuity_upgrade",
@@ -593,9 +610,22 @@ async def process(chat_id: str) -> None:
                     db.set_session(chat_id, result.session_id)
                 _session_models[chat_id] = model
 
-        # Save conversation state for continuity (non-trivial conversations only)
-        if effort != "low":
-            _fire_and_forget(asyncio.to_thread(_save_conv_state, messages, result.texts))
+        # Save conversation state for continuity — on EVERY turn.
+        #
+        # This used to skip low-effort turns as "trivial". They are not: low
+        # effort tracks short messages, short messages route cheap, and a cheap
+        # turn cannot resume a session. So the conversation-state block is the
+        # only continuity a low-effort turn has, and it was the one kind of turn
+        # that never refreshed it. A rapid exchange of one-liners therefore left
+        # the anchor frozen at the last expensive turn while the conversation
+        # ran on without it — "Luke, did you just forget everything?", 16:05 on
+        # 2026-08-07, twenty hours into a fast this process had been coaching
+        # all afternoon.
+        #
+        # The save costs nothing worth gating on: pure-Python topic extraction,
+        # one file write, one index call, already off the response path in a
+        # thread.
+        _fire_and_forget(asyncio.to_thread(_save_conv_state, messages, result.texts))
 
         _clear_crash_context("processing_chat", "processing_msg_count", "processing_started")
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import fcntl
 import time
 from datetime import UTC, datetime
@@ -1603,7 +1604,13 @@ class TestConversationIsLive:
 
 
 class TestSessionContinuity:
-    async def _run(self, chat_id: str, live: bool) -> Any:
+    async def _run(
+        self,
+        chat_id: str,
+        live: bool,
+        session: str | None = "sess-abc",
+        saver: Any = None,
+    ) -> Any:
         mock_result = MagicMock()
         mock_result.texts = ["response"]
         mock_result.session_id = "sess-123"
@@ -1625,17 +1632,23 @@ class TestSessionContinuity:
             patch("luke.app.send_long_message", new_callable=AsyncMock),
             patch("luke.app._conversation_is_live", return_value=live),
             patch("luke.app._classify_effort", return_value=("low", None, "sonnet")),
+            patch("luke.app._save_conv_state", saver or MagicMock()),
         ):
             mock_settings.chat_id = chat_id
             mock_settings.agent_timeout = 10
             mock_settings.auto_recall_limit = 5
             mock_settings.max_concurrent = 5
             mock_db.get_pending_messages.return_value = [_msg(1, "Strong headache!", _iso(0))]
-            mock_db.get_session.return_value = "sess-abc"
+            mock_db.get_session.return_value = session
             mock_bot.send_chat_action = AsyncMock()
             mock_bot.send_message = AsyncMock()
 
             await app_mod.process(chat_id)
+            # The conversation-state save is fire-and-forget; let it land before
+            # the patches come off, or the assertion races the thread.
+            for task in list(app_mod._background_tasks):
+                with contextlib.suppress(Exception):
+                    await task
 
         app_mod._session_models.pop(chat_id, None)
         return run_agent.call_args.kwargs
@@ -1649,3 +1662,34 @@ class TestSessionContinuity:
         kwargs = await self._run("900102", live=False)
         assert kwargs["session_id"] is None
         assert kwargs["model"] == "sonnet"
+
+    async def test_live_turn_with_no_session_is_logged_not_silent(self) -> None:
+        """The commonest cold turn had no session at all, and logged nothing.
+
+        `clear_sessions()` wipes the table on every process restart and the
+        hourly sweep drops any session idle for an hour, so `get_session` often
+        returns None mid-conversation. Both live turns on the evening of
+        2026-08-07 went that way and the log showed zero upgrades and zero cold
+        starts — which reads as healthy while every conversational turn ran
+        without its own transcript.
+        """
+        with patch("luke.app.log") as mock_log:
+            kwargs = await self._run("900103", live=True, session=None)
+
+        assert kwargs["session_id"] is None, "there was nothing to resume"
+        # No point paying for opus: with no session, no model can resume.
+        assert kwargs["model"] == "sonnet"
+        warned = [c for c in mock_log.warning.call_args_list if c.args[:1] == ("live_turn_without_session",)]
+        assert warned, "a live turn ran cold and said nothing about it"
+
+    async def test_conversation_state_saved_even_on_low_effort_turn(self) -> None:
+        """Low-effort turns are exactly the turns that need the state block.
+
+        Low effort tracks short messages, short messages route cheap, and a
+        cheap turn cannot resume a session — so the conversation-state block is
+        the only continuity such a turn has. Skipping the save on it froze the
+        anchor at the last expensive turn while a fast exchange ran on.
+        """
+        saver = MagicMock()
+        await self._run("900104", live=True, saver=saver)
+        assert saver.called, "a low-effort turn left the conversation-state block stale"
