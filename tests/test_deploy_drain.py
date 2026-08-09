@@ -255,6 +255,102 @@ def test_unknown_flag_is_rejected(luke_dir):
     assert "unknown flag" in proc.stderr
 
 
+# ─── the detached runner ─────────────────────────────────────────────────────
+#
+# Every case here comes from the guard's first live run, which spun 43 times in
+# under a minute: `launchctl submit` sets KeepAlive, and the submitted command
+# died instantly on a relative path it could not resolve from launchd's cwd.
+
+
+def build_runner(luke_dir: Path, *args: str) -> str:
+    runner = luke_dir / "runner.sh"
+    quoted = " ".join(f'"{a}"' for a in args)
+    rc, out = run_snippet(
+        luke_dir,
+        f'build_detached_runner "com.luke.deploy.777" "{luke_dir}/x.log" "{runner}" {quoted}',
+    )
+    assert rc == 0, out
+    return runner.read_text()
+
+
+def test_runner_removes_its_own_label(luke_dir):
+    """THE bug. Without this line launchd relaunches the job forever, because
+    `launchctl submit` creates it with KeepAlive on."""
+    body = build_runner(luke_dir)
+    assert "launchctl remove com.luke.deploy.777" in body
+    # …and unconditionally: it must run after a FAILED deploy too, which is the
+    # case that actually loops.
+    assert body.index("rc=$?") < body.index("launchctl remove")
+
+
+def test_runner_invokes_deploy_by_absolute_path(luke_dir):
+    """launchd does not inherit our cwd. The 43 failures were all
+    `./deploy.sh: No such file or directory`."""
+    body = build_runner(luke_dir)
+    assert str(DEPLOY_SH) in body
+    assert "./deploy.sh" not in body
+
+
+def test_runner_marks_itself_detached_to_stop_infinite_recursion(luke_dir):
+    """Without LUKE_DEPLOY_DETACHED the re-exec'd copy would detect the tree
+    again and submit another job, and so on."""
+    assert "export LUKE_DEPLOY_DETACHED=1" in build_runner(luke_dir)
+
+
+def test_runner_forwards_arguments(luke_dir):
+    body = build_runner(luke_dir, "my-feature", "--no-drain")
+    assert "my-feature" in body
+    assert "--no-drain" in body
+
+
+def test_runner_quotes_hostile_arguments(luke_dir):
+    """A branch name is attacker-adjacent input at best and a typo at worst;
+    it is interpolated into a generated shell script."""
+    body = build_runner(luke_dir, "; touch /tmp/pwned #")
+    assert "; touch /tmp/pwned #\n" not in body
+    rc, _ = run_snippet(luke_dir, f'bash -n "{luke_dir}/runner.sh"')
+    assert rc == 0
+
+
+def test_runner_preserves_the_deploy_exit_code(luke_dir):
+    body = build_runner(luke_dir)
+    assert "exit $rc" in body
+
+
+def test_runner_is_executable_and_valid_bash(luke_dir):
+    build_runner(luke_dir)
+    runner = luke_dir / "runner.sh"
+    assert os.access(runner, os.X_OK)
+    assert subprocess.run(["bash", "-n", str(runner)], timeout=30).returncode == 0
+
+
+def test_runner_runs_end_to_end_against_a_stub_deploy(luke_dir, monkeypatch):
+    """Execute the generated runner for real with a stubbed deploy.sh and a
+    stubbed launchctl, and assert both the exit code and the label removal."""
+    stub_bin = luke_dir / "bin"
+    stub_bin.mkdir()
+    (stub_bin / "launchctl").write_text(
+        f'#!/bin/bash\necho "launchctl $*" >> "{luke_dir}/launchctl.calls"\n'
+    )
+    (stub_bin / "launchctl").chmod(0o755)
+
+    body = build_runner(luke_dir).replace(str(DEPLOY_SH), str(luke_dir / "fake-deploy.sh"))
+    (luke_dir / "fake-deploy.sh").write_text('#!/bin/bash\necho "deploy ran: $*"\nexit 7\n')
+    (luke_dir / "runner.sh").write_text(body)
+    (luke_dir / "runner.sh").chmod(0o755)
+
+    proc = subprocess.run(
+        ["bash", str(luke_dir / "runner.sh")],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PATH": f"{stub_bin}:{os.environ['PATH']}"},
+        timeout=60,
+    )
+    assert proc.returncode == 7, proc.stdout + proc.stderr
+    assert "deploy ran" in proc.stdout
+    assert "remove com.luke.deploy.777" in (luke_dir / "launchctl.calls").read_text()
+
+
 def test_exit_timeout_is_set_in_the_plist():
     """launchd's 20s default SIGKILLs the process mid-drain. deploy.sh waits for
     idle, but every other restart path (watchdog, manual kickstart) relies on this."""
