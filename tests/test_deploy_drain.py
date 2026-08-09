@@ -297,6 +297,19 @@ def test_runner_marks_itself_detached_to_stop_infinite_recursion(luke_dir):
     assert "export LUKE_DEPLOY_DETACHED=1" in build_runner(luke_dir)
 
 
+def test_runner_carries_the_callers_path(luke_dir):
+    """launchd hands a submitted job a bare PATH. The second live run of this
+    guard died on `uv not found` in step 1 for exactly this reason."""
+    body = build_runner(luke_dir)
+    assert "export PATH=" in body
+    assert "uv" in subprocess.run(
+        ["bash", "-c", f'{[l for l in body.splitlines() if l.startswith("export PATH=")][0]}; command -v uv'],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    ).stdout
+
+
 def test_runner_forwards_arguments(luke_dir):
     body = build_runner(luke_dir, "my-feature", "--no-drain")
     assert "my-feature" in body
@@ -335,6 +348,12 @@ def test_runner_runs_end_to_end_against_a_stub_deploy(luke_dir, monkeypatch):
     (stub_bin / "launchctl").chmod(0o755)
 
     body = build_runner(luke_dir).replace(str(DEPLOY_SH), str(luke_dir / "fake-deploy.sh"))
+    # The runner pins PATH deliberately, so the stub launchctl has to go in front
+    # of it rather than into the environment we hand the subprocess.
+    body = "\n".join(
+        f'export PATH="{stub_bin}:$PATH"' if line.startswith("export PATH=") else line
+        for line in body.splitlines()
+    )
     (luke_dir / "fake-deploy.sh").write_text('#!/bin/bash\necho "deploy ran: $*"\nexit 7\n')
     (luke_dir / "runner.sh").write_text(body)
     (luke_dir / "runner.sh").chmod(0o755)

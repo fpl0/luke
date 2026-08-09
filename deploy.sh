@@ -120,6 +120,10 @@ build_detached_runner() {
 # so a failed detached deploy can be read back rather than guessed at.
 export LUKE_DEPLOY_DETACHED=1
 export LUKE_DIR=$(printf '%q' "$LUKE_DIR")
+# launchd gives a submitted job a bare PATH, so the caller's is captured here.
+# Without it step 1 dies on "uv not found" — which it did, on the second live run.
+export PATH=$(printf '%q' "$PATH")
+export HOME=$(printf '%q' "$HOME")
 /bin/bash $(printf '%q' "$REPO_DIR/deploy.sh")$quoted_args
 rc=\$?
 echo "[runner] deploy.sh exited \$rc — removing launchd label $label"
