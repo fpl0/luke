@@ -24,6 +24,7 @@ from structlog.stdlib import BoundLogger
 
 from . import attention as _attention_module
 from . import db as _db_module
+from . import live_state as _live_state_module
 from . import memory as _memory_module
 from .config import settings
 from .db import _db, ensure_utc
@@ -927,12 +928,17 @@ def _pin_conversation_state(chat_id: str) -> str:
         body = _trim_conv_state(body, settings.recall_content_limit)
     updated = _memory_module.get_memory_updated(_CONV_STATE_ID) if body else None
     live_reactions = _live_reaction_note(chat_id)
+    # Above the reactions and above the transcript: what is true right now
+    # outranks what was said recently. Empty string when nothing is live.
+    live_state = _live_state_module.render()
 
     if body:
         if _session_lost.pop(chat_id, False):
             body = "[Session was reset — use this context to resume seamlessly]\n" + body
         if live_reactions:
             body = live_reactions + body
+        if live_state:
+            body = live_state + body
         if updated:
             try:
                 ts = ensure_utc(datetime.fromisoformat(updated))
@@ -951,9 +957,11 @@ def _pin_conversation_state(chat_id: str) -> str:
     if not recent:
         return ""
     lines = [f"{m['sender_name']}: {m['content'][:500]}" for m in recent[-10:]]
+    # The cold-start path needs this most: with no saved state, the anchor is
+    # the only thing that survives a lost session.
     return (
         "<conversation-state>\n"
-        f"{live_reactions}"
+        f"{live_state}{live_reactions}"
         "[Recent conversation context (no saved state available)]\n"
         f"{chr(10).join(lines)}\n</conversation-state>\n"
     )
