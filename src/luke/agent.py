@@ -60,6 +60,8 @@ from structlog.stdlib import BoundLogger
 from . import context, db, memory
 from .bus import bus
 from .config import settings
+from .db_query_gate import REASON as DB_QUERY_GATE_REASON
+from .db_query_gate import blocks_tool_input as blocks_db_query
 from .memory import MEMORY_DIRS, read_frontmatter, read_memory_body, sanitize_memory_id
 from .sdk_io import cli_stderr
 
@@ -2574,6 +2576,16 @@ async def run_agent(
             tool_name == "Bash" and _bash_reads_a_source(input_data["tool_input"])
         ):
             source_read_count["n"] += 1
+        # --- luke.db hand-query gate (all runs) ---
+        # Guessing luke.db's schema is the most repetitive self-inflicted
+        # failure in the log — 12 "no such column"/"no such table" errors in
+        # 30h on 2026-08-08, the same count q.sh's header cites from the two
+        # days BEFORE q.sh existed to end it. The wrapper shipped, the memory
+        # line shipped, the rate did not move. Enforce it instead.
+        if tool_name == "Bash" and blocks_db_query(input_data["tool_input"]):
+            log.warning("db_query_gate_blocked", chat_id=chat_id)
+            bus.emit("db_query_gate_blocked", {"chat_id": chat_id})
+            return {"decision": "block", "reason": DB_QUERY_GATE_REASON}
         # --- Background-work routing gate (interactive turns only) ---
         # Harness `Task` sub-agents are children of the per-turn client: they
         # die the moment Filipe sends his next message (the July 3 2026
@@ -2825,6 +2837,53 @@ async def run_agent(
                         },
                     )
                     return {"decision": "block", "reason": f"Quality gate: {rejection}"}
+
+                # --- State reconciliation gate (ALL sends, not just autonomous) ---
+                # Blocks a draft asserting something Filipe already superseded
+                # earlier TODAY. Deliberately not gated on `autonomous`: on
+                # 2026-08-08 the misses came from crons AND from interactive
+                # turns, and he asked for reconciliation on new information
+                # rather than a per-surface patch.
+                #
+                # Deliberately NOT recency-windowed either. check_freshness
+                # only runs inside freshness_window_minutes (15); the fast
+                # break was 7h29m old when the 21:00 check-in said "hour 47",
+                # so that gate was structurally unable to fire. Deterministic,
+                # no model call, fails open — see state_reconcile.py.
+                if msg_text and msg_text.strip():
+                    from .state_reconcile import block_reason, reconcile
+
+                    recent_rows = db.get_recent_messages(chat_id, limit=60)
+                    todays_user_msgs = [
+                        {
+                            "content": r.get("content", ""),
+                            "timestamp": r.get("timestamp", ""),
+                        }
+                        for r in recent_rows
+                        if r.get("sender_name") != settings.assistant_name
+                    ]
+                    sr = reconcile(msg_text, todays_user_msgs)
+                    if sr.error:
+                        bus.emit("state_reconcile_failopen", {"tool": tool_name, "error": sr.error})
+                    elif sr.blocked:
+                        log.warning(
+                            "state_reconcile_blocked",
+                            chat_id=chat_id,
+                            tool=tool_name,
+                            rule=sr.rule,
+                            quote=sr.quote,
+                            preview=msg_text[:100],
+                        )
+                        bus.emit(
+                            "state_reconcile_blocked",
+                            {
+                                "tool": tool_name,
+                                "rule": sr.rule,
+                                "quote": sr.quote,
+                                "preview": msg_text[:100],
+                            },
+                        )
+                        return {"decision": "block", "reason": block_reason(sr)}
 
                 # --- Recall-before-reference gate (autonomous only) ---
                 # If the draft references past events but no recall was called
