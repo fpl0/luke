@@ -60,6 +60,8 @@ from structlog.stdlib import BoundLogger
 from . import context, db, memory
 from .bus import bus
 from .config import settings
+from .db_query_gate import REASON as DB_QUERY_GATE_REASON
+from .db_query_gate import blocks_tool_input as blocks_db_query
 from .memory import MEMORY_DIRS, read_frontmatter, read_memory_body, sanitize_memory_id
 from .sdk_io import cli_stderr
 
@@ -2574,6 +2576,16 @@ async def run_agent(
             tool_name == "Bash" and _bash_reads_a_source(input_data["tool_input"])
         ):
             source_read_count["n"] += 1
+        # --- luke.db hand-query gate (all runs) ---
+        # Guessing luke.db's schema is the most repetitive self-inflicted
+        # failure in the log — 12 "no such column"/"no such table" errors in
+        # 30h on 2026-08-08, the same count q.sh's header cites from the two
+        # days BEFORE q.sh existed to end it. The wrapper shipped, the memory
+        # line shipped, the rate did not move. Enforce it instead.
+        if tool_name == "Bash" and blocks_db_query(input_data["tool_input"]):
+            log.warning("db_query_gate_blocked", chat_id=chat_id)
+            bus.emit("db_query_gate_blocked", {"chat_id": chat_id})
+            return {"decision": "block", "reason": DB_QUERY_GATE_REASON}
         # --- Background-work routing gate (interactive turns only) ---
         # Harness `Task` sub-agents are children of the per-turn client: they
         # die the moment Filipe sends his next message (the July 3 2026

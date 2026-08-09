@@ -25,6 +25,24 @@ mkdir -p "$LUKE_DIR"
 
 now=$(date +%s)
 sha=$(cd "$REPO_DIR" && git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+branch=$(cd "$REPO_DIR" && git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
+
+# ─── Off-main deploy detector ────────────────────────────────────────────────
+# The venv installs the repo EDITABLE (_editable_impl_luke.pth -> src/), so the
+# live process imports straight from the working tree. A tree left parked on a
+# feature branch therefore ships that branch on the next restart — with no test
+# run, no health check and no rollback, since none of that lives in the restart
+# path (only in deploy.sh). Found 2026-08-09: the tree had been sitting on
+# `state-reconciliation-gate` since 21:27 the night before, one watchdog
+# kickstart away from going live while I was calling it "not deployed".
+#
+# Restarting anyway is deliberate — refusing would leave Luke dead, which is
+# worse. Say it loudly instead, on every surface that gets read after a restart.
+if [[ "$branch" != "main" ]] && [[ "$branch" != "unknown" ]]; then
+    echo "[guardian $(date -Iseconds)] !!DEPLOY_OFF_MAIN!! branch=$branch sha=$sha — the live process is importing an unmerged working tree. Merge via ./deploy.sh or 'git checkout main'." >&2
+    echo "$now off_main $branch $sha" >> "$ROLLBACK_LOG"
+    echo "!!DEPLOY_OFF_MAIN!! branch=$branch sha=$sha $(date -Iseconds)" >> "$LUKE_DIR/restart_status.txt"
+fi
 
 # Count recent crashes for this SHA
 crash_count=0
@@ -75,7 +93,7 @@ if (( crash_count >= MAX_CRASHES )); then
         if git checkout "$known_good" -- . 2>/dev/null && \
            git commit -m "guardian: restore to known-good $known_good (crash loop on $sha)" 2>/dev/null; then
             new_sha=$(git rev-parse --short HEAD)
-            git push origin main 2>/dev/null || true
+            [[ "$branch" == "main" ]] && git push origin main 2>/dev/null || true
             echo "[guardian $(date -Iseconds)] Restored to known-good $known_good (was $sha) → $new_sha" >&2
             echo "$now restored $sha to_known_good $known_good" >> "$ROLLBACK_LOG"
             echo "rollback|$sha|$known_good|Restored to known-good commit ($crash_count crashes in ${WINDOW}s)" >> "$LUKE_DIR/crash_notifications"
@@ -88,7 +106,7 @@ if (( crash_count >= MAX_CRASHES )); then
         # Fallback: simple revert of HEAD
         if git revert --no-edit HEAD 2>/dev/null; then
             new_sha=$(git rev-parse --short HEAD)
-            git push origin main 2>/dev/null || true
+            [[ "$branch" == "main" ]] && git push origin main 2>/dev/null || true
             echo "[guardian $(date -Iseconds)] Rolled back $sha → $new_sha" >&2
             echo "$now rolled_back $sha to $new_sha" >> "$ROLLBACK_LOG"
             echo "rollback|$sha|$new_sha|$crash_count crashes in ${WINDOW}s" >> "$LUKE_DIR/crash_notifications"
