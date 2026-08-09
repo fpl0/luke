@@ -30,7 +30,7 @@ from claude_agent_sdk.types import (
 )
 from structlog.stdlib import BoundLogger
 
-from . import context, db, memory
+from . import context, db, inflight, memory
 from .agent import (
     _TG_MAX_MSG_LEN,
     _trunc,
@@ -1505,6 +1505,9 @@ async def main() -> None:
     _guardian_mark_healthy()
     await _send_crash_notifications()
     write_heartbeat("online")
+    # Clear any in-flight marker left behind by a process that was killed mid-run,
+    # so deploy.sh's drain doesn't read a dead run as "still busy".
+    inflight.reset()
     _fire_and_forget(_mark_known_good_after_delay())
     _mark("online")
 
