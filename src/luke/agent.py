@@ -57,7 +57,7 @@ from claude_agent_sdk.types import (
 from croniter import croniter
 from structlog.stdlib import BoundLogger
 
-from . import context, db, memory
+from . import context, db, inflight, memory
 from .bus import bus
 from .config import settings
 from .db_query_gate import REASON as DB_QUERY_GATE_REASON
@@ -2461,6 +2461,7 @@ def _resolve_model_id(model: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+@inflight.tracked
 async def run_agent(
     *,
     chat_id: str,
