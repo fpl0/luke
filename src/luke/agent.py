@@ -307,6 +307,7 @@ def _check_outbound_quality(text: str) -> str | None:
 
 
 _TG_MAX_MSG_LEN = 4096  # Telegram API hard limit
+_TG_MAX_CAPTION_LEN = 1024  # Telegram API hard limit for media captions
 _STREAMING_CURSOR = " ▍"  # visual typing indicator
 
 
@@ -460,6 +461,24 @@ async def send_long_message(
         await _send_chunk(bot, chat_id=chat_id, text=text[:cut] + "\n…", **kwargs)
         text = text[cut:].lstrip("\n")
     db.log_outbound(str(chat_id), content_hash, autonomous=autonomous)
+
+
+def split_caption(caption: str) -> tuple[str, str]:
+    """Split a media caption into (caption, overflow) against Telegram's 1024 cap.
+
+    Text messages auto-split at 4096; captions never did, and Telegram does not
+    truncate — it rejects the whole call with "Bad Request: message caption is
+    too long", so the FILE is lost along with the words. That is what happened
+    to the rebuilt fasting curriculum on 2026-08-08 22:07 UTC, and the failure
+    was then misread for a day as an outbound rate limiter.
+
+    The overflow is not cut at 1024: slicing a caption mid-``<b>`` breaks the
+    HTML parse and loses the message a second way. Over the cap, the media ships
+    bare and the whole caption follows through the normal chunked text path.
+    """
+    if len(caption) <= _TG_MAX_CAPTION_LEN:
+        return caption, ""
+    return "", caption
 
 
 _VALID_MEMORY_TYPES: frozenset[str] = frozenset(MEMORY_DIRS)
@@ -1252,11 +1271,14 @@ def _build_tools(chat_id: str, bot: Bot, autonomous: bool = True) -> Any:
         path = _safe_path(args["path"])
         if isinstance(path, str):
             return _ok(path)
+        caption, overflow = split_caption(args.get("caption", ""))
         await bot.send_photo(
             chat_id=_target(args),
             photo=FSInputFile(path),
-            caption=args.get("caption", ""),
+            caption=caption,
         )
+        if overflow:
+            await send_long_message(bot, _target(args), overflow)
         return _ok("Photo sent")
 
     @tool(
@@ -1269,11 +1291,14 @@ def _build_tools(chat_id: str, bot: Bot, autonomous: bool = True) -> Any:
         path = _safe_path(args["path"])
         if isinstance(path, str):
             return _ok(path)
+        caption, overflow = split_caption(args.get("caption", ""))
         await bot.send_document(
             chat_id=_target(args),
             document=FSInputFile(path),
-            caption=args.get("caption", ""),
+            caption=caption,
         )
+        if overflow:
+            await send_long_message(bot, _target(args), overflow)
         return _ok("Document sent")
 
     @tool(
@@ -1299,11 +1324,14 @@ def _build_tools(chat_id: str, bot: Bot, autonomous: bool = True) -> Any:
         path = _safe_path(args["path"])
         if isinstance(path, str):
             return _ok(path)
+        caption, overflow = split_caption(args.get("caption", ""))
         await bot.send_video(
             chat_id=_target(args),
             video=FSInputFile(path),
-            caption=args.get("caption", ""),
+            caption=caption,
         )
+        if overflow:
+            await send_long_message(bot, _target(args), overflow)
         return _ok("Video sent")
 
     @tool(

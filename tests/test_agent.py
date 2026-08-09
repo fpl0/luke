@@ -29,7 +29,9 @@ from luke.agent import (
     _bash_reads_a_source,
     _requests_source_read,
     _task_overlap,
+    _TG_MAX_CAPTION_LEN,
     send_long_message,
+    split_caption,
 )
 from luke.config import settings
 
@@ -3019,3 +3021,58 @@ class TestBashReadsASource:
     def test_malformed_input_is_false_not_raising(self) -> None:
         for junk in (None, {}, {"command": 123}, "notadict", []):
             assert _bash_reads_a_source(junk) is False
+
+
+# ---------------------------------------------------------------------------
+# split_caption — Telegram's 1024-char media caption cap
+# ---------------------------------------------------------------------------
+
+
+class TestSplitCaption:
+    """Regression cover for 2026-08-08 22:07 UTC.
+
+    ``send_document`` passed the caption straight through, Telegram answered
+    "Bad Request: message caption is too long", and the rebuilt fasting
+    curriculum PDF never arrived. Nothing was parked, because this is not the
+    budget path — so the failure read as an outbound rate limiter for a day.
+    """
+
+    def test_short_caption_rides_on_the_media(self) -> None:
+        assert split_caption("Here's the doc.") == ("Here's the doc.", "")
+
+    def test_empty_caption_is_valid_and_unchanged(self) -> None:
+        assert split_caption("") == ("", "")
+
+    def test_caption_exactly_at_the_cap_still_rides_along(self) -> None:
+        cap = "x" * _TG_MAX_CAPTION_LEN
+        assert split_caption(cap) == (cap, "")
+
+    def test_one_char_over_moves_the_whole_text_to_the_overflow(self) -> None:
+        cap = "x" * (_TG_MAX_CAPTION_LEN + 1)
+        caption, overflow = split_caption(cap)
+        assert caption == ""
+        assert overflow == cap
+
+    def test_nothing_is_lost_when_it_overflows(self) -> None:
+        """The point of the fix: every character still reaches him."""
+        cap = "word " * 400
+        caption, overflow = split_caption(cap)
+        assert caption + overflow == cap
+
+    def test_html_tags_are_never_split_mid_tag(self) -> None:
+        """Cutting at 1024 would break the parse and lose the message twice."""
+        cap = "<b>" + ("a" * 2000) + "</b>"
+        caption, overflow = split_caption(cap)
+        assert caption == ""
+        assert overflow.startswith("<b>") and overflow.endswith("</b>")
+
+
+class TestMediaHandlersUseTheSplitter:
+    """Defining the splitter is not the fix — the handlers must call it."""
+
+    def test_no_media_tool_passes_a_raw_caption_through(self) -> None:
+        src = Path(__file__).resolve().parents[1] / "src" / "luke" / "agent.py"
+        text = src.read_text()
+        assert 'caption=args.get("caption", "")' not in text
+        assert text.count('split_caption(args.get("caption", ""))') == 3
+        assert text.count("await send_long_message(bot, _target(args), overflow)") == 3
