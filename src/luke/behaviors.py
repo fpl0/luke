@@ -530,25 +530,6 @@ async def run_proactive_scan(bot: Bot, sem: asyncio.Semaphore) -> None:
     )
 
 
-def _latest_deep_work_summary(since_iso: str) -> str | None:
-    """First 300 chars of the session's own deep-work-log episode, if it saved one."""
-    try:
-        episodes = memory.recall(
-            mem_type="episode",
-            after=since_iso,
-            before=datetime.now(UTC).isoformat(),
-            limit=5,
-        )
-        for ep in episodes or []:
-            if "deep-work" in ep["id"]:
-                body = read_memory_body("episode", ep["id"], 300)
-                if body:
-                    return body.strip()
-    except Exception:
-        log.warning("deep_work_summary_lookup_failed")
-    return None
-
-
 def _parse_plan_status(goal_id: str) -> str | None:
     """Read a plan file and return its status (in_progress, blocked, paused, completed)."""
     plan_path = settings.workspace_dir / "plans" / f"{sanitize_memory_id(goal_id)}.md"
@@ -1061,9 +1042,12 @@ async def run_deep_work(bot: Bot, sem: asyncio.Semaphore) -> None:
                 lines.append(f"🎉 {gid} is COMPLETE.")
             elif after != before:
                 lines.append(f"{gid}: plan {before or 'none'} → {after or 'none'}")
-        summary = _latest_deep_work_summary(started_iso)
-        if summary:
-            lines.append(summary)
+        # The session's own episode is NOT appended here. It is a log I write for
+        # myself — engineering prose, headed like "the super-priority watch could
+        # not report its own blindness" — and piping its first 300 chars to
+        # Telegram put three of them in Filipe's chat on 9–10 Aug, one of them on
+        # his first morning at CarGurus. He asked "why are you keep restating?".
+        # A state change is news; my write-up of my own session never is.
         # Silence when nothing moved. The elapsed minutes are deliberately gone:
         # how long it took is telemetry, and it is already in the logs.
         if lines:
