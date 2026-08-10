@@ -824,7 +824,7 @@ class TestDeepWorkLifecycleNotifications:
     async def test_session_never_forwards_its_own_episode(self, tmp_settings: Any) -> None:
         """A deep-work log is written for me, not for him.
 
-        Regression guard for 9–10 Aug 2026: the first 300 chars of the session's
+        Regression guard for 9-10 Aug 2026: the first 300 chars of the session's
         own episode were piped to Telegram, so three engineering write-ups landed
         in his chat — one on his first morning at CarGurus.
         """

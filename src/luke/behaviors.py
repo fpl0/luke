@@ -1012,7 +1012,6 @@ async def run_deep_work(bot: Bot, sem: asyncio.Semaphore) -> None:
     # persona file forbids. What survives is the outcome: a plan that moved, or
     # a session that broke. A session that changed nothing now says nothing.
     statuses_before = {gid: _parse_plan_status(gid) for gid in active_goal_ids}
-    started_iso = datetime.now(UTC).isoformat()
     started_mono = time.monotonic()
 
     # The finally covers the whole session — the window that actually matters,
@@ -1059,7 +1058,7 @@ async def run_deep_work(bot: Bot, sem: asyncio.Semaphore) -> None:
         # The session's own episode is NOT appended here. It is a log I write for
         # myself — engineering prose, headed like "the super-priority watch could
         # not report its own blindness" — and piping its first 300 chars to
-        # Telegram put three of them in Filipe's chat on 9–10 Aug, one of them on
+        # Telegram put three of them in Filipe's chat on 9-10 Aug, one of them on
         # his first morning at CarGurus. He asked "why are you keep restating?".
         # A state change is news; my write-up of my own session never is.
         # Silence when nothing moved. The elapsed minutes are deliberately gone:
