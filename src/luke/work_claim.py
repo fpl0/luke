@@ -62,6 +62,7 @@ import time
 from collections.abc import Generator
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 import structlog
@@ -308,6 +309,89 @@ def current(goal_id: str) -> dict[str, Any] | None:
     if stale:
         return None
     return rec
+
+
+# Directories that churn for reasons that are not a peer session editing source: bytecode,
+# tool state files rewritten on every run, vendored assets, generated media. Listing those
+# would bury the two or three paths that actually matter, and a signal nobody reads is the
+# same as no signal.
+_EDIT_SCAN_PRUNE = frozenset(
+    {
+        "__pycache__",
+        ".git",
+        ".pytest_cache",
+        "node_modules",
+        ".venv",
+        "state",
+        "retired",
+        "piper-voices",
+        "media",
+        "backups",
+    }
+)
+_EDIT_SCAN_SUFFIXES = frozenset({".md", ".py", ".json", ".sh", ".txt", ".html", ".css", ".js"})
+_EDIT_WINDOW_SECONDS = 1200
+
+
+def recent_peer_edits(
+    root: Any,
+    *,
+    within_seconds: int = _EDIT_WINDOW_SECONDS,
+    limit: int = 12,
+    now: float | None = None,
+) -> list[tuple[str, int]]:
+    """Workspace files changed in the last *within_seconds*, newest first.
+
+    ``claim()`` only constrains the paths that ASK for a claim, and exactly one does: the
+    deep-work tick (``behaviors.py``). Everything else that edits the same files — the
+    goal-progress loop, the dated watch tasks, the Sunday audit — runs through the scheduler's
+    per-task dedup, which never fires across different task ids, and never touches this module
+    at all. So a claim can be held on every goal while a peer writes the very plan it protects.
+
+    Observed 2026-08-10: the 16:03Z deep-work tick was granted all five goals (luke.log,
+    ``work_claim_granted`` x5) and a peer wrote ``workspace/tools/calendar_state_check.py`` 33s
+    later and the CarGurus plan 104s after that. The session spent ~25 minutes independently
+    rediscovering a finding the peer was already implementing, and only noticed by chance, from
+    file mtimes. The same overlap had corrupted a test suite three hours earlier: two passes both
+    wrote ``test_macapp.py``, one calling the real probe, giving a suite whose result depended on
+    how it was invoked.
+
+    This is deliberately EVIDENCE, not cooperation. A claim requires the peer to opt in, which
+    is precisely what the uncovered paths do not do; an mtime is true whether or not anyone
+    agreed to it. Nothing here excludes or yields — a scheduled send must never be skipped
+    because a sibling holds a lock — it only tells a starting session where someone else's
+    hands already are.
+
+    Fails open to ``[]``: a blind spot here must never be able to stop a session running.
+    """
+    try:
+        base = Path(root)
+        cutoff = (time.time() if now is None else now) - max(1, int(within_seconds))
+        found: list[tuple[float, str]] = []
+        for dirpath, dirnames, filenames in os.walk(base):
+            dirnames[:] = [
+                d for d in dirnames if d not in _EDIT_SCAN_PRUNE and not d.startswith(".")
+            ]
+            for name in filenames:
+                if name.startswith(".") or Path(name).suffix not in _EDIT_SCAN_SUFFIXES:
+                    continue
+                full = Path(dirpath) / name
+                try:
+                    mtime = full.stat().st_mtime
+                except OSError:
+                    continue
+                if mtime >= cutoff:
+                    try:
+                        rel = str(full.relative_to(base))
+                    except ValueError:  # pragma: no cover - full is always under base
+                        rel = str(full)
+                    found.append((mtime, rel))
+        found.sort(reverse=True)
+        reference = time.time() if now is None else now
+        return [(rel, max(0, int(reference - m))) for m, rel in found[: max(0, limit)]]
+    except Exception as e:
+        log.warning("recent_peer_edits_failed", error=str(e))
+        return []
 
 
 @contextlib.contextmanager
