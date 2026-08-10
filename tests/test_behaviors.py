@@ -57,7 +57,7 @@ class TestRunConsolidation:
         ):
             mock_memory.recluster_offline.return_value = {"n_clusters": 0}
             mock_memory.get_consolidation_candidates.return_value = [cluster]
-            mock_agent.return_value = MagicMock(texts=[])
+            mock_agent.return_value = MagicMock(texts=[], is_error=False)
             await run_consolidation(AsyncMock(), _SEM)
 
         mock_agent.assert_called_once()
@@ -159,7 +159,7 @@ class TestRunReflection:
                 "by_sender": {},
                 "period_days": 7,
             }
-            mock_agent.return_value = MagicMock(texts=[])
+            mock_agent.return_value = MagicMock(texts=[], is_error=False)
             await run_reflection(AsyncMock(), _SEM)
 
         mock_agent.assert_called_once()
@@ -242,7 +242,7 @@ class TestRunProactiveScan:
             mock_db.get_message_summaries.return_value = [
                 {"date": "2024-01-01", "messages": ["User: hi"]}
             ]
-            mock_agent.return_value = MagicMock(texts=[])
+            mock_agent.return_value = MagicMock(texts=[], is_error=False)
             await run_proactive_scan(AsyncMock(), _SEM)
 
         mock_agent.assert_called_once()
@@ -261,7 +261,7 @@ class TestRunProactiveScan:
         ):
             mock_memory.recall.side_effect = [goals, [], []]
             mock_db.get_message_summaries.return_value = []
-            mock_agent.return_value = MagicMock(texts=[])
+            mock_agent.return_value = MagicMock(texts=[], is_error=False)
             await run_proactive_scan(AsyncMock(), _SEM)
 
         call_kwargs = mock_agent.call_args.kwargs
@@ -552,7 +552,7 @@ class TestRunDeepWork:
             mock_db.get_quality_blocked_goals.return_value = []
             mock_db.get_recent_quality_scores.return_value = []
             mock_memory.recall.return_value = goals
-            mock_agent.return_value = MagicMock(texts=[])
+            mock_agent.return_value = MagicMock(texts=[], is_error=False)
             await run_deep_work(AsyncMock(), _SEM)
 
         mock_agent.assert_called_once()
@@ -678,7 +678,7 @@ class TestDeepWorkPeerYield:
 
         async def _agent(*_a: Any, **_kw: Any) -> Any:
             held_during.append(work_claim.current("g1"))
-            return MagicMock(texts=[])
+            return MagicMock(texts=[], is_error=False)
 
         with (
             patch("luke.behaviors.db") as mock_db,
@@ -741,7 +741,7 @@ class TestDeepWorkPeerYield:
             mock_db.get_quality_blocked_goals.return_value = []
             mock_db.get_recent_quality_scores.return_value = []
             mock_memory.recall.return_value = goals
-            mock_agent.return_value = MagicMock(texts=[])
+            mock_agent.return_value = MagicMock(texts=[], is_error=False)
             await run_deep_work(AsyncMock(), _SEM)
 
         mock_agent.assert_called_once()
@@ -766,27 +766,42 @@ class TestDeepWorkLifecycleNotifications:
         )
         return [{"id": "g1", "type": "goal", "title": "Goal 1", "score": 1.0}]
 
-    async def _run(self, tmp_settings: Any, summary: str | None = None) -> list[str]:
+    async def _run(self, tmp_settings: Any, plan_status: str | None = None) -> list[str]:
         from luke.behaviors import run_deep_work
 
         goals = self._goal_fixture(tmp_settings)
+        # None before the session, `plan_status` after it — the shape of a real
+        # state change, which is the only thing a session is allowed to announce.
+        # Flipped by the agent mock rather than by a call counter: _parse_plan_status
+        # is also called during goal selection, so an iterator gets eaten upstream.
+        ran = {"yet": False}
+
+        async def _agent(*_a: Any, **_kw: Any) -> Any:
+            ran["yet"] = True
+            # is_error must be set explicitly: _run_behavior branches on it, and a
+            # bare MagicMock auto-creates a *truthy* attribute, which would send
+            # every one of these sessions down the dead-run path.
+            return MagicMock(texts=[], is_error=False)
+
         with (
             patch("luke.behaviors.db") as mock_db,
             patch("luke.behaviors.bus"),
             patch("luke.behaviors.memory") as mock_memory,
-            patch("luke.behaviors.run_agent", new_callable=AsyncMock) as mock_agent,
-            patch("luke.behaviors._latest_deep_work_summary", return_value=summary),
+            patch("luke.behaviors.run_agent", side_effect=_agent),
+            patch(
+                "luke.behaviors._parse_plan_status",
+                side_effect=lambda _gid: plan_status if ran["yet"] else None,
+            ),
             patch("luke.behaviors.send_long_message", new_callable=AsyncMock) as mock_send,
         ):
             mock_db.get_quality_blocked_goals.return_value = []
             mock_db.get_recent_quality_scores.return_value = []
             mock_memory.recall.return_value = goals
-            mock_agent.return_value = MagicMock(texts=[])
             await run_deep_work(AsyncMock(), _SEM)
         return [c.args[2] for c in mock_send.call_args_list]
 
     async def test_session_that_moved_nothing_says_nothing(self, tmp_settings: Any) -> None:
-        """No plan change and no summary means silence.
+        """No plan change means silence.
 
         The old code sent "🔨 starting" and "✅ done (16m)" unconditionally —
         20 such messages in 30 days, none carrying an outcome. Telling Filipe a
@@ -795,16 +810,32 @@ class TestDeepWorkLifecycleNotifications:
         texts = await self._run(tmp_settings)
         assert texts == []
 
-    async def test_session_that_produced_something_reports_it(self, tmp_settings: Any) -> None:
-        """The deterministic notice survives — it just needs an outcome.
+    async def test_session_that_moved_a_plan_reports_it(self, tmp_settings: Any) -> None:
+        """The deterministic notice survives — it just needs a real state change.
 
         This is the half that must not regress: the agent left ~10/12
         autonomous sessions unannounced on its own.
         """
-        texts = await self._run(tmp_settings, summary="Shipped the parser.")
-        assert any("Shipped the parser." in t for t in texts)
+        texts = await self._run(tmp_settings, plan_status="completed")
+        assert any("g1" in t for t in texts)
         # Elapsed minutes are telemetry, and they are already in the logs.
         assert not any("m)." in t for t in texts)
+
+    async def test_session_never_forwards_its_own_episode(self, tmp_settings: Any) -> None:
+        """A deep-work log is written for me, not for him.
+
+        Regression guard for 9-10 Aug 2026: the first 300 chars of the session's
+        own episode were piped to Telegram, so three engineering write-ups landed
+        in his chat — one on his first morning at CarGurus.
+        """
+        episode = "# Deep work 10 Aug — the super-priority watch could not report its blindness"
+        (tmp_settings.memory_dir / "episodes").mkdir(parents=True, exist_ok=True)
+        (tmp_settings.memory_dir / "episodes" / "2026-08-10-deep-work.md").write_text(
+            f"---\nid: 2026-08-10-deep-work\ntype: episode\n---\n\n{episode}"
+        )
+        texts = await self._run(tmp_settings, plan_status="completed")
+        assert not any("super-priority" in t for t in texts)
+        assert not any("Deep work 10 Aug" in t for t in texts)
 
     async def test_failed_session_notifies(self, tmp_settings: Any) -> None:
         """A dead session is announced, not silently swallowed."""

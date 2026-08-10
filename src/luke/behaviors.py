@@ -75,6 +75,20 @@ async def _run_behavior(
                 ),
                 timeout=timeout if timeout is not None else settings.agent_timeout,
             )
+        if result.is_error:
+            # A dead run is not a completed behavior. Without this it logged
+            # `{name}_done` at info with the API's error string sitting in
+            # `response_preview` — which is exactly how the 2026-08-09/10 auth
+            # outage stayed invisible through deep work, the proactive scan and
+            # the dream, all three of which "finished" successfully all night.
+            log.error(
+                f"{name}_agent_error",
+                subtype=result.error_subtype,
+                detail=result.error_detail,
+                duration_s=round(time.monotonic() - started, 1),
+                **log_fields,
+            )
+            return None
         log.info(
             f"{name}_done",
             responses=len(result.texts),
@@ -528,25 +542,6 @@ async def run_proactive_scan(bot: Bot, sem: asyncio.Semaphore) -> None:
         urgent=True,
         sections=len(sections),
     )
-
-
-def _latest_deep_work_summary(since_iso: str) -> str | None:
-    """First 300 chars of the session's own deep-work-log episode, if it saved one."""
-    try:
-        episodes = memory.recall(
-            mem_type="episode",
-            after=since_iso,
-            before=datetime.now(UTC).isoformat(),
-            limit=5,
-        )
-        for ep in episodes or []:
-            if "deep-work" in ep["id"]:
-                body = read_memory_body("episode", ep["id"], 300)
-                if body:
-                    return body.strip()
-    except Exception:
-        log.warning("deep_work_summary_lookup_failed")
-    return None
 
 
 def _parse_plan_status(goal_id: str) -> str | None:
@@ -1017,7 +1012,6 @@ async def run_deep_work(bot: Bot, sem: asyncio.Semaphore) -> None:
     # persona file forbids. What survives is the outcome: a plan that moved, or
     # a session that broke. A session that changed nothing now says nothing.
     statuses_before = {gid: _parse_plan_status(gid) for gid in active_goal_ids}
-    started_iso = datetime.now(UTC).isoformat()
     started_mono = time.monotonic()
 
     # The finally covers the whole session — the window that actually matters,
@@ -1061,9 +1055,12 @@ async def run_deep_work(bot: Bot, sem: asyncio.Semaphore) -> None:
                 lines.append(f"🎉 {gid} is COMPLETE.")
             elif after != before:
                 lines.append(f"{gid}: plan {before or 'none'} → {after or 'none'}")
-        summary = _latest_deep_work_summary(started_iso)
-        if summary:
-            lines.append(summary)
+        # The session's own episode is NOT appended here. It is a log I write for
+        # myself — engineering prose, headed like "the super-priority watch could
+        # not report its own blindness" — and piping its first 300 chars to
+        # Telegram put three of them in Filipe's chat on 9-10 Aug, one of them on
+        # his first morning at CarGurus. He asked "why are you keep restating?".
+        # A state change is news; my write-up of my own session never is.
         # Silence when nothing moved. The elapsed minutes are deliberately gone:
         # how long it took is telemetry, and it is already in the logs.
         if lines:

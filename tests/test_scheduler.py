@@ -288,6 +288,7 @@ class TestRunTask:
         mock_result = MagicMock()
         mock_result.texts = ["Task output"]
         mock_result.sent_messages = 0
+        mock_result.is_error = False
 
         task = _task(schedule_type="cron")
 
@@ -308,6 +309,7 @@ class TestRunTask:
         mock_result = MagicMock()
         mock_result.texts = []
         mock_result.sent_messages = 0
+        mock_result.is_error = False
         mock_result.cost_usd = 1.23
         mock_result.num_turns = 4
         mock_result.duration_api_ms = 5678
@@ -334,6 +336,7 @@ class TestRunTask:
         mock_bot = AsyncMock()
         mock_result = MagicMock()
         mock_result.texts = []
+        mock_result.is_error = False
 
         task = _task(schedule_type="once", schedule_value=datetime.now(UTC).isoformat())
 
@@ -380,6 +383,108 @@ class TestRunTask:
             await _run_task(task, mock_bot)
 
         mock_db.update_task_status.assert_called_once_with("test-id", "completed")
+
+    async def test_dead_agent_run_is_not_logged_ok(self) -> None:
+        """A run that came back is_error must never be recorded as "ok".
+
+        On 2026-08-09/10 an auth outage ("Your organization has disabled Claude
+        subscription access for Claude Code") returned a ResultMessage with
+        zero usage for ~9 hours. run_agent did not raise, so 36 scheduled runs
+        — including the weekly CarGurus reqs watch on its first ever fire and
+        that Monday morning's briefing — were logged "ok" with their failure
+        counters reset. Nothing warned. If this test goes green on the old
+        code path, the outage is invisible again.
+        """
+        mock_bot = AsyncMock()
+        mock_result = MagicMock()
+        mock_result.texts = ["Your organization has disabled Claude subscription access"]
+        mock_result.sent_messages = 0
+        mock_result.is_error = True
+        mock_result.error_subtype = "error_during_execution"
+        mock_result.error_detail = "Your organization has disabled Claude subscription access"
+
+        task = _task(schedule_type="cron")
+
+        with (
+            patch("luke.scheduler.run_agent", return_value=mock_result),
+            patch("luke.scheduler.db") as mock_db,
+        ):
+            mock_db.increment_task_failures.return_value = 1
+            await _run_task(task, mock_bot)
+
+        logged_result = mock_db.log_task_run.call_args[0][3]
+        assert logged_result.startswith("error:")
+        assert "is_error" in logged_result
+        assert "disabled Claude subscription access" in logged_result
+        mock_db.increment_task_failures.assert_called_once()
+        mock_db.reset_task_failures.assert_not_called()
+
+    async def test_dead_run_does_not_log_cost_as_a_real_run(self) -> None:
+        """A dead run bills nothing; recording it pollutes the cost baseline
+        the anomaly detector reads."""
+        mock_bot = AsyncMock()
+        mock_result = MagicMock()
+        mock_result.texts = []
+        mock_result.is_error = True
+        mock_result.error_subtype = "zero_usage"
+        mock_result.error_detail = "no usage, no tools, no text"
+
+        task = _task(schedule_type="cron")
+
+        with (
+            patch("luke.scheduler.run_agent", return_value=mock_result),
+            patch("luke.scheduler.db") as mock_db,
+        ):
+            mock_db.increment_task_failures.return_value = 1
+            await _run_task(task, mock_bot)
+
+        mock_db.log_cost.assert_not_called()
+
+    async def test_dead_once_task_does_not_retry_storm(self) -> None:
+        """A once-task that died still gets closed out — the failure path owns
+        that, and routing dead runs through it is why they raise rather than
+        return early."""
+        mock_bot = AsyncMock()
+        mock_result = MagicMock()
+        mock_result.texts = []
+        mock_result.is_error = True
+        mock_result.error_subtype = "zero_usage"
+        mock_result.error_detail = "dead"
+
+        task = _task(schedule_type="once", schedule_value=datetime.now(UTC).isoformat())
+
+        with (
+            patch("luke.scheduler.run_agent", return_value=mock_result),
+            patch("luke.scheduler.db") as mock_db,
+        ):
+            mock_db.increment_task_failures.return_value = 1
+            await _run_task(task, mock_bot)
+
+        mock_db.update_task_status.assert_called_once_with("test-id", "completed")
+        mock_db.update_task_last_run.assert_called_once()
+
+    async def test_failure_alert_is_throttled_not_per_run(self) -> None:
+        """Alert on the third strike, then once per 24. Unthrottled, a 15-minute
+        cron in a nine-hour outage sends ~33 identical alarms overnight — which
+        is how a real alarm gets muted."""
+        task = _task(schedule_type="cron")
+
+        async def run_with_failure_count(count: int) -> int:
+            mock_bot = AsyncMock()
+            with (
+                patch("luke.scheduler.run_agent", side_effect=RuntimeError("boom")),
+                patch("luke.scheduler.db") as mock_db,
+            ):
+                mock_db.increment_task_failures.return_value = count
+                await _run_task(task, mock_bot)
+            return mock_bot.send_message.await_count
+
+        assert await run_with_failure_count(2) == 0
+        assert await run_with_failure_count(3) == 1
+        assert await run_with_failure_count(4) == 0
+        assert await run_with_failure_count(23) == 0
+        assert await run_with_failure_count(24) == 1
+        assert await run_with_failure_count(48) == 1
 
 
 # ---------------------------------------------------------------------------

@@ -30,6 +30,7 @@ from luke.agent import (
     _requests_source_read,
     _task_overlap,
     _TG_MAX_CAPTION_LEN,
+    mark_dead_run,
     send_long_message,
     split_caption,
 )
@@ -3076,3 +3077,55 @@ class TestMediaHandlersUseTheSplitter:
         assert 'caption=args.get("caption", "")' not in text
         assert text.count('split_caption(args.get("caption", ""))') == 3
         assert text.count("await send_long_message(bot, _target(args), overflow)") == 3
+
+
+# ---------------------------------------------------------------------------
+# mark_dead_run — a run that did not happen must not look like a quiet success
+# ---------------------------------------------------------------------------
+
+
+class TestMarkDeadRun:
+    """Regression cover for the 2026-08-09/10 silent auth outage.
+
+    For ~9 hours every agent run returned a ResultMessage carrying "Your
+    organization has disabled Claude subscription access for Claude Code" with
+    usage zeroed on all four axes. run_agent did not raise, so 36 scheduled
+    runs were recorded "ok" — the morning briefing on Filipe's first day at
+    CarGurus and the weekly reqs watch on its first ever fire among them.
+    """
+
+    def test_zero_usage_no_tools_is_an_error(self) -> None:
+        r = AgentResult(texts=["Your organization has disabled Claude subscription access"])
+        mark_dead_run(r)
+        assert r.is_error is True
+        assert r.error_subtype == "zero_usage"
+        assert "disabled Claude subscription access" in (r.error_detail or "")
+
+    def test_zero_usage_with_no_text_still_flagged(self) -> None:
+        r = AgentResult()
+        mark_dead_run(r)
+        assert r.is_error is True
+        assert r.error_detail == "no usage, no tools, no text"
+
+    def test_cache_read_alone_is_a_real_run(self) -> None:
+        """The system prompt always bills cache_read — a genuinely silent
+        success looks like this and must stay clean."""
+        r = AgentResult(cache_read_tokens=207_800)
+        mark_dead_run(r)
+        assert r.is_error is False
+
+    def test_output_tokens_alone_is_a_real_run(self) -> None:
+        r = AgentResult(output_tokens=42)
+        mark_dead_run(r)
+        assert r.is_error is False
+
+    def test_tool_use_with_no_usage_is_a_real_run(self) -> None:
+        r = AgentResult(tool_uses=3)
+        mark_dead_run(r)
+        assert r.is_error is False
+
+    def test_existing_error_is_not_overwritten(self) -> None:
+        r = AgentResult(is_error=True, error_subtype="error_during_execution", error_detail="401")
+        mark_dead_run(r)
+        assert r.error_subtype == "error_during_execution"
+        assert r.error_detail == "401"

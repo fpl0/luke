@@ -1204,11 +1204,59 @@ class AgentResult:
     # similarity work, which is cost with no signal over standing context.
     injected_ids: list[str] = field(default_factory=list)
     recalled_ids: list[str] = field(default_factory=list)
+    # Set when the SDK's ResultMessage came back with is_error. Before this
+    # existed an errored run was indistinguishable from a successful silent
+    # one: usage came back all-zero, the error string landed in `texts`, and
+    # for a scheduled task texts are never delivered — so it was dropped and
+    # the run logged "ok". On 2026-08-09/10 that hid a ~9h auth outage
+    # ("Your organization has disabled Claude subscription access for Claude
+    # Code") across 36 runs, including the Monday-morning briefing and the
+    # weekly reqs watch on its first ever fire. Every caller must branch on
+    # this rather than on "did I get any text back".
+    is_error: bool = False
+    error_subtype: str | None = None
+    error_detail: str | None = None
 
 
 # ---------------------------------------------------------------------------
 # MCP tools — built per invocation so they close over group context + bot
 # ---------------------------------------------------------------------------
+
+
+def mark_dead_run(result: AgentResult, chat_id: str = "") -> AgentResult:
+    """Flag a run that reported no work on any axis as an error.
+
+    Belt and braces, deliberately not trusting the SDK's ``is_error`` alone: a
+    run that billed nothing on every token axis and touched no tool did not
+    happen, whatever it was labelled. A real run always bills cache_read at
+    minimum — the system prompt goes out every time — so this cannot fire on a
+    genuinely silent success.
+
+    This is the shape the 2026-08-09/10 auth outage actually presented as in
+    the logs (``input=0 output=0 cache_create=0 cache_read=0``), and unlike a
+    string match on the provider's error text it is provider-agnostic.
+    """
+    if result.is_error:
+        return result
+    if result.tool_uses or (
+        result.input_tokens
+        or result.output_tokens
+        or result.cache_create_tokens
+        or result.cache_read_tokens
+    ):
+        return result
+    result.is_error = True
+    result.error_subtype = result.error_subtype or "zero_usage"
+    result.error_detail = result.error_detail or (
+        result.texts[0][:400] if result.texts else "no usage, no tools, no text"
+    )
+    log.error(
+        "agent_zero_usage",
+        chat_id=chat_id,
+        detail=result.error_detail,
+        turns=result.num_turns,
+    )
+    return result
 
 
 def _build_tools(chat_id: str, bot: Bot, autonomous: bool = True) -> Any:
@@ -3308,6 +3356,18 @@ async def run_agent(
                             cache_create=result.cache_create_tokens,
                             cache_read=result.cache_read_tokens,
                         )
+                    if getattr(msg, "is_error", False):
+                        result.is_error = True
+                        result.error_subtype = getattr(msg, "subtype", None)
+                        result.error_detail = (msg.result or "")[:400]
+                        log.error(
+                            "agent_result_error",
+                            chat_id=chat_id,
+                            subtype=result.error_subtype,
+                            api_error_status=getattr(msg, "api_error_status", None),
+                            detail=result.error_detail,
+                            turns=result.num_turns,
+                        )
                     if msg.result:
                         text = _INTERNAL_RE.sub("", msg.result).strip()
                         text = _INTERNAL_OPEN_RE.sub("", text).strip()
@@ -3320,6 +3380,7 @@ async def run_agent(
 
     result.sent_messages = send_count["n"]
     result.tool_uses = tool_count["n"]
+    mark_dead_run(result, chat_id)
     # Subagents that started but never stopped were killed by the turn ending
     # (timeout/interrupt/teardown). Surface it — a dead subagent must never be
     # indistinguishable from a finished one.
