@@ -44,6 +44,15 @@ log: BoundLogger = structlog.get_logger()
 _wake = asyncio.Event()
 
 
+class AgentRunFailed(RuntimeError):
+    """The agent run returned without raising, but did not actually happen.
+
+    Raised so a dead run flows through the same failure path as a crash —
+    logged, counted, backed off, and reported — instead of being recorded
+    as a successful silent run.
+    """
+
+
 def wake() -> None:
     """Wake the scheduler loop now — the next due-check runs immediately."""
     _wake.set()
@@ -201,6 +210,18 @@ async def _run_task(task: TaskRecord, bot: Bot) -> None:
             timeout=settings.agent_timeout,
         )
 
+        # The run can come back dead without raising — auth failure, API error,
+        # or zero usage with no tools. Route it into the failure path below
+        # rather than recording "ok": task_logs is the surface every later
+        # audit reads, and a lying "ok" is worse than a missing row.
+        # (2026-08-09/10: 36 dead runs across ~9h all logged "ok", including
+        # the weekly reqs watch on its first ever fire and that Monday's
+        # morning briefing. Nothing anywhere said a word.)
+        if result.is_error:
+            raise AgentRunFailed(
+                f"agent returned is_error[{result.error_subtype}]: {result.error_detail}"
+            )
+
         finished = datetime.now(UTC).isoformat()
         db.log_task_run(task_id, started, finished, "ok")
         db.reset_task_failures(task_id)
@@ -241,7 +262,11 @@ async def _run_task(task: TaskRecord, bot: Bot) -> None:
         db.log_task_run(task_id, started, finished, f"error: {detail}")
         log.exception("Task failed", task_id=task_id)
         count = db.increment_task_failures(task_id)
-        if count >= 3:
+        # Alert on the third strike, then only once per 24 further failures.
+        # Unthrottled this fires every run: a 15-minute cron in a nine-hour
+        # outage would have sent ~33 identical alarms overnight, which is how
+        # a real alarm gets muted. Once loudly, then a heartbeat.
+        if count == 3 or (count > 3 and count % 24 == 0):
             try:
                 await bot.send_message(
                     chat_id=int(settings.chat_id),

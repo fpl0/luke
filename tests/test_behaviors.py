@@ -57,7 +57,7 @@ class TestRunConsolidation:
         ):
             mock_memory.recluster_offline.return_value = {"n_clusters": 0}
             mock_memory.get_consolidation_candidates.return_value = [cluster]
-            mock_agent.return_value = MagicMock(texts=[])
+            mock_agent.return_value = MagicMock(texts=[], is_error=False)
             await run_consolidation(AsyncMock(), _SEM)
 
         mock_agent.assert_called_once()
@@ -159,7 +159,7 @@ class TestRunReflection:
                 "by_sender": {},
                 "period_days": 7,
             }
-            mock_agent.return_value = MagicMock(texts=[])
+            mock_agent.return_value = MagicMock(texts=[], is_error=False)
             await run_reflection(AsyncMock(), _SEM)
 
         mock_agent.assert_called_once()
@@ -242,7 +242,7 @@ class TestRunProactiveScan:
             mock_db.get_message_summaries.return_value = [
                 {"date": "2024-01-01", "messages": ["User: hi"]}
             ]
-            mock_agent.return_value = MagicMock(texts=[])
+            mock_agent.return_value = MagicMock(texts=[], is_error=False)
             await run_proactive_scan(AsyncMock(), _SEM)
 
         mock_agent.assert_called_once()
@@ -261,7 +261,7 @@ class TestRunProactiveScan:
         ):
             mock_memory.recall.side_effect = [goals, [], []]
             mock_db.get_message_summaries.return_value = []
-            mock_agent.return_value = MagicMock(texts=[])
+            mock_agent.return_value = MagicMock(texts=[], is_error=False)
             await run_proactive_scan(AsyncMock(), _SEM)
 
         call_kwargs = mock_agent.call_args.kwargs
@@ -552,7 +552,7 @@ class TestRunDeepWork:
             mock_db.get_quality_blocked_goals.return_value = []
             mock_db.get_recent_quality_scores.return_value = []
             mock_memory.recall.return_value = goals
-            mock_agent.return_value = MagicMock(texts=[])
+            mock_agent.return_value = MagicMock(texts=[], is_error=False)
             await run_deep_work(AsyncMock(), _SEM)
 
         mock_agent.assert_called_once()
@@ -678,7 +678,7 @@ class TestDeepWorkPeerYield:
 
         async def _agent(*_a: Any, **_kw: Any) -> Any:
             held_during.append(work_claim.current("g1"))
-            return MagicMock(texts=[])
+            return MagicMock(texts=[], is_error=False)
 
         with (
             patch("luke.behaviors.db") as mock_db,
@@ -741,7 +741,7 @@ class TestDeepWorkPeerYield:
             mock_db.get_quality_blocked_goals.return_value = []
             mock_db.get_recent_quality_scores.return_value = []
             mock_memory.recall.return_value = goals
-            mock_agent.return_value = MagicMock(texts=[])
+            mock_agent.return_value = MagicMock(texts=[], is_error=False)
             await run_deep_work(AsyncMock(), _SEM)
 
         mock_agent.assert_called_once()
@@ -781,7 +781,7 @@ class TestDeepWorkLifecycleNotifications:
             mock_db.get_quality_blocked_goals.return_value = []
             mock_db.get_recent_quality_scores.return_value = []
             mock_memory.recall.return_value = goals
-            mock_agent.return_value = MagicMock(texts=[])
+            mock_agent.return_value = MagicMock(texts=[], is_error=False)
             await run_deep_work(AsyncMock(), _SEM)
         return [c.args[2] for c in mock_send.call_args_list]
 
