@@ -75,6 +75,20 @@ async def _run_behavior(
                 ),
                 timeout=timeout if timeout is not None else settings.agent_timeout,
             )
+        if result.is_error:
+            # A dead run is not a completed behavior. Without this it logged
+            # `{name}_done` at info with the API's error string sitting in
+            # `response_preview` — which is exactly how the 2026-08-09/10 auth
+            # outage stayed invisible through deep work, the proactive scan and
+            # the dream, all three of which "finished" successfully all night.
+            log.error(
+                f"{name}_agent_error",
+                subtype=result.error_subtype,
+                detail=result.error_detail,
+                duration_s=round(time.monotonic() - started, 1),
+                **log_fields,
+            )
+            return None
         log.info(
             f"{name}_done",
             responses=len(result.texts),

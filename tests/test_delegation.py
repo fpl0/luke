@@ -208,6 +208,7 @@ class TestDelegationRelay:
         result = MagicMock()
         result.texts = ["dropped text"]
         result.sent_messages = 0
+        result.is_error = False
 
         task: TaskRecord = {
             "id": "cron-1",
