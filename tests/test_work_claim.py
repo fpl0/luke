@@ -225,3 +225,69 @@ def test_release_with_no_token_leaves_a_peers_claim_intact(store: Any) -> None:
     assert still is not None and still["holder"] == "real holder"
     # The real holder can still release normally.
     assert work_claim.release("goal-x", peer.token) is True
+
+
+# --- recent_peer_edits: the half a claim structurally cannot cover -------------------
+#
+# claim() binds only callers that ask for a claim, and the deep-work tick is the only one.
+# The goal-progress loop and the dated watch tasks edit the same plans through the
+# scheduler, whose dedup is per task id, so they never collide with a claim at all. These
+# tests pin the evidence-based fallback: mtimes are true whether or not a peer opted in.
+
+
+def _touch(path: Path, age_seconds: float, now: float) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("x")
+    stamp = now - age_seconds
+    os.utime(path, (stamp, stamp))
+
+
+def test_recent_peer_edits_reports_a_live_peer_write(tmp_path: Path) -> None:
+    """The real 2026-08-10 collision: a peer wrote the plan 104s into this session."""
+    now = time.time()
+    _touch(tmp_path / "plans" / "goal-cargurus-first-90-days.md", 104, now)
+    edits = work_claim.recent_peer_edits(tmp_path, now=now)
+    assert edits == [("plans/goal-cargurus-first-90-days.md", 104)]
+
+
+def test_recent_peer_edits_is_empty_when_nothing_is_in_flight(tmp_path: Path) -> None:
+    """Silence is the common case and must produce no prompt noise at all."""
+    now = time.time()
+    _touch(tmp_path / "plans" / "old.md", 4000, now)
+    assert work_claim.recent_peer_edits(tmp_path, now=now) == []
+
+
+def test_recent_peer_edits_orders_newest_first_and_caps(tmp_path: Path) -> None:
+    now = time.time()
+    for i in range(5):
+        _touch(tmp_path / "tools" / f"t{i}.py", 60 * (i + 1), now)
+    edits = work_claim.recent_peer_edits(tmp_path, now=now, limit=3)
+    assert [p for p, _ in edits] == ["tools/t0.py", "tools/t1.py", "tools/t2.py"]
+
+
+def test_recent_peer_edits_prunes_churn_that_is_not_a_peer(tmp_path: Path) -> None:
+    """Bytecode and tool state files rewrite on every run.
+
+    Listing them buries the two paths that matter, and a signal nobody reads is the same
+    as no signal — the lesson evening_slot_owner.py already paid for.
+    """
+    now = time.time()
+    _touch(tmp_path / "tools" / "__pycache__" / "x.py", 10, now)
+    _touch(tmp_path / "tools" / "state" / "cargurus_reqs.json", 10, now)
+    _touch(tmp_path / "media" / "clip.json", 10, now)
+    _touch(tmp_path / "tools" / "real.py", 10, now)
+    assert work_claim.recent_peer_edits(tmp_path, now=now) == [("tools/real.py", 10)]
+
+
+def test_recent_peer_edits_ignores_binaries_and_dotfiles(tmp_path: Path) -> None:
+    now = time.time()
+    _touch(tmp_path / "projects" / "doc.pdf", 10, now)
+    _touch(tmp_path / "projects" / ".hidden.md", 10, now)
+    _touch(tmp_path / "projects" / "doc.md", 10, now)
+    assert work_claim.recent_peer_edits(tmp_path, now=now) == [("projects/doc.md", 10)]
+
+
+def test_recent_peer_edits_fails_open_on_a_broken_root(tmp_path: Path) -> None:
+    """A blind spot here must never be able to stop a session from running."""
+    assert work_claim.recent_peer_edits(tmp_path / "does-not-exist") == []
+    assert work_claim.recent_peer_edits(None) == []

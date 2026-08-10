@@ -654,6 +654,38 @@ async def enforce_plan_momentum(bot: Bot) -> int:
     return acted
 
 
+def _peer_edit_block() -> str:
+    """Tell a starting session where a sibling's hands already are.
+
+    ``work_claim`` only binds callers that ask for a claim, and the deep-work tick is the
+    only one. The goal-progress loop and every dated watch task edit the same plans and tools
+    through the scheduler, whose dedup is per task id and so never fires across them. The
+    result is a session holding a claim on all five goals while a peer rewrites the plan it
+    just claimed — observed 2026-08-10, at the cost of ~25 minutes spent rediscovering a
+    finding the peer was mid-way through implementing.
+
+    Every path listed here changed BEFORE this session existed, so none of it is the reading
+    session's own work. Advisory by design: it never withholds a goal, because a scheduled
+    send must not be skipped just because a sibling is editing a file.
+    """
+    edits = work_claim.recent_peer_edits(settings.workspace_dir)
+    if not edits:
+        return ""
+    lines = "\n".join(
+        f"- {path} ({age // 60}m {age % 60}s ago)" if age >= 60 else f"- {path} ({age}s ago)"
+        for path, age in edits
+    )
+    return (
+        "\n\nANOTHER SESSION MAY BE MID-FLIGHT. These workspace files changed in the last "
+        "20 minutes, before this session started — so none of them are yours:\n"
+        f"{lines}\n"
+        "Re-read any of these before editing, and prefer different work over racing a peer: "
+        "two passes writing the same file has already cost a corrupted test suite and a "
+        "duplicated session. If the file you were about to work on is listed, that is a "
+        "strong signal to pick something else."
+    )
+
+
 async def _run_attention_deep_work(bot: Bot, sem: asyncio.Semaphore, *, reason: str) -> bool:
     """Fallback deep work when no goals are eligible: drive from active-attention pins.
 
@@ -694,6 +726,7 @@ async def _run_attention_deep_work(bot: Bot, sem: asyncio.Semaphore, *, reason: 
         "Active-attention pins (these are the things Filipe said matter):\n"
         + "\n".join(pin_lines)
         + engagement_block
+        + _peer_edit_block()
         + "\n\n"
         "Select ONE pin and do real work against it. Prefer concrete artifacts "
         "(findings, fixes, prep docs) over meta-work (entity cleanup, cron "
@@ -917,6 +950,7 @@ async def run_deep_work(bot: Bot, sem: asyncio.Semaphore) -> None:
             else ""
         )
         + engagement_block
+        + _peer_edit_block()
         + "\n\n"
         "Phase 1 — PLAN (do this first):\n"
         "1. Pick the highest-priority goal — a goal whose plan is marked STALLED "
