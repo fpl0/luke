@@ -29,6 +29,18 @@
 #      launchd's ExitTimeOut is what bounds that drain, and an agent turn runs
 #      5–15 minutes.  Waiting for idle before the kickstart is the actual fix;
 #      the raised ExitTimeOut in com.luke.plist only widens the safety margin.
+#
+#  (c) KILLING A LIVE CONVERSATION (found 2026-08-11, after Filipe asked "why do
+#      you keep restarting?!").  (b) only ever asked "is a turn EXECUTING right
+#      now?" — and the pause between his message and the reply, or between two of
+#      his messages, is precisely idle.  So the drain reported "Luke is idle —
+#      safe to restart" and killed the exchange between turns.  A restart calls
+#      db.clear_sessions(), so the next message arrives with NO transcript: he is
+#      mid-thought and Luke has forgotten the thread.  That is what a "restart"
+#      looks like from his side, and it happened five times on 10 Aug alone —
+#      the last at 01:06, twenty minutes before he complained.
+#      Fix: the drain now also waits for the CONVERSATION to go quiet
+#      (CONVERSATION_QUIET_MIN), not merely for the CPU to go idle.
 
 set -euo pipefail
 
@@ -48,14 +60,20 @@ HEALTH_TIMEOUT=90   # seconds to wait for startup_complete in the log
 # so there is nothing left to protect.
 DRAIN_TIMEOUT="${DRAIN_TIMEOUT:-900}"
 HEARTBEAT_STALE=300 # heartbeat older than this ⇒ Luke is dead or hung, don't wait on it
+# A restart wipes the session table, so restarting between two turns of a live
+# exchange costs the transcript — see failure mode (c). Wait for this many
+# minutes of silence in `messages` first. 0 disables the check.
+CONVERSATION_QUIET_MIN="${CONVERSATION_QUIET_MIN:-10}"
 
 DRAIN=1
 DRAIN_AUTONOMOUS=0
+CHECK_DRAIN=0
 FEATURE_BRANCH=""
 for arg in "$@"; do
     case "$arg" in
         --no-drain)    DRAIN=0 ;;
         --drain-auto)  DRAIN_AUTONOMOUS=1 ;;
+        --check-drain) CHECK_DRAIN=1 ;;
         -*)            echo "unknown flag: $arg" >&2; exit 2 ;;
         *)             FEATURE_BRANCH="$arg" ;;
     esac
@@ -152,6 +170,36 @@ inflight_busy() {
     return 1
 }
 
+# A turn finishing is not a conversation ending. `inflight_busy` goes false in
+# the gap between his message and the reply, which is exactly the moment a
+# restart is most damaging: the session is wiped and the next message arrives
+# with no transcript. Age of the newest row in `messages` is the honest signal —
+# it counts his messages and Luke's alike, because either means a thread is open.
+# NOTE: messages.ts, not .timestamp. Hand-written SQL against this DB is a known
+# footgun; the column list came from `workspace/tools/q.sh --schema messages`.
+conversation_is_live() {
+    (( CONVERSATION_QUIET_MIN > 0 )) || return 1
+    [[ -f "$LUKE_DIR/luke.db" ]] || return 1
+    command -v sqlite3 >/dev/null 2>&1 || return 1
+    local age
+    age="$(sqlite3 -readonly "$LUKE_DIR/luke.db" \
+        "SELECT CAST((julianday('now') - julianday(MAX(ts)))*1440 AS INT) FROM messages;" \
+        2>/dev/null)" || return 1
+    # Empty table, unparseable ts, or a clock skew that makes the newest message
+    # look like the future: all "cannot tell", and a drain gate that cannot tell
+    # must not block a deploy forever.
+    [[ "$age" =~ ^-?[0-9]+$ ]] || return 1
+    (( age < 0 )) && return 1
+    if (( age < CONVERSATION_QUIET_MIN )); then
+        DRAIN_REASON="live conversation (last message ${age}m ago)"
+        return 0
+    fi
+    return 1
+}
+
+# Busy in the sense that matters: a turn is executing, OR an exchange is open.
+drain_blocked() { inflight_busy || conversation_is_live; }
+
 wait_for_idle() {
     (( DRAIN )) || { warn "--no-drain: restarting without waiting for in-flight turns."; return; }
     if ! luke_is_live; then
@@ -160,18 +208,58 @@ wait_for_idle() {
     fi
     local waited=0
     DRAIN_REASON=""
-    inflight_busy || { info "Luke is idle — safe to restart."; return; }
+    drain_blocked || { info "Luke is idle and the conversation is quiet — safe to restart."; return; }
     info "Waiting for Luke to go idle (${DRAIN_REASON}) — up to ${DRAIN_TIMEOUT}s…"
     while (( waited < DRAIN_TIMEOUT )); do
         sleep 3; waited=$(( waited + 3 ))
-        if ! inflight_busy; then
+        if ! drain_blocked; then
             info "Idle after ${waited}s — restarting."
             return
         fi
         (( waited % 60 == 0 )) && info "  …still busy (${DRAIN_REASON}) at ${waited}s"
     done
+    # Timeout reached. For an in-flight TURN, restarting anyway is defensible:
+    # past DRAIN_TIMEOUT the run is being killed by its own agent timeout, so
+    # there is nothing left to protect. For a live CONVERSATION it is not — the
+    # thread is still open, and restarting wipes the transcript. No deploy is
+    # urgent enough to justify that, so defer instead of forcing it through.
+    if ! inflight_busy && conversation_is_live; then
+        warn "Still in a live conversation after ${DRAIN_TIMEOUT}s (${DRAIN_REASON})."
+        warn "DEFERRING the restart rather than wiping the transcript. Code is pushed;"
+        warn "re-run deploy.sh when it is quiet, or use --no-drain to force."
+        DEPLOY_DEFERRED=1
+        return
+    fi
     warn "Still busy after ${DRAIN_TIMEOUT}s (${DRAIN_REASON}) — restarting anyway."
     warn "An in-flight turn will be lost. This is the old behaviour, now at least visible."
+}
+
+# `--check-drain`: report whether a restart would be safe *right now* and exit.
+# Read-only, runs no tests, touches no git. Exists because the answer used to be
+# knowable only by deploying and reading the log afterwards — which is a poor way
+# to find out you have just wiped a live conversation.
+check_drain_and_exit() {
+    local blocked=0
+    DRAIN_REASON=""
+    if ! luke_is_live; then
+        warn "No fresh heartbeat — Luke is down or hung; a deploy would restart immediately."
+        exit 0
+    fi
+    if inflight_busy; then
+        warn "IN-FLIGHT: ${DRAIN_REASON} — a deploy would wait."
+        blocked=1
+    else
+        info "No turn in flight."
+    fi
+    if conversation_is_live; then
+        warn "CONVERSATION OPEN: ${DRAIN_REASON} — a deploy would wait (quiet threshold ${CONVERSATION_QUIET_MIN}m)."
+        blocked=1
+    else
+        info "Conversation quiet (threshold ${CONVERSATION_QUIET_MIN}m)."
+    fi
+    (( blocked )) && { warn "→ A deploy right now would WAIT before restarting."; exit 1; }
+    info "→ Safe to restart."
+    exit 0
 }
 
 # ─── Rollback ────────────────────────────────────────────────────────────────
@@ -216,6 +304,10 @@ do_rollback() {
 # heartbeat/inflight files — the alternative is shipping restart logic that has
 # only ever been read, not run.
 if [[ -n "${DEPLOY_SH_SOURCE_ONLY:-}" ]]; then return 0; fi
+
+# Diagnostic only — must run BEFORE the detach, so the answer comes back to the
+# caller instead of into a log file nobody reads.
+(( CHECK_DRAIN )) && check_drain_and_exit
 
 # ─── Self-kill guard: re-exec as a separate launchd job ──────────────────────
 # `nohup`/`disown` are NOT enough — launchd reaps the descendants of the job it
@@ -277,7 +369,13 @@ git push origin main
 
 # ─── Step 3: GRACEFUL RESTART ────────────────────────────────────────────────
 info "Step 3/5 — Graceful restart via launchctl kickstart -k…"
+DEPLOY_DEFERRED=0
 wait_for_idle
+if (( DEPLOY_DEFERRED )); then
+    warn "Step 3/5 — RESTART DEFERRED. $DEPLOY_SHA is pushed but NOT yet running."
+    warn "The old process is still serving, with its transcript intact."
+    exit 3
+fi
 # Capture log offset *before* restart so health check only scans new output
 LOG_OFFSET="$(wc -c < "$LUKE_LOG" 2>/dev/null || echo 0)"
 

@@ -375,3 +375,128 @@ def test_exit_timeout_is_set_in_the_plist():
     idle, but every other restart path (watchdog, manual kickstart) relies on this."""
     plist = (Path(__file__).resolve().parents[1] / "com.luke.plist").read_text()
     assert "<key>ExitTimeOut</key>" in plist
+
+
+# ─── conversation_is_live ────────────────────────────────────────────────────
+# Failure mode (c), 2026-08-11. inflight_busy only answers "is a turn EXECUTING
+# right now?", and the pause between his message and the reply is idle by that
+# measure. So the drain announced "safe to restart" and killed the exchange
+# between turns; the restart wiped the session table and the next message
+# arrived with no transcript. Five times on 10 Aug, the last at 01:06.
+
+
+def write_messages_db(luke_dir: Path, ages_minutes: list[float] | None) -> None:
+    """Build a synthetic luke.db. `None` writes no database at all.
+
+    Column is `ts`, not `timestamp` — the real schema, confirmed against
+    `q.sh --schema messages`. A test that invents the column would pass while
+    the gate silently returned "cannot tell" forever.
+    """
+    if ages_minutes is None:
+        return
+    import sqlite3
+    from datetime import UTC, datetime, timedelta
+
+    conn = sqlite3.connect(luke_dir / "luke.db")
+    conn.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY, sender TEXT, content TEXT, ts TEXT)")
+    now = datetime.now(UTC)
+    for i, age in enumerate(ages_minutes):
+        ts = (now - timedelta(minutes=age)).isoformat()
+        conn.execute("INSERT INTO messages (sender, content, ts) VALUES (?,?,?)", ("Filipe", "x", ts))
+    conn.commit()
+    conn.close()
+
+
+@pytest.mark.parametrize(
+    "ages,quiet_min,expect_live",
+    [
+        ([1.0], 10, True),        # mid-exchange — the case that broke
+        ([3.0], 10, True),        # still inside the window
+        ([30.0], 10, False),      # long quiet — deploy freely
+        ([1.0], 0, False),        # explicitly disabled
+        ([], 10, False),          # empty table ⇒ cannot tell ⇒ must not block
+        (None, 10, False),        # no db at all ⇒ cannot tell ⇒ must not block
+        ([-120.0], 10, False),    # clock skew into the future ⇒ must not block
+        ([45.0, 2.0], 10, True),  # MAX(ts) wins, not row order
+    ],
+)
+def test_conversation_is_live(luke_dir, ages, quiet_min, expect_live):
+    write_messages_db(luke_dir, ages)
+    rc, out = run_snippet(
+        luke_dir,
+        'conversation_is_live && echo LIVE || echo QUIET',
+        env={"CONVERSATION_QUIET_MIN": str(quiet_min)},
+    )
+    assert rc == 0, out
+    assert ("LIVE" if expect_live else "QUIET") in out, out
+
+
+def test_drain_blocks_between_turns_even_with_nothing_in_flight(luke_dir):
+    """THE REGRESSION. No turn executing, but he sent something a minute ago.
+
+    Old behaviour: inflight_busy false ⇒ "Luke is idle — safe to restart".
+    """
+    write_state(luke_dir, inflight=(os.getpid(), 0, 0))
+    write_messages_db(luke_dir, [1.0])
+    rc, out = run_snippet(luke_dir, 'drain_blocked && echo BLOCKED || echo FREE')
+    assert rc == 0, out
+    assert "BLOCKED" in out, out
+    # and the old, narrower signal genuinely reads idle — proving the gap was real
+    rc2, out2 = run_snippet(luke_dir, 'inflight_busy && echo BUSY || echo IDLE')
+    assert "IDLE" in out2, out2
+
+
+def test_drain_frees_once_the_conversation_goes_quiet(luke_dir):
+    write_state(luke_dir, inflight=(os.getpid(), 0, 0))
+    write_messages_db(luke_dir, [45.0])
+    rc, out = run_snippet(luke_dir, 'drain_blocked && echo BLOCKED || echo FREE')
+    assert rc == 0, out
+    assert "FREE" in out, out
+
+
+def test_check_drain_flag_is_read_only_and_reports(luke_dir):
+    """--check-drain must never deploy: no tests, no git, no restart."""
+    write_state(luke_dir, inflight=(os.getpid(), 0, 0))
+    write_messages_db(luke_dir, [1.0])
+    proc = subprocess.run(
+        ["bash", str(DEPLOY_SH), "--check-drain"],
+        capture_output=True, text=True, timeout=60,
+        env={**os.environ, "LUKE_DIR": str(luke_dir)},
+    )
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode == 1, combined      # 1 = would wait
+    assert "CONVERSATION OPEN" in combined, combined
+    assert "Step 1/5" not in combined, combined
+
+
+def test_timeout_defers_rather_than_wiping_a_live_conversation(luke_dir):
+    """The hole in the first version of the fix: DRAIN_TIMEOUT expiring used to
+    restart 'anyway'. For a live conversation that is just the original bug on a
+    timer — talk for 15 minutes and the transcript dies regardless."""
+    write_state(luke_dir, inflight=(os.getpid(), 0, 0))
+    write_messages_db(luke_dir, [1.0])
+    rc, out = run_snippet(
+        luke_dir,
+        'DEPLOY_DEFERRED=0\nwait_for_idle\necho "DEFERRED=$DEPLOY_DEFERRED"',
+        env={"DRAIN_TIMEOUT": "6"},
+    )
+    assert rc == 0, out
+    assert "DEFERRED=1" in out, out
+    assert "DEFERRING the restart" in out, out
+    assert "restarting anyway" not in out, out
+
+
+def test_timeout_still_forces_through_a_stuck_in_flight_turn(luke_dir):
+    """The deferral must NOT leak into the in-flight case: past DRAIN_TIMEOUT the
+    run is being killed by its own agent timeout, so there is nothing to protect
+    and a deploy that never restarts is its own failure."""
+    write_state(luke_dir, inflight=(os.getpid(), 1, 0))
+    write_messages_db(luke_dir, [90.0])
+    rc, out = run_snippet(
+        luke_dir,
+        'DEPLOY_DEFERRED=0\nwait_for_idle\necho "DEFERRED=$DEPLOY_DEFERRED"',
+        env={"DRAIN_TIMEOUT": "6"},
+    )
+    assert rc == 0, out
+    assert "DEFERRED=0" in out, out
+    assert "restarting anyway" in out, out
