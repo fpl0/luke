@@ -115,6 +115,31 @@ class TestMarkdownToHtml:
     def test_bare_asterisks_are_not_bold(self) -> None:
         assert _md_to_html("2 * 3 * 4") == "2 * 3 * 4"
 
+    def test_quote_run_becomes_one_blockquote(self) -> None:
+        """The 2026-08-10 defect: a post drafted for Filipe to publish went out
+        with a literal '>' on every line, and he asked for something pasteable."""
+        out = _md_to_html("Here it is:\n\n> line one\n> line two\n\nrest")
+        assert out == "Here it is:\n\n<blockquote>line one\nline two</blockquote>\n\nrest"
+
+    def test_quote_marker_never_reaches_the_wire(self) -> None:
+        out = _md_to_html("> Today I started at CarGurus.\n> We are hiring.")
+        assert ">" not in out.replace("<blockquote>", "").replace("</blockquote>", "")
+
+    def test_blank_quote_line_stays_inside_one_block(self) -> None:
+        out = _md_to_html("> a\n>\n> b")
+        assert out.count("<blockquote>") == 1
+
+    def test_arrow_at_line_start_is_left_alone(self) -> None:
+        assert _md_to_html("-> keeps going\n>>> not a quote") == "-> keeps going\n>>> not a quote"
+
+    def test_greater_than_mid_line_is_untouched(self) -> None:
+        assert _md_to_html("if x > 3 then stop") == "if x > 3 then stop"
+
+    def test_quote_inside_fence_is_not_a_blockquote(self) -> None:
+        out = _md_to_html("```\n> not a quote here\n```")
+        assert "<blockquote>" not in out
+        assert "&gt; not a quote here" in out
+
     async def test_conversion_happens_before_the_wire(self) -> None:
         bot = AsyncMock(spec=Bot)
         with (

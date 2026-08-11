@@ -351,6 +351,15 @@ _MD_FENCE_RE = re.compile(r"```[a-zA-Z0-9_+-]*\n?(.*?)```", re.S)
 _MD_CODE_RE = re.compile(r"`([^`\n]+)`")
 _MD_BOLD_RE = re.compile(r"\*\*(\S(?:[^*\n]*\S)?)\*\*")
 
+# A run of "> " lines. Telegram HTML has <blockquote>; markdown's marker reaches
+# Filipe as a literal ">" on every single line. On 2026-08-10 a LinkedIn post
+# drafted for him to publish went out with sixteen of them, and his next message
+# was "give me something I can just paste" — the marker was the thing in the way.
+# Requires whitespace or EOL after the ">" so ">>>" and "-> x" are left alone;
+# a fence's contents are already escaped to "&gt;" by the time this runs.
+_MD_QUOTE_BLOCK_RE = re.compile(r"(?:^>(?:[ \t].*|)$\n?)+", re.M)
+_MD_QUOTE_MARKER_RE = re.compile(r"^>[ \t]?", re.M)
+
 
 def _md_to_html(text: str) -> str:
     """Rewrite stray markdown as the HTML Telegram actually renders.
@@ -367,9 +376,14 @@ def _md_to_html(text: str) -> str:
     def _code(m: re.Match[str]) -> str:
         return "<code>" + html.escape(m.group(1), quote=False) + "</code>"
 
+    def _quote(m: re.Match[str]) -> str:
+        inner = _MD_QUOTE_MARKER_RE.sub("", m.group(0)).strip("\n")
+        return "<blockquote>" + inner + "</blockquote>\n"
+
     text = _MD_FENCE_RE.sub(_fence, text)
     text = _MD_CODE_RE.sub(_code, text)
-    return _MD_BOLD_RE.sub(r"<b>\1</b>", text)
+    text = _MD_BOLD_RE.sub(r"<b>\1</b>", text)
+    return _MD_QUOTE_BLOCK_RE.sub(_quote, text)
 
 
 async def _send_chunk(bot: Bot, chat_id: int, text: str, **kwargs: Any) -> None:
