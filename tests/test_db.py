@@ -655,6 +655,49 @@ class TestCountRecentOutbound:
         assert test_db.is_duplicate_outbound("12345", "samehash") is True
 
 
+class TestGetDailyOutboundCount:
+    """The planner's daily attention budget.
+
+    This counter had no tests at all until 2026-08-13, which is how it kept
+    counting replies for six days after the hourly counter above stopped.
+    """
+
+    def test_empty(self, test_db: Any) -> None:
+        assert test_db.get_daily_outbound_count("12345") == 0
+
+    def test_counts_autonomous_sends(self, test_db: Any) -> None:
+        test_db.log_outbound("12345", "cron1")
+        test_db.log_outbound("12345", "cron2")
+        assert test_db.get_daily_outbound_count("12345") == 2
+
+    def test_ignores_other_chat_ids(self, test_db: Any) -> None:
+        test_db.log_outbound("12345", "hash1")
+        test_db.log_outbound("99999", "hash2")
+        assert test_db.get_daily_outbound_count("12345") == 1
+
+    def test_replies_do_not_eat_the_daily_budget(self, test_db: Any) -> None:
+        # 2026-08-12, the live case: 35 replies inside a conversation Filipe
+        # started (his LinkedIn About) plus 6 autonomous sends. Budget is 12.
+        # Unfiltered this read 41 and dropped every proactive_scan for the rest
+        # of the day; the honest figure is 6.
+        for i in range(35):
+            test_db.log_outbound("12345", f"reply{i}", autonomous=False)
+        for i in range(6):
+            test_db.log_outbound("12345", f"auto{i}", autonomous=True)
+        assert test_db.get_daily_outbound_count("12345") == 6
+
+    def test_excludes_yesterday(self, test_db: Any) -> None:
+        conn = test_db._db()
+        conn.execute(
+            "INSERT INTO outbound_log (chat_id, content_hash, timestamp, autonomous) "
+            "VALUES (?, ?, datetime('now', '-2 days'), 1)",
+            ("12345", "old_hash"),
+        )
+        conn.commit()
+        test_db.log_outbound("12345", "today_hash")
+        assert test_db.get_daily_outbound_count("12345") == 1
+
+
 # ---------------------------------------------------------------------------
 # Migrations
 # ---------------------------------------------------------------------------

@@ -1461,11 +1461,22 @@ def count_recent_outbound(chat_id: str, window_seconds: int = 3600) -> int:
 
 
 def get_daily_outbound_count(chat_id: str) -> int:
-    """Count outbound messages sent today (since UTC midnight)."""
+    """Count Luke-initiated messages sent today (since UTC midnight).
+
+    Replies to Filipe are excluded for the same reason ``count_recent_outbound``
+    excludes them: this figure feeds the planner's daily attention budget, which
+    caps how often Luke interrupts, not how often he answers. The 2026-08-07 fix
+    added the ``autonomous`` column and applied it to the hourly counter five
+    lines above — and stopped there. This one kept counting everything, so on
+    2026-08-12 a 35-message conversation Filipe started drove the budget to -29
+    and dropped every proactive_scan for the rest of the day. Correct count that
+    day was 6 of 12. The more he engaged, the blinder the scan went.
+    """
     row = (
         _db()
         .execute(
-            "SELECT COUNT(*) FROM outbound_log WHERE chat_id = ? AND timestamp >= date('now')",
+            "SELECT COUNT(*) FROM outbound_log "
+            "WHERE chat_id = ? AND autonomous = 1 AND timestamp >= date('now')",
             (chat_id,),
         )
         .fetchone()
