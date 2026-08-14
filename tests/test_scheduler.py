@@ -1183,3 +1183,101 @@ class TestWakeChannel:
 
         # The wake — not the 30s tick — caused a due-check
         assert mock_db.get_due_tasks.called
+
+
+class TestIntermittentFailureAlert:
+    """A task that fails every other night never trips a streak alarm.
+
+    Cron `f580ac19`, the daily self-reflection run, failed on 11, 13 and 14 Aug
+    2026 with a success on the 12th between them. `consecutive_failures` went
+    1 → 0 → 1 → 2, so the `count == 3` alert never fired, and three nights of
+    the run whose whole job is noticing things died unnoticed. The cause (a
+    deploy killing it) is fixed separately; this is the alarm that should have
+    said so regardless of cause.
+    """
+
+    TASK = {"id": "t1", "prompt": "DAILY SELF-REFLECTION (00:00)", "chat_id": "12345"}
+    NOW = "2026-08-14T00:09:40+00:00"
+
+    def _alert(self, rate: tuple[int, int], last_alert: str | None = None) -> str | None:
+        with patch("luke.scheduler.db") as mock_db:
+            mock_db.recent_task_failure_rate.return_value = rate
+            mock_db.get_behavior_last_run.return_value = last_alert
+            return scheduler._intermittent_failure_alert(self.TASK, "t1", self.NOW)
+
+    def test_fires_on_the_f580ac19_shape(self) -> None:
+        alert = self._alert((3, 4))
+        assert alert is not None
+        assert "3 of its last 4 runs" in alert
+        assert "never tripped the consecutive-failure alarm" in alert
+
+    def test_silent_below_the_threshold(self) -> None:
+        assert self._alert((2, 10)) is None
+
+    def test_silent_on_too_small_a_sample(self) -> None:
+        """Two failures out of two runs is a new task, not a sick one."""
+        assert self._alert((2, 2)) is None
+
+    def test_silent_when_healthy(self) -> None:
+        assert self._alert((0, 10)) is None
+
+    def test_throttled_within_the_quiet_period(self) -> None:
+        """Six hours after the last one — a */15 cron must not alarm all day."""
+        assert self._alert((5, 10), last_alert="2026-08-13T18:09:40+00:00") is None
+
+    def test_fires_again_after_the_quiet_period(self) -> None:
+        assert self._alert((5, 10), last_alert="2026-08-12T00:09:40+00:00") is not None
+
+    def test_an_unreadable_throttle_fires_rather_than_stays_silent(self) -> None:
+        """A missed alarm is the failure this exists to prevent. Fail loud."""
+        assert self._alert((5, 10), last_alert="not-a-timestamp") is not None
+
+    def test_the_throttle_is_recorded_when_it_fires(self) -> None:
+        with patch("luke.scheduler.db") as mock_db:
+            mock_db.recent_task_failure_rate.return_value = (3, 4)
+            mock_db.get_behavior_last_run.return_value = None
+            scheduler._intermittent_failure_alert(self.TASK, "t1", self.NOW)
+        mock_db.set_behavior_last_run.assert_called_once_with("task_fail_rate:t1", self.NOW)
+
+    def test_the_throttle_is_not_recorded_when_it_stays_silent(self) -> None:
+        """Otherwise a healthy task quietly arms its own 24h mute."""
+        with patch("luke.scheduler.db") as mock_db:
+            mock_db.recent_task_failure_rate.return_value = (0, 10)
+            mock_db.get_behavior_last_run.return_value = None
+            scheduler._intermittent_failure_alert(self.TASK, "t1", self.NOW)
+        mock_db.set_behavior_last_run.assert_not_called()
+
+    def test_the_throttle_is_per_task(self) -> None:
+        with patch("luke.scheduler.db") as mock_db:
+            mock_db.recent_task_failure_rate.return_value = (3, 4)
+            mock_db.get_behavior_last_run.return_value = None
+            scheduler._intermittent_failure_alert(self.TASK, "other-task", self.NOW)
+        mock_db.get_behavior_last_run.assert_called_once_with("task_fail_rate:other-task")
+
+    async def test_a_broken_alarm_cannot_break_the_failure_path(self) -> None:
+        """It runs inside `except`, so an exception here escapes _run_task itself.
+
+        That would take out error handling — task_logs, backoff, once-task
+        closeout — for every task, to protect a telemetry line.
+        """
+        task = {
+            "id": "t1",
+            "chat_id": "12345",
+            "prompt": "p",
+            "schedule_type": "once",
+            "schedule_value": "2026-08-14T00:00:00+00:00",
+        }
+        bot = MagicMock()
+        bot.send_message = AsyncMock()
+        with (
+            patch("luke.scheduler.run_agent", side_effect=RuntimeError("agent died")),
+            patch("luke.scheduler.db") as mock_db,
+            patch(
+                "luke.scheduler._intermittent_failure_alert",
+                side_effect=RuntimeError("alarm is broken"),
+            ),
+        ):
+            mock_db.increment_task_failures.return_value = 1
+            await scheduler._run_task(task, bot)  # must not raise
+        mock_db.log_task_run.assert_called()
+        mock_db.update_task_status.assert_called_once_with("t1", "completed")
