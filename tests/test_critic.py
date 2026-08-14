@@ -190,6 +190,157 @@ class TestCritiqueOutbound:
 
 
 # ---------------------------------------------------------------------------
+# Retry before failing open — a single transient blip must not become "pass".
+#
+# Regression cover for the defect found 2026-08-14: the fail-open rate was
+# diagnosed on 2026-05-16, 2026-07-05 and 2026-08-05, and every pass made it
+# more VISIBLE while leaving it exactly as frequent, because retry was never
+# added. These tests fail if anyone reverts to single-attempt.
+# ---------------------------------------------------------------------------
+
+
+def _make_scripted_query(script: list[Any]) -> tuple[Any, list[int]]:
+    """Fake query replaying `script` per call; returns it and a call counter.
+
+    Each entry is either an exception to raise or a string to yield.
+    """
+    from claude_agent_sdk import AssistantMessage, TextBlock
+
+    calls = [0]
+
+    async def _fake(
+        *,
+        prompt: str | Any,
+        options: Any = None,
+        transport: Any = None,
+    ) -> AsyncIterator[Any]:
+        idx = calls[0]
+        calls[0] += 1
+        step = script[min(idx, len(script) - 1)]
+        if isinstance(step, BaseException):
+            raise step
+        yield AssistantMessage(content=[TextBlock(text=step)], model="haiku")
+
+    return _fake, calls
+
+
+class TestGateRetriesBeforeFailingOpen:
+    async def test_network_error_then_success_is_judged(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fake, calls = _make_scripted_query(
+            [ConnectionError("boom"), "DECISION: block filler"]
+        )
+        monkeypatch.setattr(critic, "query", fake)
+        v = await critique_outbound("I apologize for the inconvenience.", {"tool": "s"})
+        assert v.decision == "block", "a retryable blip must not become a pass"
+        assert "critic-error" not in v.reason
+        assert calls[0] == 2
+
+    async def test_unparseable_then_success_is_judged(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fake, calls = _make_scripted_query(
+            ["hmm, hard to say", "DECISION: revise too stiff"]
+        )
+        monkeypatch.setattr(critic, "query", fake)
+        v = await critique_outbound("Heads up, your 3pm moved.", {"tool": "s"})
+        assert v.decision == "revise"
+        assert calls[0] == 2
+
+    async def test_unparseable_retry_carries_the_format_nudge(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        seen: list[str] = []
+        from claude_agent_sdk import AssistantMessage, TextBlock
+
+        async def _fake(
+            *, prompt: str | Any, options: Any = None, transport: Any = None
+        ) -> AsyncIterator[Any]:
+            seen.append(str(prompt))
+            text = "nope" if len(seen) == 1 else "DECISION: pass"
+            yield AssistantMessage(content=[TextBlock(text=text)], model="haiku")
+
+        monkeypatch.setattr(critic, "query", _fake)
+        await critique_outbound("Heads up.", {"tool": "s"})
+        assert "could not be parsed" not in seen[0]
+        assert "could not be parsed" in seen[1], "retry should tighten the format ask"
+
+    async def test_timeout_then_success_is_judged(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from luke.config import settings
+        from claude_agent_sdk import AssistantMessage, TextBlock
+
+        calls = [0]
+
+        async def _fake(
+            *, prompt: str | Any, options: Any = None, transport: Any = None
+        ) -> AsyncIterator[Any]:
+            calls[0] += 1
+            if calls[0] == 1:
+                await asyncio.sleep(60)
+            yield AssistantMessage(
+                content=[TextBlock(text="DECISION: block off-voice")], model="haiku"
+            )
+
+        monkeypatch.setattr(critic, "query", _fake)
+        monkeypatch.setattr(settings, "critic_timeout_s", 0.05)
+        v = await critique_outbound("Absolutely!", {"tool": "s"})
+        assert v.decision == "block"
+        assert calls[0] == 2
+
+    async def test_exhausting_attempts_still_fails_open(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Terminal policy is unchanged: a dead critic never silences Luke.
+        fake, calls = _make_scripted_query([ConnectionError("boom")])
+        monkeypatch.setattr(critic, "query", fake)
+        v = await critique_outbound("Heads up.", {"tool": "s"})
+        assert v.decision == "pass"
+        assert "ConnectionError" in v.reason
+        assert calls[0] == 2, "must stop at critic_attempts, not loop forever"
+
+    async def test_attempts_setting_is_honoured(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from luke.config import settings
+
+        fake, calls = _make_scripted_query([ConnectionError("boom")])
+        monkeypatch.setattr(critic, "query", fake)
+        monkeypatch.setattr(settings, "critic_attempts", 3)
+        v = await critique_outbound("Heads up.", {"tool": "s"})
+        assert v.decision == "pass"
+        assert calls[0] == 3
+
+    async def test_single_attempt_config_is_respected(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from luke.config import settings
+
+        fake, calls = _make_scripted_query([ConnectionError("boom")])
+        monkeypatch.setattr(critic, "query", fake)
+        monkeypatch.setattr(settings, "critic_attempts", 1)
+        await critique_outbound("Heads up.", {"tool": "s"})
+        assert calls[0] == 1
+
+    async def test_freshness_gate_retries_too(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Both gates share _judge; freshness must not be left single-attempt.
+        fake, calls = _make_scripted_query(
+            [TimeoutError(), "DECISION: block answers a cancelled question"]
+        )
+        monkeypatch.setattr(critic, "query", fake)
+        v = await check_freshness(
+            "About that dentist appointment...",
+            [{"sender_name": "Filipe", "content": "cancelled it, never mind"}],
+        )
+        assert v.decision == "block"
+        assert calls[0] == 2
+
+
+# ---------------------------------------------------------------------------
 # check_freshness — stubs SDK query, compares drafts vs user-latest
 # ---------------------------------------------------------------------------
 

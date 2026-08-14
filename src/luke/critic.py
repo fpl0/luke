@@ -4,9 +4,11 @@ Runs a cheap one-shot Haiku query over a draft message and returns a
 pass/revise/block verdict. Wired into ``_pre_tool_hook`` as the final
 gate after cheap regex/state checks.
 
-Fail-open: on any error (network, parse, timeout) the critic returns
-``pass`` so a misbehaving critic doesn't silence Luke. Single mechanism,
-no fallback layers — per Filipe's coherence preference.
+Fail-open, but only after retrying: a timeout, an SDK error or an
+unparseable verdict is retried up to ``settings.critic_attempts`` times
+before the gate returns ``pass`` so a misbehaving critic doesn't silence
+Luke. Single mechanism, no fallback layers — per Filipe's coherence
+preference. See ``_judge``.
 """
 
 from __future__ import annotations
@@ -159,6 +161,60 @@ async def _collect_text(prompt: str, system_prompt: str) -> str:
     return "".join(chunks).strip()
 
 
+_RETRY_NUDGE = (
+    "\n\nIMPORTANT: your previous reply could not be parsed. Reply with the "
+    "single line only, nothing else, in exactly this form:\nDECISION: <pass|"
+    "revise|block> <reason>"
+)
+
+
+async def _judge(prompt: str, system_prompt: str, *, gate: str) -> CriticVerdict:
+    """Run a gate query, retrying transient failures before failing open.
+
+    A timeout, an SDK blow-up and an unparseable verdict are all recoverable
+    on a second attempt; treating the first one as final is how a gate that
+    runs delivers no protection. Only after ``settings.critic_attempts`` have
+    all failed do we return ``CriticVerdict("pass", "critic-error: ...")``.
+
+    Fail-open remains the terminal policy — a dead critic must never silence
+    Luke — but it is now the exit after exhausting retries, not the response
+    to a single blip. Enforces
+    reflexion-a-gate-that-fails-open-on-first-error-was-never-retried-2026-08-14.
+    """
+    attempts = max(1, int(settings.critic_attempts))
+    last_error = "unknown"
+
+    for attempt in range(1, attempts + 1):
+        # Only the parse failure benefits from the nudge; a timeout retry
+        # should re-send the prompt unchanged.
+        this_prompt = prompt if last_error != "unparseable" else prompt + _RETRY_NUDGE
+        try:
+            raw = await asyncio.wait_for(
+                _collect_text(this_prompt, system_prompt=system_prompt),
+                timeout=settings.critic_timeout_s,
+            )
+        except TimeoutError:
+            last_error = "timeout"
+        except Exception as e:  # network / SDK failure
+            last_error = type(e).__name__
+            log.warning("critic_attempt_error", gate=gate, error=str(e)[:200])
+        else:
+            m = _DECISION_RE.search(raw)
+            if m:
+                if attempt > 1:
+                    log.info("critic_retry_recovered", gate=gate, attempt=attempt)
+                return _parse_verdict(raw)
+            last_error = "unparseable"
+
+        if attempt < attempts:
+            log.warning(
+                "critic_retry", gate=gate, attempt=attempt, reason=last_error
+            )
+
+    log.warning("critic_failed_open", gate=gate, reason=last_error, attempts=attempts)
+    return CriticVerdict("pass", f"critic-error: {last_error}")
+
+
 async def critique_outbound(text: str, context: dict[str, Any]) -> CriticVerdict:
     """Run a cheap critic pass over an outbound message draft.
 
@@ -176,19 +232,7 @@ async def critique_outbound(text: str, context: dict[str, Any]) -> CriticVerdict
     misbehaving critic doesn't silence Luke.
     """
     prompt = _CRITIC_USER_TEMPLATE.format(text=text)
-    try:
-        raw = await asyncio.wait_for(
-            _collect_text(prompt, system_prompt=_critic_system_prompt()),
-            timeout=settings.critic_timeout_s,
-        )
-    except TimeoutError:
-        log.warning("critic_timeout", preview=text[:80])
-        return CriticVerdict("pass", "critic-error: timeout")
-    except Exception as e:  # fail open on any SDK / network failure
-        log.warning("critic_error", error=str(e)[:200], preview=text[:80])
-        return CriticVerdict("pass", f"critic-error: {type(e).__name__}")
-
-    verdict = _parse_verdict(raw)
+    verdict = await _judge(prompt, _critic_system_prompt(), gate="critic")
     log.info(
         "critic_verdict",
         decision=verdict.decision,
@@ -232,19 +276,7 @@ async def check_freshness(draft: str, user_latest: list[dict[str, Any]]) -> Crit
         user_messages=_format_user_messages(user_latest),
         draft=draft,
     )
-    try:
-        raw = await asyncio.wait_for(
-            _collect_text(prompt, system_prompt=_FRESHNESS_SYSTEM_PROMPT),
-            timeout=settings.critic_timeout_s,
-        )
-    except TimeoutError:
-        log.warning("freshness_timeout", preview=draft[:80])
-        return CriticVerdict("pass", "critic-error: timeout")
-    except Exception as e:  # fail open on any SDK / network failure
-        log.warning("freshness_error", error=str(e)[:200], preview=draft[:80])
-        return CriticVerdict("pass", f"critic-error: {type(e).__name__}")
-
-    verdict = _parse_verdict(raw)
+    verdict = await _judge(prompt, _FRESHNESS_SYSTEM_PROMPT, gate="freshness")
     log.info(
         "freshness_verdict",
         decision=verdict.decision,

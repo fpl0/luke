@@ -120,6 +120,16 @@ class Settings(BaseSettings):
     critic_model: str = "claude-haiku-4-5-20251001"
     critic_timeout_s: float = 60.0
 
+    # Attempts per gate call before giving up and failing open. A timeout or
+    # an unparseable one-line verdict is almost always transient, and until
+    # 2026-08-14 a single such blip went straight to "pass" — zero protection
+    # delivered, silently. The fail-open rate was diagnosed three times
+    # (2026-05-16, 2026-07-05, 2026-08-05) and each pass improved how VISIBLE
+    # it was; none of them made it rarer, because retry was never added.
+    # Worst case is attempts * critic_timeout_s, which the comment above
+    # establishes is free on the autonomous path.
+    critic_attempts: int = 2
+
     # Freshness gate (L1) — abort sends that have gone stale relative to
     # the user's latest inbound message. Reuses critic infrastructure.
     freshness_enabled: bool = True
