@@ -109,13 +109,62 @@ def test_idle_with_no_runs(luke_dir):
     assert rc == 1
 
 
-def test_autonomous_runs_are_ignored_by_default(luke_dir):
-    """A cron is not worth blocking a deploy on; a user turn is."""
+def test_autonomous_runs_are_drained_by_default(luke_dir):
+    """THE regression. This used to assert the opposite, and it cost three nights.
+
+    ``f580ac19`` — the daily self-reflection cron, Filipe's standing directive —
+    starts at 00:00 and runs 4-15 minutes.  On 11, 13 and 14 Aug 2026 a deploy
+    launched around 00:05 read this marker, saw ``users=0``, logged "Luke is idle
+    and the conversation is quiet — safe to restart" and killed it: three of four
+    nights, 37-47 tool turns each, the last one 23,361 output tokens in with five
+    files already edited.  The old default was reasoned from a 30-second mail
+    scan and generalised to everything the scheduler runs.
+    """
     write_state(luke_dir, inflight=(os.getpid(), 0, 3))
     rc, _ = run_snippet(luke_dir, "inflight_busy")
+    assert rc == 0, "an autonomous run in flight must block a restart"
+
+
+def test_autonomous_draining_can_still_be_waived_explicitly(luke_dir):
+    """The escape hatch has to exist, or an urgent deploy has no way through."""
+    write_state(luke_dir, inflight=(os.getpid(), 0, 3))
+    rc, _ = run_snippet(luke_dir, "DRAIN_AUTONOMOUS=0; inflight_busy")
     assert rc == 1
-    rc, _ = run_snippet(luke_dir, "DRAIN_AUTONOMOUS=1; inflight_busy")
+
+
+def test_a_genuinely_idle_luke_is_still_not_waited_on(luke_dir):
+    """The new default must not make every deploy wait DRAIN_TIMEOUT."""
+    write_state(luke_dir, inflight=(os.getpid(), 0, 0))
+    rc, _ = run_snippet(luke_dir, "inflight_busy")
+    assert rc == 1
+
+
+def test_the_autonomous_reason_names_the_count(luke_dir):
+    """DRAIN_REASON is what lands in the deploy log; "busy" alone is not a clue."""
+    write_state(luke_dir, inflight=(os.getpid(), 0, 2))
+    rc, out = run_snippet(luke_dir, 'inflight_busy && echo "REASON=$DRAIN_REASON"')
     assert rc == 0
+    assert "REASON=2 autonomous run(s)" in out
+
+
+def test_a_user_turn_still_outranks_the_autonomous_reason(luke_dir):
+    """With both open the message should name the user turn — it is the costlier."""
+    write_state(luke_dir, inflight=(os.getpid(), 1, 2))
+    rc, out = run_snippet(luke_dir, 'inflight_busy && echo "REASON=$DRAIN_REASON"')
+    assert rc == 0
+    assert "REASON=1 user turn(s)" in out
+
+
+def test_dead_process_marker_is_ignored_for_autonomous_runs_too(luke_dir):
+    """The pid gate is what stops the new default hanging every deploy forever.
+
+    A process SIGKILLed mid-cron leaves ``autos=1`` on disk permanently. Under
+    the old default that was harmless because autonomous counts were ignored;
+    now it would wait out DRAIN_TIMEOUT on every single deploy.
+    """
+    write_state(luke_dir, hb_pid=os.getpid(), inflight=(os.getpid() + 12345, 0, 1))
+    rc, _ = run_snippet(luke_dir, "inflight_busy")
+    assert rc == 1
 
 
 def test_marker_from_a_dead_process_is_ignored(luke_dir):
@@ -215,11 +264,15 @@ def test_not_inside_when_there_is_no_heartbeat(luke_dir):
 @pytest.mark.parametrize(
     ("argv", "expect"),
     [
-        ([], "branch= drain=1 auto=0"),
-        (["my-feature"], "branch=my-feature drain=1 auto=0"),
-        (["--no-drain"], "branch= drain=0 auto=0"),
-        (["my-feature", "--no-drain"], "branch=my-feature drain=0 auto=0"),
+        ([], "branch= drain=1 auto=1"),
+        (["my-feature"], "branch=my-feature drain=1 auto=1"),
+        (["--no-drain"], "branch= drain=0 auto=1"),
+        (["my-feature", "--no-drain"], "branch=my-feature drain=0 auto=1"),
         (["--drain-auto", "my-feature"], "branch=my-feature drain=1 auto=1"),
+        (["--no-drain-auto"], "branch= drain=1 auto=0"),
+        (["--no-drain-auto", "my-feature"], "branch=my-feature drain=1 auto=0"),
+        # Both spellings present: last one wins, same as every other flag here.
+        (["--drain-auto", "--no-drain-auto"], "branch= drain=1 auto=0"),
     ],
 )
 def test_flags_and_branch_parse_in_any_order(luke_dir, argv, expect):

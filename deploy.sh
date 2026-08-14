@@ -66,13 +66,27 @@ HEARTBEAT_STALE=300 # heartbeat older than this ⇒ Luke is dead or hung, don't 
 CONVERSATION_QUIET_MIN="${CONVERSATION_QUIET_MIN:-10}"
 
 DRAIN=1
-DRAIN_AUTONOMOUS=0
+# Autonomous runs are drained BY DEFAULT as of 2026-08-14. It used to be opt-in,
+# on the reasoning that "a cron is not worth blocking a deploy on" — true of a
+# 30-second mail scan, false of everything that matters. Evidence: the daily
+# self-reflection cron `f580ac19` ran 00:00 and was killed by a deploy at 00:06,
+# 00:04 and 00:09 on 11, 13 and 14 Aug — three of four nights, each time after
+# 4-9 minutes and 37-47 tool turns, each time with the deploy log cheerfully
+# reporting "Luke is idle and the conversation is quiet — safe to restart."
+# The 14 Aug run had spent 23,361 output tokens and written five files when it
+# died, so what it leaves behind is not a clean loss but half a change with no
+# summary, no plan update and no quality log.
+#
+# The cost of the new default is deploy latency, capped by DRAIN_TIMEOUT and
+# loud when it bites. That is the cheaper side of the trade by a wide margin.
+DRAIN_AUTONOMOUS=1
 CHECK_DRAIN=0
 FEATURE_BRANCH=""
 for arg in "$@"; do
     case "$arg" in
-        --no-drain)    DRAIN=0 ;;
-        --drain-auto)  DRAIN_AUTONOMOUS=1 ;;
+        --no-drain)      DRAIN=0 ;;
+        --drain-auto)    DRAIN_AUTONOMOUS=1 ;;   # kept: now the default, still accepted
+        --no-drain-auto) DRAIN_AUTONOMOUS=0 ;;
         --check-drain) CHECK_DRAIN=1 ;;
         -*)            echo "unknown flag: $arg" >&2; exit 2 ;;
         *)             FEATURE_BRANCH="$arg" ;;
@@ -232,6 +246,12 @@ wait_for_idle() {
     fi
     warn "Still busy after ${DRAIN_TIMEOUT}s (${DRAIN_REASON}) — restarting anyway."
     warn "An in-flight turn will be lost. This is the old behaviour, now at least visible."
+    if [[ -n "${LUKE_DEPLOY_DETACHED:-}" ]] && [[ "$DRAIN_REASON" == *autonomous* ]]; then
+        warn "NOTE: this deploy was launched from inside an autonomous run, so one of"
+        warn "the runs it just waited out is very likely its own caller. If that caller"
+        warn "is blocking on this deploy's exit, the two deadlock until DRAIN_TIMEOUT."
+        warn "Launch deploy.sh and return — do not poll for 'Deploy complete'."
+    fi
 }
 
 # `--check-drain`: report whether a restart would be safe *right now* and exit.
