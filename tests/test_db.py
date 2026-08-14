@@ -772,3 +772,60 @@ class TestMigration15:
         self._rerun(conn)
         row = conn.execute("SELECT importance FROM memory_meta WHERE id = 'proc-auto'").fetchone()
         assert row["importance"] == 1.0
+
+
+class TestRecentTaskFailureRate:
+    """The counter that sees an INTERMITTENT failure.
+
+    `consecutive_failures` cannot: one success resets it. Cron `f580ac19` — the
+    daily self-reflection run — failed 11, 13 and 14 Aug 2026 with a success on
+    the 12th between them, so the streak went 1 → 0 → 1 → 2 and the three-strike
+    alert never fired. Three nights, in task_logs, in plain text, silent.
+    """
+
+    @staticmethod
+    def _log(test_db: Any, results: list[str | None], task_id: str = "t1") -> str:
+        """Oldest first, so index 0 is the earliest run. Returns the real task id."""
+        real_id = test_db.create_task("12345", f"prompt for {task_id}", "cron", "0 0 * * *")
+        for i, r in enumerate(results):
+            test_db.log_task_run(real_id, f"2026-08-{i + 1:02d}T00:00:00+00:00", None, r)
+        return real_id
+
+    def test_no_runs_at_all(self, test_db: Any) -> None:
+        assert test_db.recent_task_failure_rate("never-ran") == (0, 0)
+
+    def test_counts_failures_and_runs(self, test_db: Any) -> None:
+        tid = self._log(test_db, ["ok", "error: boom", "ok", "error: boom"])
+        assert test_db.recent_task_failure_rate(tid) == (2, 4)
+
+    def test_the_f580ac19_sequence_the_streak_counter_missed(self, test_db: Any) -> None:
+        """error, ok, error, error — a streak never exceeds 2, the rate is 3/4."""
+        tid = self._log(test_db, ["error: x", "ok", "error: x", "error: x"])
+        fails, runs = test_db.recent_task_failure_rate(tid)
+        assert (fails, runs) == (3, 4)
+
+    def test_window_bounds_the_lookback(self, test_db: Any) -> None:
+        """Old failures must roll off, or a recovered task alarms forever."""
+        tid = self._log(test_db, ["error: x"] * 5 + ["ok"] * 5)
+        assert test_db.recent_task_failure_rate(tid, window=5) == (0, 5)
+
+    def test_window_takes_the_most_recent_runs(self, test_db: Any) -> None:
+        tid = self._log(test_db, ["ok"] * 5 + ["error: x"] * 3)
+        assert test_db.recent_task_failure_rate(tid, window=3) == (3, 3)
+
+    def test_a_run_still_in_flight_is_neither_pass_nor_fail(self, test_db: Any) -> None:
+        """log_task_run writes a NULL result at start; that is not a failure."""
+        tid = self._log(test_db, ["ok", None, "error: x"])
+        fails, runs = test_db.recent_task_failure_rate(tid)
+        assert fails == 1
+        assert runs == 3
+
+    def test_other_tasks_do_not_contaminate_the_count(self, test_db: Any) -> None:
+        self._log(test_db, ["error: x"] * 4, task_id="other")
+        tid = self._log(test_db, ["ok", "ok"], task_id="t1")
+        assert test_db.recent_task_failure_rate(tid) == (0, 2)
+
+    def test_only_the_error_prefix_counts_as_failure(self, test_db: Any) -> None:
+        """`ok` is the only success string scheduler writes; be strict anyway."""
+        tid = self._log(test_db, ["ok", "error: AgentRunFailed: ...", "ok"])
+        assert test_db.recent_task_failure_rate(tid) == (1, 3)

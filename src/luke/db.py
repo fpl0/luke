@@ -1519,6 +1519,29 @@ def reset_task_failures(task_id: str) -> None:
     _commit(db)
 
 
+def recent_task_failure_rate(task_id: str, window: int = 10) -> tuple[int, int]:
+    """(failures, runs) over this task's last ``window`` logged runs.
+
+    ``consecutive_failures`` cannot see an INTERMITTENT failure: one success
+    resets it to zero.  The daily self-reflection cron ``f580ac19`` failed on
+    11, 13 and 14 Aug 2026 with a success on the 12th between them, so the
+    streak counter went 1 → 0 → 1 → 2 and the three-strike alert never fired.
+    Three nights of the system's own reflexion run dying, in ``task_logs``, in
+    plain text, silent.
+
+    A rate over a window catches exactly that shape and a streak never will.
+    """
+    rows = _db().execute(
+        "SELECT result FROM task_logs WHERE task_id = ? ORDER BY started DESC LIMIT ?",
+        (task_id, window),
+    ).fetchall()
+    runs = len(rows)
+    # A run still in flight has result NULL; it is neither a pass nor a fail.
+    scored = [str(r[0]) for r in rows if r[0] is not None]
+    failures = sum(1 for r in scored if r.startswith("error"))
+    return failures, runs
+
+
 # ---------------------------------------------------------------------------
 # Cost anomaly detection
 # ---------------------------------------------------------------------------

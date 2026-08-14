@@ -130,6 +130,57 @@ async def _limit_behavior(cap: asyncio.Semaphore, coro: Coroutine[object, object
         await coro
 
 
+# Intermittent-failure alarm. `consecutive_failures` only ever sees a streak, so
+# a task that fails every other night is invisible to it forever — see
+# db.recent_task_failure_rate and the 2026-08-14 03:00 addendum in
+# workspace/plans/perf-audit-2026-08-01.md.
+_FAILURE_RATE_WINDOW = 10  # how many recent runs to look at
+_FAILURE_RATE_MIN_RUNS = 4  # below this the sample says nothing
+_FAILURE_RATE_THRESHOLD = 3  # failures in the window before it is worth saying
+_FAILURE_RATE_QUIET_H = 24  # at most one of these a day, per task
+
+
+def _rate_alert_is_due(task_id: str, now_iso: str) -> bool:
+    """True when this task's rate alarm has not fired in _FAILURE_RATE_QUIET_H.
+
+    Persisted in behavior_state rather than in memory: a restart must not reset
+    the throttle, or a permanently-broken */15 cron alarms afresh every deploy.
+    A throttle that cannot be read is treated as "fire" — a missed alarm is the
+    failure mode this whole mechanism exists to prevent.
+    """
+    last = db.get_behavior_last_run(f"task_fail_rate:{task_id}")
+    if not last:
+        return True
+    try:
+        elapsed = (
+            ensure_utc(datetime.fromisoformat(now_iso)) - ensure_utc(datetime.fromisoformat(last))
+        ).total_seconds()
+    except (TypeError, ValueError):
+        return True
+    return elapsed >= _FAILURE_RATE_QUIET_H * 3600
+
+
+def _intermittent_failure_alert(task: TaskRecord, task_id: str, finished: str) -> str | None:
+    """The alert text for a task failing intermittently, or None.
+
+    Split out from the failure handler so it can be tested without driving a
+    whole task run, and so the handler can treat it as best-effort.
+    """
+    fails, runs = db.recent_task_failure_rate(task_id, window=_FAILURE_RATE_WINDOW)
+    if runs < _FAILURE_RATE_MIN_RUNS or fails < _FAILURE_RATE_THRESHOLD:
+        return None
+    # The streak counter's own throttle is useless here — the streak keeps
+    # resetting, which is the whole point — so throttle on wall-clock, persisted,
+    # at most one a day per task. Unthrottled on a */15 cron that is dozens.
+    if not _rate_alert_is_due(task_id, finished):
+        return None
+    db.set_behavior_last_run(f"task_fail_rate:{task_id}", finished)
+    return (
+        f"⚠️ Task '{str(task['prompt'])[:50]}' has failed {fails} of its last {runs} runs "
+        "— intermittently, so it never tripped the consecutive-failure alarm."
+    )
+
+
 def _is_due(task: TaskRecord, now: datetime) -> bool:
     """Check if a task should run now."""
     stype = task["schedule_type"]
@@ -266,12 +317,26 @@ async def _run_task(task: TaskRecord, bot: Bot) -> None:
         # Unthrottled this fires every run: a 15-minute cron in a nine-hour
         # outage would have sent ~33 identical alarms overnight, which is how
         # a real alarm gets muted. Once loudly, then a heartbeat.
+        alert: str | None = None
         if count == 3 or (count > 3 and count % 24 == 0):
+            alert = f"⚠️ Task '{task['prompt'][:50]}' has failed {count} times in a row."
+        else:
+            # A streak counter is blind to an INTERMITTENT failure — one success
+            # resets it. f580ac19, the daily self-reflection cron, failed 11, 13
+            # and 14 Aug 2026 with a success on the 12th between them: the count
+            # went 1 → 0 → 1 → 2 and nothing ever said a word. Three nights of
+            # the run whose whole job is noticing things, dying unnoticed.
+            # Never let the alarm break the failure path it lives in. We are
+            # already inside `except`; an exception raised here escapes _run_task
+            # entirely, so a broken alarm would take out the error handling for
+            # every task. Best-effort, exactly like inflight.py.
             try:
-                await bot.send_message(
-                    chat_id=int(settings.chat_id),
-                    text=f"⚠️ Task '{task['prompt'][:50]}' has failed {count} times in a row.",
-                )
+                alert = _intermittent_failure_alert(task, task_id, finished)
+            except Exception:
+                log.exception("intermittent_failure_alert_failed", task_id=task_id)
+        if alert:
+            try:
+                await bot.send_message(chat_id=int(settings.chat_id), text=alert)
             except Exception:
                 log.exception("Failed to send task failure alert")
         # A delegated job is a promise to Filipe — its death must speak.
