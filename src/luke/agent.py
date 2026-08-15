@@ -236,6 +236,46 @@ def _emit_failopen(bus: Any, gate: str, tool_name: str, verdict: Any, msg_text: 
     )
 
 
+def _blackout_verdict(msg_text: str) -> dict | None:
+    """Hold an autonomous ASK when he has gone silent. See the call site.
+
+    The measurement, the thresholds and the ASK/INFORMATION classifier all live
+    in ``workspace/tools/unanswered_streak.py`` so they are testable and runnable
+    by hand (``unanswered_streak.py --draft-text "..."``) rather than buried in a
+    hook. This is the thin bridge.
+
+    Returns None when the gate cannot run — the caller treats that as a
+    fail-open and emits ``gate_failopen``, because a gate that reports its own
+    failure as success is unauditable
+    (reflexion-failopen-gate-invisible-in-its-own-telemetry-2026-08-05).
+    """
+    import importlib.util
+
+    tool = Path.home() / "Luke" / "workspace" / "tools" / "unanswered_streak.py"
+    if not tool.exists():
+        raise FileNotFoundError(str(tool))
+    spec = importlib.util.spec_from_file_location("unanswered_streak", tool)
+    if spec is None or spec.loader is None:
+        raise ImportError("could not load unanswered_streak")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    m = mod.measure()
+    v = mod.verdict(m)
+    kind = mod.classify(msg_text)
+    decision, why = mod.judge_draft(v, kind)
+    return {
+        "decision": decision,
+        "why": why,
+        "verdict": v,
+        "kind": kind,
+        "hours_since": m["hours_since"],
+        "sends_since": m["sends_since"],
+        "asks_since": m["asks_since"],
+        "ask_previews": " | ".join(a["preview"][:60] for a in m["asks"][-3:]),
+    }
+
+
 BLOCKED_SENDS_PATH_PARTS = ("workspace", "state", "blocked_sends.jsonl")
 
 
@@ -3061,6 +3101,67 @@ async def run_agent(
                                         f"{fresh_verdict.reason}"
                                     ),
                                 }
+
+                # --- Blackout gate (autonomous only) ---
+                # Every other gate here judges ONE draft in isolation: is it
+                # performative, is the fact stale, does it cite a recall. None of
+                # them asks whether he has said a word in three days. On 12-14
+                # Aug 2026 that produced 23 unanswered sends over 69.7h — the
+                # largest streak on record against a p95 of 4 sends / 9.7h — of
+                # which six were reply-seeking check-ins asked one after another,
+                # and one OPENED by noticing the silence ("Quiet from you all
+                # day") and then asked anyway. Every one passed the critic,
+                # because each was individually defensible. The defect was in the
+                # sequence, and nothing could see sequences.
+                #
+                # Deliberately asymmetric and deterministic (no LLM, so it runs
+                # before the critic spend): information always goes — a fact he
+                # can use does not need a reply — and only an ASK is held. Three
+                # advisory memories already said this (insight-scheduled-
+                # automation-ignores-engagement, insight-proactive-work-not-
+                # proactive-communication, dream-gap-calibrated-rituals-have-no-
+                # load-test-date) and it happened anyway, so per
+                # proc-recurring-failure-to-guardrail it belongs in the executed
+                # surface, not in another memory.
+                if msg_text and len(msg_text) >= 20:
+                    try:
+                        _bo = _blackout_verdict(msg_text)
+                    except Exception as _e:  # never fail open silently
+                        _bo = None
+                        log.warning("blackout_gate_error", error=str(_e))
+                        bus.emit("gate_failopen", {
+                            "gate": "blackout", "tool": tool_name,
+                            "reason": f"blackout-error: {_e}",
+                            "preview": msg_text[:100],
+                        })
+                    if _bo and _bo["decision"] == "HOLD":
+                        log.warning(
+                            "blackout_blocked", chat_id=chat_id, tool=tool_name,
+                            hours=_bo["hours_since"], asks=_bo["asks_since"],
+                            preview=msg_text[:100],
+                        )
+                        bus.emit("blackout_blocked", {
+                            "tool": tool_name,
+                            "hours_since": _bo["hours_since"],
+                            "sends_since": _bo["sends_since"],
+                            "asks_since": _bo["asks_since"],
+                            "preview": msg_text[:100],
+                        })
+                        return {
+                            "decision": "block",
+                            "reason": (
+                                f"Blackout: he has not replied or reacted in "
+                                f"{_bo['hours_since']}h, across {_bo['sends_since']} "
+                                f"send(s), and {_bo['asks_since']} of those were "
+                                f"already asks. This draft is another ASK, so it is "
+                                f"held — a fourth unanswered check-in is pestering, "
+                                f"not presence. Unanswered asks still sitting there: "
+                                f"{_bo['ask_previews']}. You may still send "
+                                f"INFORMATION (a fact, a correction, something he can "
+                                f"act on) — that does not need a reply. If you have "
+                                f"no fact to deliver, send nothing at all."
+                            ),
+                        }
 
                 # --- Outbound critic (autonomous only) — F4 ---
                 # Last gate: cheap haiku pass for tone/factuality/fit. Runs
