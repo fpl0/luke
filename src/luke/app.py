@@ -1572,7 +1572,9 @@ async def main() -> None:
 
     async with asyncio.TaskGroup() as tg:
         tg.create_task(_resilient_polling())
-        tg.create_task(start_scheduler_loop(bot, _sem, shutdown=shutdown_event))
+        scheduler_task = tg.create_task(
+            start_scheduler_loop(bot, _sem, shutdown=shutdown_event)
+        )
 
         async def _wait_for_shutdown() -> None:
             await shutdown_event.wait()
@@ -1583,6 +1585,12 @@ async def main() -> None:
             if pending:
                 log.info("stopping", phase="drain_tasks", count=len(pending))
                 await asyncio.gather(*pending, return_exceptions=True)
+            # start_scheduler_loop drains its own _running_tasks (scheduled/cron
+            # agent runs) internally before returning, but it races this coroutine
+            # as a sibling TaskGroup task — nothing previously blocked bot.session
+            # from closing under an in-flight scheduled run. Wait for it explicitly.
+            log.info("stopping", phase="scheduler_drain")
+            await scheduler_task
             log.info("stopping", phase="notify")
             await _notify_main("Going offline.")
             await bot.session.close()
