@@ -610,6 +610,7 @@ async def enforce_plan_momentum(bot: Bot) -> int:
 
     now = datetime.now(UTC)
     acted = 0
+    alerts: list[str] = []
     for path in plans_dir.glob("*.md"):
         try:
             head = path.read_text(encoding="utf-8")[:2000]
@@ -638,14 +639,40 @@ async def enforce_plan_momentum(bot: Bot) -> int:
             {"goal_id": path.stem, "reason": "plan_stalled", "stale_hours": round(stale_h)},
         )
         log.info("plan_stalled_nudge", plan=path.stem, stale_hours=round(stale_h))
-        if stale_h >= _STALL_ALERT_HOURS:
-            days = int(stale_h // 24)
-            await _notify(
-                bot,
-                f"⏸ No progress on {path.stem} for {days} days. Next step there: "
-                f"{_plan_next_step(path)}. I'm pointing my next work session at it — "
-                "if it's actually blocked on you or should be closed, say the word.",
+        if stale_h < _STALL_ALERT_HOURS:
+            continue
+        # Wall-clock staleness nudges the work loop, but only staleness Luke was
+        # AWAKE for is worth telling Filipe about. He already knows he switched
+        # the thing off; billing him for the silence he chose reads as nagging.
+        down_h = db.downtime_hours_since(updated)
+        observed_h = stale_h - down_h
+        if observed_h < _STALL_ALERT_HOURS:
+            log.info(
+                "plan_stall_alert_suppressed_downtime",
+                plan=path.stem,
+                stale_hours=round(stale_h),
+                downtime_hours=round(down_h),
+                observed_hours=round(observed_h),
             )
+            continue
+        days = int(observed_h // 24)
+        alerts.append(f"• <b>{path.stem}</b> — {days}d. Next: {_plan_next_step(path)}")
+
+    # One message, not eight. Eight plans crossed the threshold in the same
+    # second on 2026-09-01 and each sent its own notification.
+    if alerts:
+        head = (
+            "⏸ No progress on these while I was running:"
+            if len(alerts) > 1
+            else "⏸ No progress while I was running:"
+        )
+        await _notify(
+            bot,
+            f"{head}\n\n"
+            + "\n".join(alerts)
+            + "\n\nI'm pointing my next work sessions at them — if any is actually "
+            "blocked on you or should be closed, say the word.",
+        )
     return acted
 
 
