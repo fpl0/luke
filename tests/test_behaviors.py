@@ -1006,3 +1006,63 @@ class TestEnforcePlanMomentum:
         self._write_plan(tmp_settings, "goal-paused", status="paused", updated_hours_ago=500)
         with patch("luke.behaviors.send_long_message", new_callable=AsyncMock):
             assert await enforce_plan_momentum(AsyncMock()) == 0
+
+    def _write_liveness(self, *, alive_hours_ago: list[float]) -> None:
+        """Backdate synthetic events so the gaps between them read as downtime."""
+        from datetime import UTC, datetime, timedelta
+
+        from luke import db as luke_db
+
+        conn = luke_db._db()
+        for hours in alive_hours_ago:
+            ts = datetime.now(UTC) - timedelta(hours=hours)
+            conn.execute(
+                "INSERT INTO events (event_type, payload, created) VALUES ('tool_use', '{}', ?)",
+                (ts.isoformat(sep=" ", timespec="seconds"),),
+            )
+        conn.commit()
+
+    async def test_deep_stall_across_downtime_does_not_alert(
+        self, test_db: Any, tmp_settings: Any
+    ) -> None:
+        """Filipe switched Luke off for 16 days; that silence is not neglect.
+
+        Regression for 2026-09-01, when eight plans alerted in the same second
+        on the first tick after the Boston blackout.
+        """
+        from luke.behaviors import enforce_plan_momentum
+
+        self._write_plan(tmp_settings, "goal-blacked-out", updated_hours_ago=400)
+        # Alive at the edges, nothing in between: a 396h hole.
+        self._write_liveness(alive_hours_ago=[399, 3, 1])
+        with patch("luke.behaviors.send_long_message", new_callable=AsyncMock) as mock_send:
+            assert await enforce_plan_momentum(AsyncMock()) == 1  # nudge still fires
+        mock_send.assert_not_called()
+
+    async def test_stall_while_awake_still_alerts(self, test_db: Any, tmp_settings: Any) -> None:
+        """Downtime credit must not become a blanket excuse — continuous
+        liveness across the stall window keeps the alert."""
+        from luke.behaviors import enforce_plan_momentum
+
+        self._write_plan(tmp_settings, "goal-genuinely-idle", updated_hours_ago=120)
+        self._write_liveness(alive_hours_ago=[float(h) for h in range(121, 0, -1)])
+        with patch("luke.behaviors.send_long_message", new_callable=AsyncMock) as mock_send:
+            assert await enforce_plan_momentum(AsyncMock()) == 1
+        mock_send.assert_called_once()
+        assert "goal-genuinely-idle" in mock_send.call_args.args[2]
+
+    async def test_many_stalled_plans_send_one_message(
+        self, test_db: Any, tmp_settings: Any
+    ) -> None:
+        """One message, not eight."""
+        from luke.behaviors import enforce_plan_momentum
+
+        for i in range(5):
+            self._write_plan(tmp_settings, f"goal-idle-{i}", updated_hours_ago=120)
+        self._write_liveness(alive_hours_ago=[float(h) for h in range(121, 0, -1)])
+        with patch("luke.behaviors.send_long_message", new_callable=AsyncMock) as mock_send:
+            assert await enforce_plan_momentum(AsyncMock()) == 5
+        mock_send.assert_called_once()
+        text = mock_send.call_args.args[2]
+        for i in range(5):
+            assert f"goal-idle-{i}" in text

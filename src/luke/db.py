@@ -1288,6 +1288,56 @@ def cleanup_events(retention_days: int = 7) -> int:
     return cur.rowcount
 
 
+def downtime_hours_since(start: datetime, *, min_gap_hours: float = 2.0) -> float:
+    """Hours between `start` and now that Luke was demonstrably NOT running.
+
+    The events table is a continuous liveness trace — every message, tool use
+    and behavior completion writes a row — so a contiguous hole in it is the
+    process being down, not the process being quiet. Filipe turned Luke off for
+    the Boston fortnight (16 Aug to 1 Sep 2026) and on the first tick after
+    restart every wall-clock staleness check crossed its threshold at once,
+    because nothing anywhere distinguished "nobody worked on this" from "nobody
+    could." Callers subtract this from a wall-clock age to get *observed* age.
+
+    Only gaps inside the retained window are counted. :func:`cleanup_events`
+    trims old rows, and a pruned stretch is indistinguishable from a live one,
+    so anything before the earliest retained event is credited as live — the
+    conservative direction, since under-counting downtime merely lets a stall
+    alert through while over-counting would silence a real one.
+    """
+    start = ensure_utc(start)
+    now = datetime.now(UTC)
+    if start >= now:
+        return 0.0
+    cur = _db().execute(
+        "SELECT created FROM events WHERE created >= ? ORDER BY created",
+        (start.isoformat(sep=" ", timespec="seconds"),),
+    )
+    rows = cur.fetchall()
+    if not rows:
+        return 0.0
+
+    def _parse(value: str) -> datetime | None:
+        with contextlib.suppress(ValueError):
+            return ensure_utc(datetime.fromisoformat(value))
+        return None
+
+    stamps = [ts for ts in (_parse(r["created"]) for r in rows) if ts is not None]
+    if not stamps:
+        return 0.0
+    # Anything before the first retained row may simply have been pruned, so the
+    # walk starts there rather than at `start`.
+    total = 0.0
+    prev = stamps[0]
+    for ts in stamps[1:]:
+        gap = (ts - prev).total_seconds() / 3600
+        if gap >= min_gap_hours:
+            total += gap
+        prev = ts
+    # No trailing prev->now segment: this code is running, so we are alive now.
+    return total
+
+
 # ---------------------------------------------------------------------------
 # Maintenance
 # ---------------------------------------------------------------------------
