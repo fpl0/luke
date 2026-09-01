@@ -2166,11 +2166,14 @@ def get_lifecycle_candidates() -> dict[str, list[dict[str, Any]]]:
             }
         )
 
-    # Unused procedures: not accessed in N days
+    # Unused procedures: not accessed in N days. A procedure that has never been
+    # accessed falls back to its creation date — never-accessed and two weeks old is
+    # a young procedure, not an abandoned one, and reporting it as "unused 60+ days"
+    # is a false positive that buries the genuinely stale ones.
     unused_rows = db.execute(
         """SELECT id, type, last_accessed FROM memory_meta
            WHERE type = 'procedure' AND status = 'active'
-           AND (last_accessed = '' OR last_accessed < ?)""",
+           AND CASE WHEN COALESCE(last_accessed, '') = '' THEN created ELSE last_accessed END < ?""",
         (unused_cutoff,),
     ).fetchall()
     result["unused_procedures"] = [dict(r) for r in unused_rows]
