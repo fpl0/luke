@@ -888,7 +888,18 @@ async def run_deep_work(bot: Bot, sem: asyncio.Semaphore) -> None:
                 if updated is not None:
                     stale_h = (datetime.now(UTC) - updated).total_seconds() / 3600
                     if stale_h >= _STALL_NUDGE_HOURS:
-                        stall_note = f" — ⚠ STALLED {int(stale_h // 24)}d+, prioritize this"
+                        # Prioritize on wall clock — a stale plan needs work whatever
+                        # the reason — but report the days Luke was actually awake for,
+                        # because a session that reads "STALLED 17d" will say "17 days"
+                        # to Filipe, and 16 of those were him having switched Luke off.
+                        down_h = db.downtime_hours_since(updated)
+                        awake_d = int((stale_h - down_h) // 24)
+                        stall_note = f" — ⚠ STALLED {awake_d}d+, prioritize this"
+                        if down_h >= 24:
+                            stall_note += (
+                                f" (plan untouched {int(stale_h // 24)}d, but Luke was down"
+                                f" {int(down_h // 24)}d of that — do not quote the raw number)"
+                            )
             plan_status.append(
                 f"[{g['id']}]: plan exists at workspace/plans/{plan_path.name}"
                 + (f" (status: {status})" if status else "")
