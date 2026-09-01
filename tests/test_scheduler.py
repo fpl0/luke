@@ -137,6 +137,50 @@ class TestCron:
         assert _is_due(task, datetime.now(UTC)) is True
 
 
+class TestCronCatchUpGrace:
+    """A cron slot missed by more than CRON_CATCHUP_GRACE is not replayed.
+
+    Regression for 2026-09-01: twelve minutes after a 16-day outage ended, all
+    sixteen crons were due in the same second, which would have delivered the
+    06:00 morning briefing at 18:51 and the Friday note on a Tuesday.
+    """
+
+    def test_daily_morning_cron_does_not_fire_in_the_evening(self) -> None:
+        """The exact failure: 06:00 daily, 16 days dark, back up at 18:51."""
+        now = datetime(2026, 9, 1, 17, 51, tzinfo=UTC)
+        last = datetime(2026, 8, 16, 6, 0, tzinfo=UTC).isoformat()
+        task = _task(schedule_type="cron", schedule_value="0 6 * * *", last_run=last)
+        assert _is_due(task, now) is False
+
+    def test_same_cron_fires_at_its_next_real_slot(self) -> None:
+        """...and is due again the following morning, so the cron isn't dead."""
+        now = datetime(2026, 9, 2, 6, 0, tzinfo=UTC)
+        last = datetime(2026, 8, 16, 6, 0, tzinfo=UTC).isoformat()
+        task = _task(schedule_type="cron", schedule_value="0 6 * * *", last_run=last)
+        assert _is_due(task, now) is True
+
+    def test_weekly_cron_does_not_fire_on_the_wrong_weekday(self) -> None:
+        """Friday 14:30 note, dark since 15 Aug, back up on a Tuesday."""
+        now = datetime(2026, 9, 1, 17, 51, tzinfo=UTC)
+        last = datetime(2026, 8, 14, 14, 30, tzinfo=UTC).isoformat()
+        task = _task(schedule_type="cron", schedule_value="30 14 * * 5", last_run=last)
+        assert _is_due(task, now) is False
+
+    def test_short_restart_still_catches_up(self) -> None:
+        """A deploy is not an outage — a slot 30 min stale still runs."""
+        now = datetime(2026, 9, 1, 12, 30, tzinfo=UTC)
+        last = datetime(2026, 9, 1, 11, 0, tzinfo=UTC).isoformat()
+        task = _task(schedule_type="cron", schedule_value="0 * * * *", last_run=last)
+        assert _is_due(task, now) is True
+
+    def test_grace_measures_the_slot_not_the_outage(self) -> None:
+        """A 3-day gap still fires if the *slot* it missed is recent."""
+        now = datetime(2026, 9, 1, 12, 5, tzinfo=UTC)
+        last = datetime(2026, 8, 29, 12, 0, tzinfo=UTC).isoformat()
+        task = _task(schedule_type="cron", schedule_value="0 * * * *", last_run=last)
+        assert _is_due(task, now) is True
+
+
 class TestInterval:
     def test_not_due_immediately_after_creation(self) -> None:
         """New interval task must NOT fire on the same tick it was created."""

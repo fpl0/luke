@@ -38,6 +38,21 @@ from .planner import BEHAVIOR_EVENTS, generate_intents, plan
 
 log: BoundLogger = structlog.get_logger()
 
+# How stale a missed cron slot may be and still be caught up on restart.
+#
+# Without this, `_is_due` computes the next slot after last_run and fires the
+# moment now passes it — so after a long outage every cron fires at once, at
+# whatever hour the process happened to come back. Observed 2026-09-01, twelve
+# minutes after the 16-day blackout ended: all sixteen crons started in the same
+# second, which would have delivered the 06:00 morning briefing at 18:51 and the
+# Friday note on a Tuesday.
+#
+# The grace is measured against the SLOT, not the outage: an hourly cron that
+# missed 12:00 during a 90-minute outage still runs at 12:30, because that slot
+# is only 30 minutes stale. A slot older than this has had its moment pass —
+# waiting for the next real one is the only sane delivery.
+CRON_CATCHUP_GRACE = timedelta(hours=1)
+
 # Wake signal: set by task creation (bus: cron_created) or an external poke at
 # the wake socket. The loop waits on it alongside the tick timeout, so newly
 # queued work starts in ~0s instead of up to a full scheduler_interval later.
@@ -194,11 +209,17 @@ def _is_due(task: TaskRecord, now: datetime) -> bool:
 
     if stype == "cron":
         if not last_run:
-            # Use task creation time as anchor so we wait for the next window
-            last = ensure_utc(datetime.fromisoformat(task["created_at"]))
+            # Use task creation time as anchor so we wait for the next window.
+            # No catch-up grace here: a task that has never run isn't replaying
+            # a missed slot, it's waiting for its first one.
+            anchor = ensure_utc(datetime.fromisoformat(task["created_at"]))
         else:
+            # Flooring the anchor at now - CRON_CATCHUP_GRACE makes croniter
+            # return the next *upcoming* slot rather than one that passed days
+            # ago, so a long outage resumes the schedule instead of replaying it.
             last = ensure_utc(datetime.fromisoformat(last_run))
-        next_run: datetime = ensure_utc(croniter(sval, last).get_next(datetime))
+            anchor = max(last, now - CRON_CATCHUP_GRACE)
+        next_run: datetime = ensure_utc(croniter(sval, anchor).get_next(datetime))
         return now >= next_run
 
     if stype == "interval":
