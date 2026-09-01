@@ -1386,9 +1386,35 @@ class TestLifecycleCandidates:
 
     def test_unused_procedure_detected(self, test_db: Any) -> None:
         memory.index_memory("old-proc", "procedure", "Proc", "content")
+        # Never accessed AND created long ago — genuinely abandoned
+        old_date = (datetime.now(UTC) - timedelta(days=100)).isoformat()
+        db._db().execute("UPDATE memory_meta SET created = ? WHERE id = 'old-proc'", (old_date,))
+        db._db().commit()
         candidates = memory.get_lifecycle_candidates()
-        # last_accessed defaults to '' which counts as unused
         assert any(p["id"] == "old-proc" for p in candidates["unused_procedures"])
+
+    def test_never_accessed_young_procedure_not_flagged(self, test_db: Any) -> None:
+        """A procedure written a fortnight ago has never been accessed and is fine.
+
+        Regression: the query read `last_accessed = '' OR last_accessed < cutoff`, so
+        every never-accessed procedure was reported as "unused 60+ days" from the moment
+        it was written. On 2026-09-01 all 13 never-accessed procedures were flagged and
+        none of them was even 60 days old.
+        """
+        memory.index_memory("young-proc", "procedure", "Proc", "content")
+        candidates = memory.get_lifecycle_candidates()
+        assert not any(p["id"] == "young-proc" for p in candidates["unused_procedures"])
+
+    def test_stale_access_beats_recent_creation(self, test_db: Any) -> None:
+        """An accessed-then-abandoned procedure is still flagged on its access date."""
+        memory.index_memory("lapsed-proc", "procedure", "Proc", "content")
+        old_date = (datetime.now(UTC) - timedelta(days=100)).isoformat()
+        db._db().execute(
+            "UPDATE memory_meta SET last_accessed = ? WHERE id = 'lapsed-proc'", (old_date,)
+        )
+        db._db().commit()
+        candidates = memory.get_lifecycle_candidates()
+        assert any(p["id"] == "lapsed-proc" for p in candidates["unused_procedures"])
 
     def test_lingering_goal_detected(self, test_db: Any) -> None:
         memory.index_memory("done-goal", "goal", "Done", "All done.", tags=["completed"])
