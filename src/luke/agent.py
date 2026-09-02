@@ -2085,13 +2085,23 @@ def _build_tools(chat_id: str, bot: Bot, autonomous: bool = True) -> Any:
             corrected_content = args.get("corrected_content")
             if not correction_id or not corrected_content:
                 return _ok("Error: correction_id and corrected_content required for modify")
+            pending = memory.get_correction(correction_id)
+            if not pending:
+                return _ok(f"Correction #{correction_id}: not found")
+            # Two bugs used to live in these four lines: apply_correction was handed
+            # the correction ROW id where it wants a mem_id (so it always returned
+            # not_found), and the follow-up resolve_correction(..., "applied") then
+            # re-applied the ORIGINAL auto-detected content destructively — throwing
+            # away the edit that "modify" exists to make. Resolve as 'rejected' so the
+            # row closes without replaying itself, then write the edited content.
+            memory.resolve_correction(correction_id, "rejected")
             result = memory.apply_correction(
-                correction_id,
+                pending["mem_id"],
                 corrected_content,
                 confidence=0.85,
                 source="agent_review",
+                allow_destructive=True,
             )
-            memory.resolve_correction(correction_id, "applied")
             return _ok(f"Correction #{correction_id}: modified and applied ({result['status']})")
         else:
             return _ok(f"Unknown action: {action}. Use: list, approve, reject, modify")

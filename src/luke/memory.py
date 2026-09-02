@@ -1714,10 +1714,23 @@ def compute_correction_confidence(
     return round(score, 3)
 
 
+def _similarity(emb_a: list[float], emb_b: list[float]) -> float:
+    """Cosine similarity in [-1, 1] — the scale every threshold here is written for.
+
+    This used to be ``1 / (1 + cosine_distance)``, which is monotonic in the right
+    direction but bounded to **[1/3, 1]**: distance maxes out at 2, so the ratio can
+    never fall below 0.333. Every "< 0.3" branch written against it was unreachable
+    and every "> 0.5" gate was satisfied by any pair with non-negative cosine — i.e.
+    effectively all English prose. See ``classify_relationship`` and
+    ``_compute_semantic_similarity`` for the two places that silently mis-fired.
+    """
+    return 1.0 - _cosine_distance(emb_a, emb_b)
+
+
 def classify_relationship(existing_content: str, new_content: str) -> str:
     """Classify relationship between existing and new content.
 
-    Uses semantic similarity with thresholds:
+    Uses cosine similarity with thresholds:
     - < 0.3: independent (no meaningful overlap)
     - 0.3-0.7: extendable (complementary information)
     - > 0.7: contradictory (conflicting — needs LLM verification)
@@ -1733,7 +1746,7 @@ def classify_relationship(existing_content: str, new_content: str) -> str:
     if existing_emb is None or new_emb is None:
         return "extendable"
 
-    sim = 1.0 / (1.0 + _cosine_distance(existing_emb, new_emb))
+    sim = _similarity(existing_emb, new_emb)
 
     if sim < 0.3:
         return "independent"
@@ -1757,6 +1770,19 @@ def _cosine_distance(a: list[float], b: list[float]) -> float:
 # Only do that automatically when we're highly confident; otherwise queue it for
 # review so a low-confidence false positive can't silently eat a memory.
 DESTRUCTIVE_AUTO_CONFIDENCE = 0.9
+
+# An "extendable" correction appends instead of replacing, so it was left unguarded
+# — but appending is not harmless: 616 auto-appends across 194 memories glued Luke's
+# own chat replies onto procedures and feedback rules, because detect_corrections
+# fires on any response containing "actually"/"wait,"/"i meant" and proposes the
+# reply as a correction to *every* memory recalled that turn.
+#
+# 0.8 is the source boundary, not a taste call. compute_correction_confidence is
+# 0.3*explicit + 0.3*source_reliability + 0.2*semantic + 0.2*recency, so with an
+# explicit trigger word and perfect similarity an ``agent_inferred`` correction
+# tops out at 0.78 while a ``user_direct`` one starts at 0.80. Filipe correcting me
+# still lands automatically; me saying "actually" no longer edits my own rules.
+EXTEND_AUTO_CONFIDENCE = 0.8
 
 
 def apply_correction(
@@ -1790,6 +1816,14 @@ def apply_correction(
     relationship = classify_relationship(existing_content, corrected_content)
 
     if relationship == "extendable":
+        if not allow_destructive and confidence < EXTEND_AUTO_CONFIDENCE:
+            flag_for_review(mem_id, corrected_content, confidence=confidence, source=source)
+            return {
+                "status": "flagged",
+                "mem_id": mem_id,
+                "reason": "low_confidence_extension",
+                "confidence": confidence,
+            }
         new_content = existing_content + "\n\n" + corrected_content
         change_desc = "Extended with new information"
     elif relationship == "contradictory":
@@ -1806,6 +1840,19 @@ def apply_correction(
         new_content = corrected_content
         change_desc = "Contradiction resolved — replaced content"
     else:
+        # 'independent' — the proposed content has no meaningful overlap with the
+        # memory. That is the strongest evidence available that this is a false
+        # positive, so it must never overwrite. (It used to replace wholesale with
+        # no confidence guard at all; it only escaped notice because the old
+        # similarity formula made this branch unreachable.)
+        if not allow_destructive:
+            flag_for_review(mem_id, corrected_content, confidence=confidence, source=source)
+            return {
+                "status": "flagged",
+                "mem_id": mem_id,
+                "reason": "independent_content",
+                "confidence": confidence,
+            }
         new_content = corrected_content
         change_desc = "Updated content"
 
@@ -1946,6 +1993,15 @@ def get_pending_corrections(
     return [dict(r) for r in rows]
 
 
+def get_correction(correction_id: int) -> dict[str, Any] | None:
+    """Fetch one correction row by id (any status), or None."""
+    conn = _db()
+    row = conn.execute(
+        "SELECT * FROM pending_corrections WHERE id = ?", (correction_id,)
+    ).fetchone()
+    return dict(row) if row else None
+
+
 def resolve_correction(correction_id: int, status: str) -> dict[str, Any]:
     """Resolve a pending correction (approved, rejected, applied)."""
     conn = _db()
@@ -2034,8 +2090,7 @@ def _compute_semantic_similarity(text_a: str, text_b: str) -> float:
     if emb_a is None or emb_b is None:
         return 0.0
 
-    sim = 1.0 / (1.0 + _cosine_distance(emb_a, emb_b))
-    return round(sim, 3)
+    return round(_similarity(emb_a, emb_b), 3)
 
 
 # ---------------------------------------------------------------------------

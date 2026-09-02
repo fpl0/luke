@@ -1214,14 +1214,64 @@ class TestApplyCorrection:
         )
         assert row["old_content"] == long_original  # full snapshot, reversible
 
-    def test_extendable_correction_still_appends(self, test_db: Any, monkeypatch: Any) -> None:
+    def test_high_confidence_extension_appends(self, test_db: Any, monkeypatch: Any) -> None:
         monkeypatch.setattr(memory, "classify_relationship", _classify_as("extendable"))
         memory.index_memory("e1", "entity", "Fact", "base")
 
-        result = memory.apply_correction("e1", "addendum", confidence=0.74)
+        # 0.86 is what a user_direct correction with an explicit trigger scores.
+        result = memory.apply_correction("e1", "addendum", confidence=0.86)
 
         assert result["status"] == "applied"
         assert self._content("e1") == "base\n\naddendum"
+
+    def test_low_confidence_extension_is_flagged_not_appended(
+        self, test_db: Any, monkeypatch: Any
+    ) -> None:
+        # 616 auto-appends across 194 memories glued Luke's own chat replies onto
+        # procedures, all in the 0.71-0.75 band that agent_inferred corrections score.
+        monkeypatch.setattr(memory, "classify_relationship", _classify_as("extendable"))
+        memory.index_memory("e1", "entity", "Fact", "base")
+
+        result = memory.apply_correction("e1", "unrelated chat reply", confidence=0.74)
+
+        assert result["status"] == "flagged"
+        assert result["reason"] == "low_confidence_extension"
+        assert self._content("e1") == "base"
+        assert len(memory.get_pending_corrections("e1")) == 1
+
+    def test_independent_content_never_overwrites(self, test_db: Any, monkeypatch: Any) -> None:
+        # 'independent' means no meaningful overlap — the strongest available signal
+        # that this is a false positive. It used to replace wholesale, unguarded.
+        monkeypatch.setattr(memory, "classify_relationship", _classify_as("independent"))
+        memory.index_memory("e1", "entity", "Fact", "original important content")
+
+        result = memory.apply_correction("e1", "something else entirely", confidence=0.95)
+
+        assert result["status"] == "flagged"
+        assert result["reason"] == "independent_content"
+        assert self._content("e1") == "original important content"
+
+
+class TestSimilarityScale:
+    """The thresholds are written for cosine similarity; the metric must supply it."""
+
+    def test_orthogonal_vectors_score_zero(self) -> None:
+        assert memory._similarity([1.0, 0.0], [0.0, 1.0]) == pytest.approx(0.0)
+
+    def test_identical_vectors_score_one(self) -> None:
+        assert memory._similarity([1.0, 2.0], [1.0, 2.0]) == pytest.approx(1.0)
+
+    def test_opposed_vectors_reach_the_independent_band(self) -> None:
+        # The old 1/(1+distance) form bottomed out at 0.333, so classify_relationship's
+        # "< 0.3 -> independent" branch was unreachable and every unrelated pair was
+        # filed as 'extendable' (i.e. appended).
+        assert memory._similarity([1.0, 0.0], [-1.0, 0.0]) < 0.3
+
+    def test_unrelated_content_classifies_as_independent(
+        self, test_db: Any, monkeypatch: Any
+    ) -> None:
+        monkeypatch.setattr(memory, "_embed_passage", lambda t: [1.0, 0.0] if "a" in t else [0.0, 1.0])
+        assert memory.classify_relationship("aaa", "zzz") == "independent"
 
 
 # ---------------------------------------------------------------------------
