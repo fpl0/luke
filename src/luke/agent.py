@@ -63,6 +63,8 @@ from .config import settings
 from .db_query_gate import REASON as DB_QUERY_GATE_REASON
 from .db_query_gate import blocks_tool_input as blocks_db_query
 from .memory import MEMORY_DIRS, read_frontmatter, read_memory_body, sanitize_memory_id
+from .rating_gate import REASON as RATING_GATE_REASON
+from .rating_gate import blocks as blocks_unlanded_rating
 from .sdk_io import cli_stderr
 
 log: BoundLogger = structlog.get_logger()
@@ -2686,6 +2688,7 @@ async def run_agent(
     # Reactive only: an autonomous run has no inbound message to be a re-ask of.
     reask_reason = None if autonomous else _is_reask(prompt_text_for_context)
     reask_gate_fired = {"n": 0}  # one-shot guard for the re-ask gate
+    rating_gate_fired = {"n": 0}  # one-shot guard for the deep-work rating gate
     tool_start_times: dict[str, float] = {}  # tool_use_id -> monotonic start
     subagent_start_times: dict[str, float] = {}  # agent_id -> monotonic start
     effective_max_sends = max_sends if max_sends is not None else settings.max_sends_per_run
@@ -2727,6 +2730,27 @@ async def run_agent(
             log.warning("db_query_gate_blocked", chat_id=chat_id)
             bus.emit("db_query_gate_blocked", {"chat_id": chat_id})
             return {"decision": "block", "reason": DB_QUERY_GATE_REASON}
+        # --- Deep-work rating gate (all runs) ---
+        # A 4 is a claim that the work landed. Block it once when this run
+        # shipped nothing at all — see rating_gate.py for the measurement that
+        # made this a gate instead of a fourth advisory note.
+        if blocks_unlanded_rating(
+            tool_name,
+            input_data["tool_input"],
+            shipped=bool(send_count["n"] or artifact_delivered_count["n"]),
+            already_fired=bool(rating_gate_fired["n"]),
+        ):
+            rating_gate_fired["n"] = 1
+            log.warning("rating_gate_blocked", chat_id=chat_id)
+            bus.emit(
+                "rating_gate_blocked",
+                {
+                    "chat_id": chat_id,
+                    "goal_id": input_data["tool_input"].get("goal_id"),
+                    "rating": input_data["tool_input"].get("rating"),
+                },
+            )
+            return {"decision": "block", "reason": RATING_GATE_REASON}
         # --- Background-work routing gate (interactive turns only) ---
         # Harness `Task` sub-agents are children of the per-turn client: they
         # die the moment Filipe sends his next message (the July 3 2026
