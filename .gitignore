@@ -28,3 +28,7 @@ bgeembed.err
 luke.db
 workspace/
 logs/
+
+# Canary verdicts live next to their script (deliberately not in behavior_state, so a
+# daemon that cannot write its own state cannot silence them) but are runtime, not source
+scripts/*.state.json

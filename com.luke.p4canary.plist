@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.luke.p4canary</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/filipelm/Code/luke/scripts/p4_resume_canary.sh</string>
+    </array>
+    <!-- Daily, but the script's --if-due gate means it only spends money weekly or when
+         the claude-agent-sdk version moves. Deliberately outside the Luke daemon. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>4</integer>
+        <key>Minute</key>
+        <integer>20</integer>
+    </dict>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>StandardOutPath</key>
+    <string>/Users/filipelm/Code/luke/logs/p4canary.out</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/filipelm/Code/luke/logs/p4canary.err</string>
+</dict>
+</plist>
