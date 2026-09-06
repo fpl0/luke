@@ -1679,7 +1679,11 @@ class TestSessionContinuity:
         assert kwargs["session_id"] is None, "there was nothing to resume"
         # No point paying for opus: with no session, no model can resume.
         assert kwargs["model"] == "sonnet"
-        warned = [c for c in mock_log.warning.call_args_list if c.args[:1] == ("live_turn_without_session",)]
+        warned = [
+            c
+            for c in mock_log.warning.call_args_list
+            if c.args[:1] == ("live_turn_without_session",)
+        ]
         assert warned, "a live turn ran cold and said nothing about it"
 
     async def test_conversation_state_saved_even_on_low_effort_turn(self) -> None:

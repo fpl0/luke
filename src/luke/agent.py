@@ -240,7 +240,7 @@ def _emit_failopen(bus: Any, gate: str, tool_name: str, verdict: Any, msg_text: 
     )
 
 
-def _blackout_verdict(msg_text: str) -> dict | None:
+def _blackout_verdict(msg_text: str) -> dict[str, Any] | None:
     """Hold an autonomous ASK when he has gone silent. See the call site.
 
     The measurement, the thresholds and the ASK/INFORMATION classifier all live
@@ -2089,8 +2089,8 @@ def _build_tools(chat_id: str, bot: Bot, autonomous: bool = True) -> Any:
             corrected_content = args.get("corrected_content")
             if not correction_id or not corrected_content:
                 return _ok("Error: correction_id and corrected_content required for modify")
-            pending = memory.get_correction(correction_id)
-            if not pending:
+            row = memory.get_correction(correction_id)
+            if not row:
                 return _ok(f"Correction #{correction_id}: not found")
             # Two bugs used to live in these four lines: apply_correction was handed
             # the correction ROW id where it wants a mem_id (so it always returned
@@ -2100,7 +2100,7 @@ def _build_tools(chat_id: str, bot: Bot, autonomous: bool = True) -> Any:
             # row closes without replaying itself, then write the edited content.
             memory.resolve_correction(correction_id, "rejected")
             result = memory.apply_correction(
-                pending["mem_id"],
+                row["mem_id"],
                 corrected_content,
                 confidence=0.85,
                 source="agent_review",
@@ -2954,7 +2954,11 @@ async def run_agent(
                     parked = persist_blocked_send(
                         chat_id=chat_id,
                         tool_name=tool_name,
-                        tool_input=raw_input if isinstance(raw_input, dict) else None,
+                        # The static type says this is always a dict; it arrives from the
+                        # SDK, so the runtime check stays and pyright is told to allow it.
+                        tool_input=raw_input
+                        if isinstance(raw_input, dict)  # pyright: ignore[reportUnnecessaryIsInstance]
+                        else None,
                         reason="hourly_budget_exceeded",
                     )
                     bus.emit(
@@ -3171,24 +3175,34 @@ async def run_agent(
                     except Exception as _e:  # never fail open silently
                         _bo = None
                         log.warning("blackout_gate_error", error=str(_e))
-                        bus.emit("gate_failopen", {
-                            "gate": "blackout", "tool": tool_name,
-                            "reason": f"blackout-error: {_e}",
-                            "preview": msg_text[:100],
-                        })
+                        bus.emit(
+                            "gate_failopen",
+                            {
+                                "gate": "blackout",
+                                "tool": tool_name,
+                                "reason": f"blackout-error: {_e}",
+                                "preview": msg_text[:100],
+                            },
+                        )
                     if _bo and _bo["decision"] == "HOLD":
                         log.warning(
-                            "blackout_blocked", chat_id=chat_id, tool=tool_name,
-                            hours=_bo["hours_since"], asks=_bo["asks_since"],
+                            "blackout_blocked",
+                            chat_id=chat_id,
+                            tool=tool_name,
+                            hours=_bo["hours_since"],
+                            asks=_bo["asks_since"],
                             preview=msg_text[:100],
                         )
-                        bus.emit("blackout_blocked", {
-                            "tool": tool_name,
-                            "hours_since": _bo["hours_since"],
-                            "sends_since": _bo["sends_since"],
-                            "asks_since": _bo["asks_since"],
-                            "preview": msg_text[:100],
-                        })
+                        bus.emit(
+                            "blackout_blocked",
+                            {
+                                "tool": tool_name,
+                                "hours_since": _bo["hours_since"],
+                                "sends_since": _bo["sends_since"],
+                                "asks_since": _bo["asks_since"],
+                                "preview": msg_text[:100],
+                            },
+                        )
                         return {
                             "decision": "block",
                             "reason": (

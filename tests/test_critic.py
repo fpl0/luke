@@ -228,9 +228,7 @@ class TestGateRetriesBeforeFailingOpen:
     async def test_network_error_then_success_is_judged(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        fake, calls = _make_scripted_query(
-            [ConnectionError("boom"), "DECISION: block filler"]
-        )
+        fake, calls = _make_scripted_query([ConnectionError("boom"), "DECISION: block filler"])
         monkeypatch.setattr(critic, "query", fake)
         v = await critique_outbound("I apologize for the inconvenience.", {"tool": "s"})
         assert v.decision == "block", "a retryable blip must not become a pass"
@@ -240,9 +238,7 @@ class TestGateRetriesBeforeFailingOpen:
     async def test_unparseable_then_success_is_judged(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        fake, calls = _make_scripted_query(
-            ["hmm, hard to say", "DECISION: revise too stiff"]
-        )
+        fake, calls = _make_scripted_query(["hmm, hard to say", "DECISION: revise too stiff"])
         monkeypatch.setattr(critic, "query", fake)
         v = await critique_outbound("Heads up, your 3pm moved.", {"tool": "s"})
         assert v.decision == "revise"
@@ -266,11 +262,10 @@ class TestGateRetriesBeforeFailingOpen:
         assert "could not be parsed" not in seen[0]
         assert "could not be parsed" in seen[1], "retry should tighten the format ask"
 
-    async def test_timeout_then_success_is_judged(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        from luke.config import settings
+    async def test_timeout_then_success_is_judged(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from claude_agent_sdk import AssistantMessage, TextBlock
+
+        from luke.config import settings
 
         calls = [0]
 
@@ -301,9 +296,7 @@ class TestGateRetriesBeforeFailingOpen:
         assert "ConnectionError" in v.reason
         assert calls[0] == 2, "must stop at critic_attempts, not loop forever"
 
-    async def test_attempts_setting_is_honoured(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_attempts_setting_is_honoured(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from luke.config import settings
 
         fake, calls = _make_scripted_query([ConnectionError("boom")])
@@ -324,9 +317,7 @@ class TestGateRetriesBeforeFailingOpen:
         await critique_outbound("Heads up.", {"tool": "s"})
         assert calls[0] == 1
 
-    async def test_freshness_gate_retries_too(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_freshness_gate_retries_too(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # Both gates share _judge; freshness must not be left single-attempt.
         fake, calls = _make_scripted_query(
             [TimeoutError(), "DECISION: block answers a cancelled question"]

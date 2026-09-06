@@ -1602,10 +1602,14 @@ def recent_task_failure_rate(task_id: str, window: int = 10) -> tuple[int, int]:
 
     A rate over a window catches exactly that shape and a streak never will.
     """
-    rows = _db().execute(
-        "SELECT result FROM task_logs WHERE task_id = ? ORDER BY started DESC LIMIT ?",
-        (task_id, window),
-    ).fetchall()
+    rows = (
+        _db()
+        .execute(
+            "SELECT result FROM task_logs WHERE task_id = ? ORDER BY started DESC LIMIT ?",
+            (task_id, window),
+        )
+        .fetchall()
+    )
     runs = len(rows)
     # A run still in flight has result NULL; it is neither a pass nor a fail.
     scored = [str(r[0]) for r in rows if r[0] is not None]

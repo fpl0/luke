@@ -68,7 +68,7 @@ def _parse(raw: Any) -> datetime | None:
         return None
     try:
         dt = datetime.fromisoformat(str(raw))
-    except (ValueError, TypeError):
+    except ValueError, TypeError:
         return None
     return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
 
@@ -84,7 +84,7 @@ def _fasting(now: datetime) -> str | None:
     path = settings.workspace_dir / "health" / "fast_state.json"
     try:
         state = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError, ValueError):
+    except OSError, json.JSONDecodeError, ValueError:
         return None
     if not isinstance(state, dict):
         return None
@@ -133,7 +133,7 @@ def render(
     for provider in providers:
         try:
             line = provider(now)
-        except Exception:  # noqa: BLE001 — a broken provider must stay silent
+        except Exception:
             continue
         if line:
             lines.append(f"- {line}")

@@ -17,8 +17,10 @@ from claude_agent_sdk.types import SyncHookJSONOutput
 from luke.agent import (
     _AUTO_SKILL_THRESHOLD,
     _INTERNAL_RE,
+    _TG_MAX_CAPTION_LEN,
     _VALID_MEMORY_TYPES,
     AgentResult,
+    _bash_reads_a_source,
     _build_stop_hook,
     _context_query,
     _cron_local_time_mismatch,
@@ -26,10 +28,8 @@ from luke.agent import (
     _md_to_html,
     _ok,
     _requests_file_artifact,
-    _bash_reads_a_source,
     _requests_source_read,
     _task_overlap,
-    _TG_MAX_CAPTION_LEN,
     mark_dead_run,
     send_long_message,
     split_caption,
@@ -3018,7 +3018,7 @@ class TestBashReadsASource:
         assert _bash_reads_a_source({"command": cmd}) is True
 
     def test_osascript_inline_tell_mail_counts(self) -> None:
-        cmd = "osascript -e '\ntell application \"Mail\"\nset out to \"\"\nend tell'"
+        cmd = 'osascript -e \'\ntell application "Mail"\nset out to ""\nend tell\''
         assert _bash_reads_a_source({"command": cmd}) is True
 
     def test_calendar_counts(self) -> None:
@@ -3029,9 +3029,10 @@ class TestBashReadsASource:
         for tool in ("mail_scan", "mail_triage", "mail_immigration_watch"):
             cmd = f"python3 workspace/tools/{tool}.py"
             assert _bash_reads_a_source({"command": cmd}) is True, tool
-        assert _bash_reads_a_source(
-            {"command": "python3 workspace/tools/calendar_state_check.py"}
-        ) is True
+        assert (
+            _bash_reads_a_source({"command": "python3 workspace/tools/calendar_state_check.py"})
+            is True
+        )
 
     def test_ordinary_bash_does_not_count(self) -> None:
         """The gate stays sharp — Bash runs nearly every turn."""

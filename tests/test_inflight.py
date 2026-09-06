@@ -130,7 +130,9 @@ def test_write_failure_never_raises(_store, monkeypatch):
     """Best effort by design: losing the marker degrades to today's behaviour
     (a deploy that might interrupt a turn). Killing the turn to protect the
     marker would be strictly worse."""
-    monkeypatch.setattr(inflight, "_path", lambda: (_ for _ in ()).throw(AttributeError("no store_dir")))
+    monkeypatch.setattr(
+        inflight, "_path", lambda: (_ for _ in ()).throw(AttributeError("no store_dir"))
+    )
     inflight.begin(autonomous=False)
     inflight.end(autonomous=False)
 

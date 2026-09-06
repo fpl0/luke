@@ -4,7 +4,7 @@ WHY THIS EXISTS
 ---------------
 ``deploy.sh`` restarts the service with ``launchctl kickstart -k``, which SIGTERMs
 immediately.  ``app.py``'s shutdown handler *does* await its background tasks, but
-launchd's default ``ExitTimeOut`` is 20 seconds and an agent turn runs 5–15 minutes,
+launchd's default ``ExitTimeOut`` is 20 seconds and an agent turn runs 5-15 minutes,
 so the drain never completes: launchd SIGKILLs the process with the turn still open.
 Observed on 2026-08-01 — a 17-minute answer lost during the morning storm, and a
 15:00 cron killed mid-run.
@@ -37,14 +37,12 @@ import functools
 import os
 import time
 from collections.abc import Awaitable, Callable
-from typing import Any, TypeVar
+from typing import Any
 
 from .config import settings
 
 _user_runs = 0
 _auto_runs = 0
-
-T = TypeVar("T")
 
 
 def _path() -> Any:
@@ -101,7 +99,7 @@ def end(*, autonomous: bool) -> None:
     _write()
 
 
-def tracked(fn: Callable[..., Awaitable[T]]) -> Callable[..., Awaitable[T]]:
+def tracked[T](fn: Callable[..., Awaitable[T]]) -> Callable[..., Awaitable[T]]:
     """Decorator: count an async run as in-flight for its whole lifetime.
 
     Reads ``autonomous`` from the call's keyword arguments — ``run_agent`` is

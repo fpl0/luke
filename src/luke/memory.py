@@ -2228,7 +2228,8 @@ def get_lifecycle_candidates() -> dict[str, list[dict[str, Any]]]:
     unused_rows = db.execute(
         """SELECT id, type, last_accessed FROM memory_meta
            WHERE type = 'procedure' AND status = 'active'
-           AND CASE WHEN COALESCE(last_accessed, '') = '' THEN created ELSE last_accessed END < ?""",
+           AND CASE WHEN COALESCE(last_accessed, '') = ''
+                    THEN created ELSE last_accessed END < ?""",
         (unused_cutoff,),
     ).fetchall()
     result["unused_procedures"] = [dict(r) for r in unused_rows]

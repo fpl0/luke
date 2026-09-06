@@ -55,9 +55,7 @@ TOOL_NAME: Final = "mcp__luke__log_deep_work_quality"
 # (two Luke sessions on one trigger is a documented event, 2026-09-03).
 #
 # None means "no gate hook ran for this call" — honest unknown, never False.
-CURRENT_RUN_SHIPPED: ContextVar[bool | None] = ContextVar(
-    "current_run_shipped", default=None
-)
+CURRENT_RUN_SHIPPED: ContextVar[bool | None] = ContextVar("current_run_shipped", default=None)
 
 # Below this, the gate stays out of the way. 3 is the honest rating for a
 # session that did real work nobody has seen yet; 4 is a claim about landing.
@@ -93,6 +91,6 @@ def blocks(tool_name: str, tool_input: object, *, shipped: bool, already_fired: 
         return False
     try:
         rating = int(tool_input.get("rating"))  # type: ignore[arg-type]
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return False
     return rating >= _MIN_GATED_RATING

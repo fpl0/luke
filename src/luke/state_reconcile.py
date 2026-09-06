@@ -44,7 +44,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -52,7 +52,10 @@ LOCAL_TZ = ZoneInfo("Europe/Dublin")
 
 # A message that merely *asks* about a state never revokes it. "Will black tea
 # break my fast?" is not a break. Checked before any revocation pattern.
-_QUESTION = re.compile(r"^\s*(?:will|can|could|should|is|are|am|do|does|did|how|what|when|why|any)\b|\?\s*$", re.I)
+_QUESTION = re.compile(
+    r"^\s*(?:will|can|could|should|is|are|am|do|does|did|how|what|when|why|any)\b|\?\s*$",
+    re.I,
+)
 
 
 @dataclass(frozen=True)
@@ -85,7 +88,8 @@ RULES: tuple[Rule, ...] = (
             r"mid-?fast|"
             r"(?:coming up on|approaching|at|now)\s+hour\s+\d+|"
             r"(?:you'?re|you are|still|currently)\s+fasting|"
-            r"hour\s+\d+\s+of\s+(?:the\s+)?fast(?!\w)(?![^.!?\n]{0,30}\b(?:when|before|and (?:you|he) broke)\b)",
+            r"hour\s+\d+\s+of\s+(?:the\s+)?fast(?!\w)"
+            r"(?![^.!?\n]{0,30}\b(?:when|before|and (?:you|he) broke)\b)",
             re.I,
         ),
         guidance=(
@@ -96,8 +100,12 @@ RULES: tuple[Rule, ...] = (
     ),
     Rule(
         name="fast-not-started",
-        revokes=re.compile(r"\b(?:not|isn'?t|won'?t|didn'?t)\b[^.!?\n]{0,20}\bfast(?:ing)?\b", re.I),
-        asserts=re.compile(r"mid-?fast|hour\s+\d+\s+of\s+(?:the\s+)?fast|(?:you'?re|still)\s+fasting", re.I),
+        revokes=re.compile(
+            r"\b(?:not|isn'?t|won'?t|didn'?t)\b[^.!?\n]{0,20}\bfast(?:ing)?\b", re.I
+        ),
+        asserts=re.compile(
+            r"mid-?fast|hour\s+\d+\s+of\s+(?:the\s+)?fast|(?:you'?re|still)\s+fasting", re.I
+        ),
         guidance="He has said he is not fasting. Do not reference a fast in progress.",
         verify_with="python3 workspace/tools/fast_state.py",
     ),
@@ -148,7 +156,7 @@ def _parse_ts(raw: Any) -> datetime | None:
         return raw if raw.tzinfo else raw.replace(tzinfo=UTC)
     try:
         dt = datetime.fromisoformat(str(raw))
-    except (ValueError, TypeError):
+    except ValueError, TypeError:
         return None
     return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
 
@@ -157,7 +165,13 @@ def _parse_ts(raw: Any) -> datetime | None:
 # *about* a stale phrase while explaining the bug that produced it must not be
 # blocked — the real log caught this: my own "it wrote the 'mid-fast' line
 # without checking the clock" tripped the gate it was describing.
-_QUOTED = re.compile(r"[\"“”'‘’`]([^\"“”'‘’`\n]{1,80})[\"“”'‘’`]|<code>.*?</code>", re.S)
+# The curly quotes below are deliberate: Telegram and macOS both smart-quote, so the
+# literal typographic quote characters must appear in the class to match real messages.
+# RUF001 is suppressed on the pattern line for exactly that reason.
+_QUOTED = re.compile(
+    r"[\"“”'‘’`]([^\"“”'‘’`\n]{1,80})[\"“”'‘’`]|<code>.*?</code>",  # noqa: RUF001
+    re.S,
+)
 
 
 def _strip_quoted(text: str) -> str:
@@ -222,7 +236,7 @@ def reconcile(
                             checked=len(todays),
                         )
         return Verdict(checked=len(todays))
-    except Exception as exc:  # noqa: BLE001 - fail OPEN, never block on a bug
+    except Exception as exc:
         return Verdict(error=f"state-reconcile-error: {exc.__class__.__name__}: {exc}")
 
 

@@ -207,9 +207,7 @@ async def _judge(prompt: str, system_prompt: str, *, gate: str) -> CriticVerdict
             last_error = "unparseable"
 
         if attempt < attempts:
-            log.warning(
-                "critic_retry", gate=gate, attempt=attempt, reason=last_error
-            )
+            log.warning("critic_retry", gate=gate, attempt=attempt, reason=last_error)
 
     log.warning("critic_failed_open", gate=gate, reason=last_error, attempts=attempts)
     return CriticVerdict("pass", f"critic-error: {last_error}")

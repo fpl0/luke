@@ -498,18 +498,14 @@ async def process(chat_id: str) -> None:
                     # Multi-chunk: delete preview, send full
                     with contextlib.suppress(Exception):
                         await bot.delete_message(int(chat_id), result.streaming_msg_id)
-                    await send_long_message(
-                        bot, chat_id=int(chat_id), text=final, autonomous=False
-                    )
+                    await send_long_message(bot, chat_id=int(chat_id), text=final, autonomous=False)
             else:
                 # No streaming preview, or multiple text blocks — send normally
                 if result.streaming_msg_id:
                     with contextlib.suppress(Exception):
                         await bot.delete_message(int(chat_id), result.streaming_msg_id)
                 for text in result.texts:
-                    await send_long_message(
-                        bot, chat_id=int(chat_id), text=text, autonomous=False
-                    )
+                    await send_long_message(bot, chat_id=int(chat_id), text=text, autonomous=False)
         elif result.streaming_msg_id:
             # Agent sent messages via tools — clean up streaming preview
             with contextlib.suppress(Exception):
@@ -1572,9 +1568,7 @@ async def main() -> None:
 
     async with asyncio.TaskGroup() as tg:
         tg.create_task(_resilient_polling())
-        scheduler_task = tg.create_task(
-            start_scheduler_loop(bot, _sem, shutdown=shutdown_event)
-        )
+        scheduler_task = tg.create_task(start_scheduler_loop(bot, _sem, shutdown=shutdown_event))
 
         async def _wait_for_shutdown() -> None:
             await shutdown_event.wait()

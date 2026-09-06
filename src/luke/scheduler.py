@@ -198,7 +198,7 @@ def _rate_alert_is_due(task_id: str, now_iso: str) -> bool:
         elapsed = (
             ensure_utc(datetime.fromisoformat(now_iso)) - ensure_utc(datetime.fromisoformat(last))
         ).total_seconds()
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return True
     return elapsed >= _FAILURE_RATE_QUIET_H * 3600
 
@@ -221,7 +221,7 @@ def _rearm_is_due(task_id: str, now_iso: str) -> bool:
         elapsed = (
             ensure_utc(datetime.fromisoformat(now_iso)) - ensure_utc(datetime.fromisoformat(last))
         ).total_seconds()
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return False
     return elapsed >= _REARM_QUIET_H * 3600
 
@@ -392,9 +392,7 @@ async def _run_task(task: TaskRecord, bot: Bot) -> None:
             # tear-down coming back as an exception, not a fault in the task.
             interrupted_at = finished
             db.log_task_run(task_id, started, finished, f"interrupted: {detail}")
-            log.warning(
-                "task_interrupted_by_shutdown", task_id=task_id, detail=detail
-            )
+            log.warning("task_interrupted_by_shutdown", task_id=task_id, detail=detail)
             return
         db.log_task_run(task_id, started, finished, f"error: {detail}")
         log.exception("Task failed", task_id=task_id)

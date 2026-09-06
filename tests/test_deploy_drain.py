@@ -31,9 +31,10 @@ def run_snippet(luke_dir: Path, snippet: str, env: dict[str, str] | None = None)
     # in this file passed by hand and failed inside the deploy on 2026-09-06,
     # which is the good outcome: the gate caught it. The environment a test
     # runs in must not depend on who launched it.
-    full_env = {
-        k: v for k, v in os.environ.items() if k != "LUKE_DEPLOY_DETACHED"
-    } | {"LUKE_DIR": str(luke_dir), **(env or {})}
+    full_env = {k: v for k, v in os.environ.items() if k != "LUKE_DEPLOY_DETACHED"} | {
+        "LUKE_DIR": str(luke_dir),
+        **(env or {}),
+    }
     proc = subprocess.run(
         ["bash", "-c", script],
         capture_output=True,
@@ -68,7 +69,10 @@ def luke_dir(tmp_path: Path) -> Path:
 
 def test_source_only_mode_defines_the_guards_without_deploying(luke_dir):
     """If sourcing ran the pipeline, these tests would deploy the repo."""
-    rc, out = run_snippet(luke_dir, 'declare -F wait_for_idle inflight_busy inside_luke_tree luke_is_live')
+    rc, out = run_snippet(
+        luke_dir,
+        "declare -F wait_for_idle inflight_busy inside_luke_tree luke_is_live",
+    )
     assert rc == 0
     for fn in ("wait_for_idle", "inflight_busy", "inside_luke_tree", "luke_is_live"):
         assert fn in out
@@ -207,16 +211,18 @@ class TestDetachedDeployDiscountsItsOwnCaller:
     def test_a_second_autonomous_run_still_blocks(self, luke_dir):
         """Discount ONE. Two runs means one of them is somebody else's work."""
         write_state(luke_dir, inflight=(os.getpid(), 0, 2))
-        rc, out = run_snippet(luke_dir, 'inflight_busy && echo "REASON=$DRAIN_REASON"',
-                              env=self.DETACHED)
+        rc, out = run_snippet(
+            luke_dir, 'inflight_busy && echo "REASON=$DRAIN_REASON"', env=self.DETACHED
+        )
         assert rc == 0
         assert "REASON=1 autonomous run(s)" in out
 
     def test_a_user_turn_still_blocks_a_detached_deploy(self, luke_dir):
         """His turn outranks the cron that launched the deploy. Wait for it."""
         write_state(luke_dir, inflight=(os.getpid(), 1, 1))
-        rc, out = run_snippet(luke_dir, 'inflight_busy && echo "REASON=$DRAIN_REASON"',
-                              env=self.DETACHED)
+        rc, out = run_snippet(
+            luke_dir, 'inflight_busy && echo "REASON=$DRAIN_REASON"', env=self.DETACHED
+        )
         assert rc == 0
         assert "REASON=1 user turn(s)" in out
 
@@ -343,7 +349,7 @@ def test_flags_and_branch_parse_in_any_order(luke_dir, argv, expect):
     merge a branch named '--no-drain'."""
     args = " ".join(f'"{a}"' for a in argv)
     script = (
-        f'set -- {args}\n'
+        f"set -- {args}\n"
         f'DEPLOY_SH_SOURCE_ONLY=1 source "{DEPLOY_SH}"\n'
         'echo "branch=$FEATURE_BRANCH drain=$DRAIN auto=$DRAIN_AUTONOMOUS"\n'
     )
@@ -418,12 +424,20 @@ def test_runner_carries_the_callers_path(luke_dir):
     guard died on `uv not found` in step 1 for exactly this reason."""
     body = build_runner(luke_dir)
     assert "export PATH=" in body
-    assert "uv" in subprocess.run(
-        ["bash", "-c", f'{[l for l in body.splitlines() if l.startswith("export PATH=")][0]}; command -v uv'],
-        capture_output=True,
-        text=True,
-        timeout=30,
-    ).stdout
+    assert (
+        "uv"
+        in subprocess.run(
+            [
+                "bash",
+                "-c",
+                f"{next(ln for ln in body.splitlines() if ln.startswith('export PATH='))}; "
+                "command -v uv",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        ).stdout
+    )
 
 
 def test_runner_forwards_arguments(luke_dir):
@@ -514,11 +528,15 @@ def write_messages_db(luke_dir: Path, ages_minutes: list[float] | None) -> None:
     from datetime import UTC, datetime, timedelta
 
     conn = sqlite3.connect(luke_dir / "luke.db")
-    conn.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY, sender TEXT, content TEXT, ts TEXT)")
+    conn.execute(
+        "CREATE TABLE messages (id INTEGER PRIMARY KEY, sender TEXT, content TEXT, ts TEXT)"
+    )
     now = datetime.now(UTC)
-    for i, age in enumerate(ages_minutes):
+    for age in ages_minutes:
         ts = (now - timedelta(minutes=age)).isoformat()
-        conn.execute("INSERT INTO messages (sender, content, ts) VALUES (?,?,?)", ("Filipe", "x", ts))
+        conn.execute(
+            "INSERT INTO messages (sender, content, ts) VALUES (?,?,?)", ("Filipe", "x", ts)
+        )
     conn.commit()
     conn.close()
 
@@ -526,13 +544,13 @@ def write_messages_db(luke_dir: Path, ages_minutes: list[float] | None) -> None:
 @pytest.mark.parametrize(
     "ages,quiet_min,expect_live",
     [
-        ([1.0], 10, True),        # mid-exchange — the case that broke
-        ([3.0], 10, True),        # still inside the window
-        ([30.0], 10, False),      # long quiet — deploy freely
-        ([1.0], 0, False),        # explicitly disabled
-        ([], 10, False),          # empty table ⇒ cannot tell ⇒ must not block
-        (None, 10, False),        # no db at all ⇒ cannot tell ⇒ must not block
-        ([-120.0], 10, False),    # clock skew into the future ⇒ must not block
+        ([1.0], 10, True),  # mid-exchange — the case that broke
+        ([3.0], 10, True),  # still inside the window
+        ([30.0], 10, False),  # long quiet — deploy freely
+        ([1.0], 0, False),  # explicitly disabled
+        ([], 10, False),  # empty table ⇒ cannot tell ⇒ must not block
+        (None, 10, False),  # no db at all ⇒ cannot tell ⇒ must not block
+        ([-120.0], 10, False),  # clock skew into the future ⇒ must not block
         ([45.0, 2.0], 10, True),  # MAX(ts) wins, not row order
     ],
 )
@@ -540,7 +558,7 @@ def test_conversation_is_live(luke_dir, ages, quiet_min, expect_live):
     write_messages_db(luke_dir, ages)
     rc, out = run_snippet(
         luke_dir,
-        'conversation_is_live && echo LIVE || echo QUIET',
+        "conversation_is_live && echo LIVE || echo QUIET",
         env={"CONVERSATION_QUIET_MIN": str(quiet_min)},
     )
     assert rc == 0, out
@@ -554,18 +572,18 @@ def test_drain_blocks_between_turns_even_with_nothing_in_flight(luke_dir):
     """
     write_state(luke_dir, inflight=(os.getpid(), 0, 0))
     write_messages_db(luke_dir, [1.0])
-    rc, out = run_snippet(luke_dir, 'drain_blocked && echo BLOCKED || echo FREE')
+    rc, out = run_snippet(luke_dir, "drain_blocked && echo BLOCKED || echo FREE")
     assert rc == 0, out
     assert "BLOCKED" in out, out
     # and the old, narrower signal genuinely reads idle — proving the gap was real
-    rc2, out2 = run_snippet(luke_dir, 'inflight_busy && echo BUSY || echo IDLE')
+    _, out2 = run_snippet(luke_dir, "inflight_busy && echo BUSY || echo IDLE")
     assert "IDLE" in out2, out2
 
 
 def test_drain_frees_once_the_conversation_goes_quiet(luke_dir):
     write_state(luke_dir, inflight=(os.getpid(), 0, 0))
     write_messages_db(luke_dir, [45.0])
-    rc, out = run_snippet(luke_dir, 'drain_blocked && echo BLOCKED || echo FREE')
+    rc, out = run_snippet(luke_dir, "drain_blocked && echo BLOCKED || echo FREE")
     assert rc == 0, out
     assert "FREE" in out, out
 
@@ -576,11 +594,13 @@ def test_check_drain_flag_is_read_only_and_reports(luke_dir):
     write_messages_db(luke_dir, [1.0])
     proc = subprocess.run(
         ["bash", str(DEPLOY_SH), "--check-drain"],
-        capture_output=True, text=True, timeout=60,
+        capture_output=True,
+        text=True,
+        timeout=60,
         env={**os.environ, "LUKE_DIR": str(luke_dir)},
     )
     combined = proc.stdout + proc.stderr
-    assert proc.returncode == 1, combined      # 1 = would wait
+    assert proc.returncode == 1, combined  # 1 = would wait
     assert "CONVERSATION OPEN" in combined, combined
     assert "Step 1/5" not in combined, combined
 

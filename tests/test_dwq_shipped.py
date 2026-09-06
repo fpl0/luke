@@ -63,9 +63,7 @@ def test_migration_adds_a_nullable_column(test_db, clean_ctx):
     # every reading downstream would inherit the fiction.
     con = sqlite3.connect(settings.store_dir / "luke.db")
     try:
-        con.execute(
-            "INSERT INTO deep_work_quality (goal_id, rating) VALUES ('legacy', 3)"
-        )
+        con.execute("INSERT INTO deep_work_quality (goal_id, rating) VALUES ('legacy', 3)")
         con.commit()
         assert con.execute(
             "SELECT shipped FROM deep_work_quality WHERE goal_id='legacy'"

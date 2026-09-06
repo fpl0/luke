@@ -6,11 +6,11 @@ and said so. The freshness gate could not catch these: its window is 15
 minutes and the break was 7h29m old by the 21:00 check-in.
 """
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 
 import pytest
 
-from luke.state_reconcile import RULES, Verdict, block_reason, reconcile
+from luke.state_reconcile import RULES, block_reason, reconcile
 
 NOW = datetime(2026, 8, 8, 20, 0, tzinfo=UTC)  # 21:00 Dublin, when it fired
 
@@ -24,14 +24,18 @@ BREAK = msg("I just broke the fasfastingting", 12, 52)  # his actual typo
 
 class TestTheEightAugustMiss:
     def test_evening_checkin_hour_count_is_blocked(self):
-        v = reconcile("Coming up on hour 47 of the fast, if my arithmetic's holding.",
-                      [BREAK], now=NOW)
+        v = reconcile(
+            "Coming up on hour 47 of the fast, if my arithmetic's holding.", [BREAK], now=NOW
+        )
         assert v.blocked
         assert v.rule == "fast-already-broken"
 
     def test_video_shelf_midfast_framing_is_blocked(self):
-        v = reconcile("You're mid-fast with Monday coming, so nothing that feels like homework.",
-                      [BREAK], now=NOW)
+        v = reconcile(
+            "You're mid-fast with Monday coming, so nothing that feels like homework.",
+            [BREAK],
+            now=NOW,
+        )
         assert v.blocked
 
     def test_block_reason_quotes_him_and_names_the_tool(self):
@@ -53,26 +57,31 @@ class TestDoesNotOverblock:
         assert not reconcile("How was the rest of the day?", [BREAK], now=NOW).blocked
 
     def test_past_tense_discussion_of_the_broken_fast_is_fine(self):
-        v = reconcile("41 hours is your longest yet, and you called it yourself.",
-                      [BREAK], now=NOW)
+        v = reconcile("41 hours is your longest yet, and you called it yourself.", [BREAK], now=NOW)
         assert not v.blocked
 
     def test_no_revocation_means_an_hour_count_is_allowed(self):
-        v = reconcile("Coming up on hour 20 of the fast.",
-                      [msg("Started at 21:00 last night", 8)], now=NOW)
+        v = reconcile(
+            "Coming up on hour 20 of the fast.", [msg("Started at 21:00 last night", 8)], now=NOW
+        )
         assert not v.blocked
 
-    @pytest.mark.parametrize("q", [
-        "Will black tea break my fast?",
-        "Is it too late to break the fast tomorrow at 21:00?",
-        "How much time have I fasted?",
-    ])
+    @pytest.mark.parametrize(
+        "q",
+        [
+            "Will black tea break my fast?",
+            "Is it too late to break the fast tomorrow at 21:00?",
+            "How much time have I fasted?",
+        ],
+    )
     def test_questions_never_revoke(self, q):
         assert not reconcile("hour 47 of the fast", [msg(q, 11)], now=NOW).blocked
 
     def test_yesterdays_break_does_not_kill_todays_fast(self):
-        y = {"content": "I just broke the fast",
-             "timestamp": datetime(2026, 8, 7, 18, 0, tzinfo=UTC)}
+        y = {
+            "content": "I just broke the fast",
+            "timestamp": datetime(2026, 8, 7, 18, 0, tzinfo=UTC),
+        }
         assert not reconcile("hour 12 of the fast", [y], now=NOW).blocked
 
     def test_empty_draft_and_no_history_are_silent(self):
@@ -92,7 +101,9 @@ class TestFailsOpen:
         class Exploding:
             def search(self, _):
                 raise RuntimeError("boom")
+
         from luke.state_reconcile import Rule
+
         bad = (Rule("x", Exploding(), Exploding(), "g"),)
         v = reconcile("anything", [BREAK], now=NOW, rules=bad)
         assert not v.blocked and "state-reconcile-error" in v.error
@@ -100,13 +111,19 @@ class TestFailsOpen:
 
 class TestOtherRules:
     def test_already_called_him_blocks_a_reminder_to_call(self):
-        v = reconcile("Don't forget to call Christopher tonight.",
-                      [msg("I just called him. It all good.", 18, 35)], now=NOW)
+        v = reconcile(
+            "Don't forget to call Christopher tonight.",
+            [msg("I just called him. It all good.", 18, 35)],
+            now=NOW,
+        )
         assert v.blocked and v.rule == "already-done-it"
 
     def test_asking_how_the_call_went_is_still_fine(self):
-        v = reconcile("How did the call with Christopher go?",
-                      [msg("I just called him. It all good.", 18, 35)], now=NOW)
+        v = reconcile(
+            "How did the call with Christopher go?",
+            [msg("I just called him. It all good.", 18, 35)],
+            now=NOW,
+        )
         assert not v.blocked
 
     def test_every_rule_has_guidance(self):
@@ -126,32 +143,48 @@ class TestFoundByReplayingTheRealLog:
 
     def test_my_own_correction_is_not_blocked(self):
         """'You broke it at 13:52, hour 41' is the RIGHT message to send."""
-        v = reconcile("Fair hit. You broke it at 13:52 today, hour 41 — and the shelf still went out.",
-                      [BREAK], now=NOW)
+        v = reconcile(
+            "Fair hit. You broke it at 13:52 today, hour 41 — and the shelf still went out.",
+            [BREAK],
+            now=NOW,
+        )
         assert not v.blocked
 
     def test_explaining_the_stale_message_is_not_blocked(self):
-        v = reconcile("The cron wrote 'mid-fast' without checking the clock. That's the bug.",
-                      [BREAK], now=NOW)
-        assert not v.blocked or True  # quoting the bad phrase is allowed in an explanation
+        """Quoting the bad phrase while explaining the bug must not trip the gate."""
+        v = reconcile(
+            "The cron wrote 'mid-fast' without checking the clock. That's the bug.",
+            [BREAK],
+            now=NOW,
+        )
+        assert not v.blocked
 
     def test_present_tense_assertion_still_blocked(self):
-        for draft in ["You're still fasting, so go gently.",
-                      "Coming up on hour 47.",
-                      "mid-fast with Monday coming"]:
+        for draft in [
+            "You're still fasting, so go gently.",
+            "Coming up on hour 47.",
+            "mid-fast with Monday coming",
+        ]:
             assert reconcile(draft, [BREAK], now=NOW).blocked, draft
 
     def test_quoted_stale_phrase_while_explaining_the_bug_is_not_blocked(self):
-        v = reconcile('It wrote the "mid-fast" line without checking the clock. That is the bug.',
-                      [BREAK], now=NOW)
+        v = reconcile(
+            'It wrote the "mid-fast" line without checking the clock. That is the bug.',
+            [BREAK],
+            now=NOW,
+        )
         assert not v.blocked
 
     def test_code_fenced_stale_phrase_is_not_blocked(self):
-        v = reconcile("The cron said <code>hour 47 of the fast</code> and that was wrong.",
-                      [BREAK], now=NOW)
+        v = reconcile(
+            "The cron said <code>hour 47 of the fast</code> and that was wrong.", [BREAK], now=NOW
+        )
         assert not v.blocked
 
     def test_but_an_unquoted_assertion_beside_a_quote_still_blocks(self):
-        v = reconcile('It wrote the "mid-fast" line. Anyway, you\'re still fasting so go gently.',
-                      [BREAK], now=NOW)
+        v = reconcile(
+            'It wrote the "mid-fast" line. Anyway, you\'re still fasting so go gently.',
+            [BREAK],
+            now=NOW,
+        )
         assert v.blocked

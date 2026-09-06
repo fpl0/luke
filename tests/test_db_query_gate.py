@@ -18,7 +18,7 @@ REAL_MISSES = [
     'sqlite3 luke.db "pragma table_info(tasks);"',
     'sqlite3 luke.db ".schema messages"',
     'sqlite3 luke.db ".schema tasks" | head -20',
-    "sqlite3 /Users/filipelm/Luke/luke.db \"select id, type, substr(title,1,70) from memory_meta\"",
+    'sqlite3 /Users/filipelm/Luke/luke.db "select id, type, substr(title,1,70) from memory_meta"',
     'sqlite3 luke.db "select ts, sender, substr(text,1,300) from messages order by ts desc"',
     "python3 -c \"import sqlite3; c=sqlite3.connect('/Users/filipelm/Luke/luke.db')\"",
     "cd /Users/filipelm/Luke && sqlite3 luke.db 'select created_at from events'",

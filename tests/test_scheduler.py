@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, ClassVar
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -1386,7 +1386,11 @@ class TestIntermittentFailureAlert:
     said so regardless of cause.
     """
 
-    TASK = {"id": "t1", "prompt": "DAILY SELF-REFLECTION (00:00)", "chat_id": "12345"}
+    TASK: ClassVar[dict[str, str]] = {
+        "id": "t1",
+        "prompt": "DAILY SELF-REFLECTION (00:00)",
+        "chat_id": "12345",
+    }
     NOW = "2026-08-14T00:09:40+00:00"
 
     def _alert(self, rate: tuple[int, int], last_alert: str | None = None) -> str | None:

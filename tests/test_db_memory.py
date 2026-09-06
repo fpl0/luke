@@ -1270,7 +1270,9 @@ class TestSimilarityScale:
     def test_unrelated_content_classifies_as_independent(
         self, test_db: Any, monkeypatch: Any
     ) -> None:
-        monkeypatch.setattr(memory, "_embed_passage", lambda t: [1.0, 0.0] if "a" in t else [0.0, 1.0])
+        monkeypatch.setattr(
+            memory, "_embed_passage", lambda t: [1.0, 0.0] if "a" in t else [0.0, 1.0]
+        )
         assert memory.classify_relationship("aaa", "zzz") == "independent"
 
 
