@@ -16,6 +16,7 @@ from pydantic import BaseModel
 from structlog.stdlib import BoundLogger
 
 from .config import settings
+from .rating_gate import CURRENT_RUN_SHIPPED
 
 log: BoundLogger = structlog.get_logger()
 
@@ -543,6 +544,26 @@ _MIGRATIONS: list[tuple[int, str, list[str]]] = [
             # provenance, so the conservative reading is the old behaviour, and
             # the window is an hour — it self-corrects almost immediately.
             "ALTER TABLE outbound_log ADD COLUMN autonomous INTEGER NOT NULL DEFAULT 1",
+        ],
+    ),
+    (
+        17,
+        "deep_work_quality.shipped — persist the fact the rating gate already computes",
+        [
+            # 2026-09-06. rating_gate.py has been handed `shipped` on every
+            # single rating since 3 Sep — did any send or artifact tool succeed
+            # in this run — and has thrown it away the instant it decided not
+            # to block. deep_work_calibration.py then has to reconstruct reach
+            # from the messages table BY DATE, and says so in its own output:
+            # "nothing links a send to the session that produced it". A fact
+            # computed at the point of truth and discarded, then guessed at
+            # from a proxy one layer down.
+            #
+            # NULL, not 0, for the 501 historical rows. They were written
+            # before anything recorded this and "unknown" is the honest value —
+            # backfilling 0 would manufacture 501 unshipped sessions and every
+            # reading downstream would inherit the fiction.
+            "ALTER TABLE deep_work_quality ADD COLUMN shipped INTEGER DEFAULT NULL",
         ],
     ),
 ]
@@ -1617,13 +1638,20 @@ def get_rolling_avg_cost(days: int = 7) -> float:
 
 
 def log_deep_work_quality(goal_id: str, rating: int) -> None:
-    """Record a deep work session quality rating (1-5) for a goal."""
+    """Record a deep work session quality rating (1-5) for a goal.
+
+    `shipped` is not a parameter: the honest value is a property of the RUN,
+    not of anything the rater can assert, so it is read from the contextvar the
+    pre-tool hook publishes. None when no hook ran (direct call, test, a path
+    that bypasses the agent) — unknown, which is not the same as False.
+    """
     if not 1 <= rating <= 5:
         return
+    shipped = CURRENT_RUN_SHIPPED.get()
     conn = _db()
     conn.execute(
-        "INSERT INTO deep_work_quality (goal_id, rating) VALUES (?, ?)",
-        (goal_id, rating),
+        "INSERT INTO deep_work_quality (goal_id, rating, shipped) VALUES (?, ?, ?)",
+        (goal_id, rating, None if shipped is None else int(shipped)),
     )
     _commit(conn)
 

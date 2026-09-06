@@ -63,7 +63,9 @@ from .config import settings
 from .db_query_gate import REASON as DB_QUERY_GATE_REASON
 from .db_query_gate import blocks_tool_input as blocks_db_query
 from .memory import MEMORY_DIRS, read_frontmatter, read_memory_body, sanitize_memory_id
+from .rating_gate import CURRENT_RUN_SHIPPED as RUN_SHIPPED
 from .rating_gate import REASON as RATING_GATE_REASON
+from .rating_gate import TOOL_NAME as RATING_TOOL_NAME
 from .rating_gate import blocks as blocks_unlanded_rating
 from .sdk_io import cli_stderr
 
@@ -2734,10 +2736,16 @@ async def run_agent(
         # A 4 is a claim that the work landed. Block it once when this run
         # shipped nothing at all — see rating_gate.py for the measurement that
         # made this a gate instead of a fourth advisory note.
+        run_shipped = bool(send_count["n"] or artifact_delivered_count["n"])
+        if tool_name == RATING_TOOL_NAME:
+            # Publish it for the writer. The gate below only ever consumed this
+            # to decide a block; the number it describes is worth keeping on
+            # the row itself. See rating_gate.CURRENT_RUN_SHIPPED.
+            RUN_SHIPPED.set(run_shipped)
         if blocks_unlanded_rating(
             tool_name,
             input_data["tool_input"],
-            shipped=bool(send_count["n"] or artifact_delivered_count["n"]),
+            shipped=run_shipped,
             already_fired=bool(rating_gate_fired["n"]),
         ):
             rating_gate_fired["n"] = 1

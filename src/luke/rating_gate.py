@@ -39,9 +39,25 @@ on all nine and trained a reflex click-through. Gating at >=4 fires on three.
 
 from __future__ import annotations
 
+from contextvars import ContextVar
 from typing import Final
 
 TOOL_NAME: Final = "mcp__luke__log_deep_work_quality"
+
+# The run's shipped fact, published so the WRITER can persist it.
+#
+# 2026-09-06. Until tonight this module was handed `shipped` on every rating
+# and dropped it the moment it decided not to block. `deep_work_calibration.py`
+# then reconstructed reach from the messages table by DATE and printed the
+# caveat in its own output — "nothing links a send to the session that produced
+# it". The fact was computed at the point of truth and guessed at one layer
+# down. A ContextVar rather than a module global because runs are concurrent
+# (two Luke sessions on one trigger is a documented event, 2026-09-03).
+#
+# None means "no gate hook ran for this call" — honest unknown, never False.
+CURRENT_RUN_SHIPPED: ContextVar[bool | None] = ContextVar(
+    "current_run_shipped", default=None
+)
 
 # Below this, the gate stays out of the way. 3 is the honest rating for a
 # session that did real work nobody has seen yet; 4 is a claim about landing.
