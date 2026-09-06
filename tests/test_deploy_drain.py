@@ -24,7 +24,16 @@ DEPLOY_SH = Path(__file__).resolve().parents[1] / "deploy.sh"
 def run_snippet(luke_dir: Path, snippet: str, env: dict[str, str] | None = None) -> tuple[int, str]:
     """Source deploy.sh's definitions, then run `snippet`. Returns (rc, output)."""
     script = f'DEPLOY_SH_SOURCE_ONLY=1 source "{DEPLOY_SH}"\n{snippet}\n'
-    full_env = {**os.environ, "LUKE_DIR": str(luke_dir), **(env or {})}
+    # Scrub LUKE_DEPLOY_DETACHED unless the case asks for it. Every deploy
+    # launched from inside Luke — which is every deploy Luke does — re-execs
+    # through a runner that exports it, so step 1's test suite inherits it and
+    # `inflight_busy` silently discounts one run in EVERY case here. Six tests
+    # in this file passed by hand and failed inside the deploy on 2026-09-06,
+    # which is the good outcome: the gate caught it. The environment a test
+    # runs in must not depend on who launched it.
+    full_env = {
+        k: v for k, v in os.environ.items() if k != "LUKE_DEPLOY_DETACHED"
+    } | {"LUKE_DIR": str(luke_dir), **(env or {})}
     proc = subprocess.run(
         ["bash", "-c", script],
         capture_output=True,
