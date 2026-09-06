@@ -14,6 +14,7 @@ import os
 import subprocess
 import time
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 
@@ -174,6 +175,59 @@ def test_marker_from_a_dead_process_is_ignored(luke_dir):
     write_state(luke_dir, hb_pid=os.getpid(), inflight=(os.getpid() + 12345, 1, 0))
     rc, _ = run_snippet(luke_dir, "inflight_busy")
     assert rc == 1
+
+
+class TestDetachedDeployDiscountsItsOwnCaller:
+    """A deploy launched from inside Luke must not wait for the run that launched it.
+
+    2026-09-06, 00:08 to 00:26 UTC: the midnight self-reflection cron deployed its
+    own fix. `LUKE_DEPLOY_DETACHED=1` was set (the re-exec only happens inside
+    the process tree), the marker read `autos=1`, and that 1 WAS the caller.
+    The drain printed "still busy (1 autonomous run(s))" every 60s for the full
+    900s, restarted anyway, killed the caller, and the tear-down was logged as
+    that cron's sixth "failure" — which alarmed Filipe's phone at 01:26.
+    """
+
+    DETACHED: ClassVar[dict[str, str]] = {"LUKE_DEPLOY_DETACHED": "1"}
+
+    def test_the_callers_own_autonomous_run_is_discounted(self, luke_dir):
+        write_state(luke_dir, inflight=(os.getpid(), 0, 1))
+        rc, _ = run_snippet(luke_dir, "inflight_busy", env=self.DETACHED)
+        assert rc == 1, "the only autonomous run is our own caller — not a reason to wait"
+
+    def test_a_second_autonomous_run_still_blocks(self, luke_dir):
+        """Discount ONE. Two runs means one of them is somebody else's work."""
+        write_state(luke_dir, inflight=(os.getpid(), 0, 2))
+        rc, out = run_snippet(luke_dir, 'inflight_busy && echo "REASON=$DRAIN_REASON"',
+                              env=self.DETACHED)
+        assert rc == 0
+        assert "REASON=1 autonomous run(s)" in out
+
+    def test_a_user_turn_still_blocks_a_detached_deploy(self, luke_dir):
+        """His turn outranks the cron that launched the deploy. Wait for it."""
+        write_state(luke_dir, inflight=(os.getpid(), 1, 1))
+        rc, out = run_snippet(luke_dir, 'inflight_busy && echo "REASON=$DRAIN_REASON"',
+                              env=self.DETACHED)
+        assert rc == 0
+        assert "REASON=1 user turn(s)" in out
+
+    def test_a_user_initiated_detached_deploy_discounts_its_own_turn(self, luke_dir):
+        """Same deadlock, other bucket: 'Luke, deploy this' from the chat."""
+        write_state(luke_dir, inflight=(os.getpid(), 1, 0))
+        rc, _ = run_snippet(luke_dir, "inflight_busy", env=self.DETACHED)
+        assert rc == 1
+
+    def test_an_attached_deploy_discounts_nothing(self, luke_dir):
+        """Run from a terminal outside Luke, every counted run is somebody else's."""
+        write_state(luke_dir, inflight=(os.getpid(), 0, 1))
+        rc, _ = run_snippet(luke_dir, "inflight_busy")
+        assert rc == 0
+
+    def test_the_discount_cannot_underflow_into_busy(self, luke_dir):
+        """(( 0 - 1 )) in bash is -1, and -1 > 0 is false — but assert it."""
+        write_state(luke_dir, inflight=(os.getpid(), 0, 0))
+        rc, _ = run_snippet(luke_dir, "inflight_busy", env=self.DETACHED)
+        assert rc == 1
 
 
 def test_missing_or_malformed_marker_reads_as_idle(luke_dir):

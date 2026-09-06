@@ -58,6 +58,34 @@ CRON_CATCHUP_GRACE = timedelta(hours=1)
 # queued work starts in ~0s instead of up to a full scheduler_interval later.
 _wake = asyncio.Event()
 
+# The shutdown event the loop was started with, published module-wide so the
+# failure path can tell "this task died" from "we killed this task".
+#
+# Every one of f580ac19's six recorded failures (11/13/14/15 Aug, 3 Sep, 6 Sep
+# 2026) has the same log signature: `stopping` → `Draining running tasks` →
+# `agent_result_error`. The run never failed. A deploy — usually one the run
+# itself had just launched — SIGTERMed the process out from under it, and the
+# tear-down was written into task_logs as `error`, counted into
+# consecutive_failures, and eventually fired an intermittent-failure alarm at
+# 01:26 in the morning about a task that had never once failed on its own.
+#
+# A signal you generate yourself is not evidence about the thing you pointed it
+# at. Anything killed inside the drain is recorded as `interrupted`, which the
+# rate readers (db.recent_task_failure_rate, task_failure_rate_check.py) do not
+# count, because both score on the `error` prefix.
+_shutdown: asyncio.Event | None = None
+
+
+def shutting_down() -> bool:
+    """True while the process is tearing down — set by the shutdown signal."""
+    return _shutdown is not None and _shutdown.is_set()
+
+
+def _release_shutdown() -> None:
+    """Forget the loop's shutdown event once the drain is over."""
+    global _shutdown
+    _shutdown = None
+
 
 class AgentRunFailed(RuntimeError):
     """The agent run returned without raising, but did not actually happen.
@@ -175,6 +203,29 @@ def _rate_alert_is_due(task_id: str, now_iso: str) -> bool:
     return elapsed >= _FAILURE_RATE_QUIET_H * 3600
 
 
+_REARM_QUIET_H = 1  # at most one re-arm an hour per once-task
+
+
+def _rearm_is_due(task_id: str, now_iso: str) -> bool:
+    """True when this once-task may be re-armed after a tear-down killed it.
+
+    The mirror image of `_rate_alert_is_due`, and it fails the other way: an
+    unreadable throttle blocks the re-arm. Firing a scheduled send twice is a
+    message to Filipe he did not ask for; not firing it is a gap I can see in
+    task_logs. Prefer the visible failure.
+    """
+    last = db.get_behavior_last_run(f"task_rearm:{task_id}")
+    if not last:
+        return True
+    try:
+        elapsed = (
+            ensure_utc(datetime.fromisoformat(now_iso)) - ensure_utc(datetime.fromisoformat(last))
+        ).total_seconds()
+    except (TypeError, ValueError):
+        return False
+    return elapsed >= _REARM_QUIET_H * 3600
+
+
 def _intermittent_failure_alert(task: TaskRecord, task_id: str, finished: str) -> str | None:
     """The alert text for a task failing intermittently, or None.
 
@@ -246,6 +297,11 @@ async def _run_task(task: TaskRecord, bot: Bot) -> None:
         chat_id=task["chat_id"],
         type=task["schedule_type"],
     )
+
+    # Set to the timestamp of a tear-down that killed this run mid-flight, so
+    # the `finally` clause below can tell a run that finished from a run we cut
+    # off — a once-task cut off has never had its moment and must keep it.
+    interrupted_at: str | None = None
 
     raw_prompt = task["prompt"]
     if isinstance(raw_prompt, bytes):
@@ -331,6 +387,15 @@ async def _run_task(task: TaskRecord, bot: Bot) -> None:
         # from luke.db alone — otherwise the cause lives only in structlog
         # and self-reflection sees a bare "error" black box.
         detail = f"{type(exc).__name__}: {exc}".replace("\n", " ")[:500]
+        if shutting_down():
+            # We killed it. See the note on `_shutdown` above: this is our own
+            # tear-down coming back as an exception, not a fault in the task.
+            interrupted_at = finished
+            db.log_task_run(task_id, started, finished, f"interrupted: {detail}")
+            log.warning(
+                "task_interrupted_by_shutdown", task_id=task_id, detail=detail
+            )
+            return
         db.log_task_run(task_id, started, finished, f"error: {detail}")
         log.exception("Task failed", task_id=task_id)
         count = db.increment_task_failures(task_id)
@@ -378,8 +443,27 @@ async def _run_task(task: TaskRecord, bot: Bot) -> None:
         if task["schedule_type"] == "once":
             db.update_task_status(task_id, "completed")
     finally:
-        # Always update last_run to prevent immediate re-firing on next tick
-        db.update_task_last_run(task_id, started)
+        # `_is_due` disarms a once-task the moment last_run is set, so writing
+        # it here for a run WE cut off is how a one-off send dies silently: the
+        # citizenship checkpoint, a fasting-prep note, a delegated job's only
+        # report. Leaving last_run unset re-arms it for the next tick after the
+        # restart, which is the behaviour a deploy should have had all along.
+        #
+        # Capped to one re-arm an hour per task, because the other shape here is
+        # a crash loop: restart, fire, die, restart. An hour is far longer than
+        # a guardian restart cycle and far shorter than any once-task's useful
+        # life. Cron and interval tasks keep the normal write — their next slot
+        # comes around on its own, and CRON_CATCHUP_GRACE already governs it.
+        if (
+            interrupted_at is not None
+            and task["schedule_type"] == "once"
+            and _rearm_is_due(task_id, interrupted_at)
+        ):
+            db.set_behavior_last_run(f"task_rearm:{task_id}", interrupted_at)
+            log.warning("once_task_rearmed_after_interruption", task_id=task_id)
+        else:
+            # Always update last_run to prevent immediate re-firing on next tick
+            db.update_task_last_run(task_id, started)
 
 
 async def _deliver_delegation_report(
@@ -421,8 +505,25 @@ async def start_scheduler_loop(
     """Main scheduler loop — checks for due tasks every interval.
 
     If *shutdown* is provided, the loop exits when the event is set.
+
+    A thin wrapper so the published shutdown event is released on EVERY exit,
+    including a crash on the way in. A stuck-set event makes every later task
+    failure read as "we killed it" — the same misclassification as before, only
+    inverted and quieter.
     """
-    global _deep_work_task
+    try:
+        await _scheduler_loop(bot, sem, shutdown=shutdown)
+    finally:
+        _release_shutdown()
+
+
+async def _scheduler_loop(
+    bot: Bot, sem: asyncio.Semaphore, *, shutdown: asyncio.Event | None = None
+) -> None:
+    global _deep_work_task, _shutdown
+    # Publish it before the first tick: a task that starts must be able to find
+    # out, in its own failure handler, whether the process is going down.
+    _shutdown = shutdown
     log.info("Scheduler started", interval=settings.scheduler_interval)
     now_mono = time.monotonic()
     now_wall = datetime.now(UTC)
@@ -759,7 +860,11 @@ async def start_scheduler_loop(
     bus.off("procedure_updated", _on_procedure_updated)
 
     # Drain in-flight tasks before exiting (snapshot to avoid mutation during gather)
+    # This is where the interruptions happen, so `_shutdown` must still be
+    # readable HERE — it is released only after the last task has been awaited.
     pending = list(_running_tasks.values())
     if pending:
         log.info("Draining running tasks", count=len(pending))
         await asyncio.gather(*pending, return_exceptions=True)
+
+    # `start_scheduler_loop`'s finally releases the shutdown event from here.

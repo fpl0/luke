@@ -177,6 +177,25 @@ inflight_busy() {
     read -r _ f_pid users autos _ < "$LUKE_DIR/inflight" 2>/dev/null || return 1
     [[ "$f_pid" == "$hb_pid" ]] || return 1
     [[ "$users" =~ ^[0-9]+$ ]] && [[ "$autos" =~ ^[0-9]+$ ]] || return 1
+    # LUKE_DEPLOY_DETACHED is set by exactly one thing: the re-exec below, which
+    # only happens when `inside_luke_tree` was true. So it is proof that one of
+    # the runs counted here is OUR OWN CALLER — and if that caller is waiting on
+    # this deploy (polling restart_status.txt for HEALTH_OK, which is the normal
+    # shape), the two block on each other until DRAIN_TIMEOUT and the restart
+    # kills the caller regardless.
+    #
+    # 2026-09-06: the midnight self-reflection cron deployed its own fix and
+    # this loop sat through all 900s of it, printing "still busy (1 autonomous
+    # run(s))" fifteen times at the run it was itself the child of, then killed
+    # it. That run was logged as the task's sixth failure and woke Filipe's
+    # phone at 01:26 with an alarm about a cron that has never once failed on
+    # its own. The old code printed a warning about this deadlock AFTER sitting
+    # through it — a note where a subtraction belonged.
+    if [[ -n "${LUKE_DEPLOY_DETACHED:-}" ]]; then
+        if   (( autos > 0 )); then autos=$(( autos - 1 ))
+        elif (( users > 0 )); then users=$(( users - 1 ))
+        fi
+    fi
     (( users > 0 )) && { DRAIN_REASON="$users user turn(s)"; return 0; }
     if (( DRAIN_AUTONOMOUS )) && (( autos > 0 )); then
         DRAIN_REASON="$autos autonomous run(s)"; return 0
@@ -246,11 +265,11 @@ wait_for_idle() {
     fi
     warn "Still busy after ${DRAIN_TIMEOUT}s (${DRAIN_REASON}) — restarting anyway."
     warn "An in-flight turn will be lost. This is the old behaviour, now at least visible."
-    if [[ -n "${LUKE_DEPLOY_DETACHED:-}" ]] && [[ "$DRAIN_REASON" == *autonomous* ]]; then
-        warn "NOTE: this deploy was launched from inside an autonomous run, so one of"
-        warn "the runs it just waited out is very likely its own caller. If that caller"
-        warn "is blocking on this deploy's exit, the two deadlock until DRAIN_TIMEOUT."
-        warn "Launch deploy.sh and return — do not poll for 'Deploy complete'."
+    if [[ -n "${LUKE_DEPLOY_DETACHED:-}" ]]; then
+        warn "NOTE: this deploy came from inside the Luke tree and its caller's run was"
+        warn "already discounted in the drain — so this is a SECOND run still busy, not"
+        warn "the caller. Reaching this line at all means something else is genuinely"
+        warn "stuck for ${DRAIN_TIMEOUT}s; check luke.log before trusting the restart."
     fi
 }
 

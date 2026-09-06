@@ -7,6 +7,8 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
 from luke import scheduler
 from luke.db import TaskRecord
 from luke.scheduler import _is_due, _run_task, start_scheduler_loop
@@ -529,6 +531,150 @@ class TestRunTask:
         assert await run_with_failure_count(23) == 0
         assert await run_with_failure_count(24) == 1
         assert await run_with_failure_count(48) == 1
+
+
+class TestShutdownIsNotAFailure:
+    """A run we killed is not a run that failed.
+
+    All six recorded failures of `f580ac19` (the midnight self-reflection cron)
+    — 11, 13, 14, 15 Aug, 3 Sep and 6 Sep 2026 — carry the identical log
+    signature: `stopping` → `Draining running tasks` → `agent_result_error`.
+    A deploy, usually one the run itself had just launched, SIGTERMed the
+    process out from under it. Six tear-downs, zero faults, written into
+    task_logs as `error`, counted into consecutive_failures, and finally fired
+    as an intermittent-failure alarm onto Filipe's phone at 01:26 on a Sunday.
+
+    The alarm was right about its inputs and the inputs were lying.
+    """
+
+    @staticmethod
+    def _shutting_down(flag: bool):  # type: ignore[no-untyped-def]
+        return patch("luke.scheduler.shutting_down", return_value=flag)
+
+    async def _run(self, task: TaskRecord, *, down: bool) -> MagicMock:
+        mock_bot = AsyncMock()
+        with (
+            patch("luke.scheduler.run_agent", side_effect=RuntimeError("killed mid-run")),
+            patch("luke.scheduler.db") as mock_db,
+            self._shutting_down(down),
+        ):
+            mock_db.increment_task_failures.return_value = 3
+            mock_db.get_behavior_last_run.return_value = None
+            await _run_task(task, mock_bot)
+        mock_db.bot = mock_bot  # carry it out for send assertions
+        return mock_db
+
+    async def test_the_run_is_logged_interrupted_not_error(self) -> None:
+        mock_db = await self._run(_task(schedule_type="cron"), down=True)
+        logged = mock_db.log_task_run.call_args[0][3]
+        assert logged.startswith("interrupted:")
+        # The rate readers score on the "error" prefix — db.recent_task_failure_rate
+        # and workspace/tools/task_failure_rate_check.py. Both must skip this row.
+        assert not logged.startswith("error")
+        assert "killed mid-run" in logged, "still diagnosable, just not blamed"
+
+    async def test_it_does_not_count_toward_the_failure_streak(self) -> None:
+        mock_db = await self._run(_task(schedule_type="cron"), down=True)
+        mock_db.increment_task_failures.assert_not_called()
+
+    async def test_it_raises_no_alarm(self) -> None:
+        """The 01:26 message. Nothing about our own tear-down reaches his phone."""
+        mock_db = await self._run(_task(schedule_type="cron"), down=True)
+        mock_db.bot.send_message.assert_not_awaited()
+
+    async def test_a_real_failure_is_still_a_failure(self) -> None:
+        """The guard must not swallow the fault it was built to distinguish."""
+        mock_db = await self._run(_task(schedule_type="cron"), down=False)
+        assert mock_db.log_task_run.call_args[0][3].startswith("error:")
+        mock_db.increment_task_failures.assert_called_once()
+        mock_db.bot.send_message.assert_awaited_once()
+
+    async def test_an_interrupted_once_task_keeps_its_slot(self) -> None:
+        """`_is_due` disarms a once-task the moment last_run is set. Writing it
+        for a run we cut off is how a one-off send — a citizenship checkpoint,
+        a delegated job's only report — dies without a trace."""
+        task = _task(schedule_type="once", schedule_value=datetime.now(UTC).isoformat())
+        mock_db = await self._run(task, down=True)
+        mock_db.update_task_last_run.assert_not_called()
+        mock_db.update_task_status.assert_not_called()
+        assert mock_db.set_behavior_last_run.call_args[0][0] == "task_rearm:test-id"
+
+    async def test_the_re_arm_is_capped_at_one_an_hour(self) -> None:
+        """The other shape here is a crash loop: restart, fire, die, restart."""
+        task = _task(schedule_type="once", schedule_value=datetime.now(UTC).isoformat())
+        mock_bot = AsyncMock()
+        with (
+            patch("luke.scheduler.run_agent", side_effect=RuntimeError("killed")),
+            patch("luke.scheduler.db") as mock_db,
+            self._shutting_down(True),
+        ):
+            mock_db.get_behavior_last_run.return_value = datetime.now(UTC).isoformat()
+            await _run_task(task, mock_bot)
+        mock_db.update_task_last_run.assert_called_once()
+
+    async def test_an_unreadable_re_arm_throttle_does_not_re_arm(self) -> None:
+        """Fails the opposite way to the alarm throttle, on purpose: a duplicate
+        send is a message he did not ask for, a missed one is a gap I can see."""
+        task = _task(schedule_type="once", schedule_value=datetime.now(UTC).isoformat())
+        mock_bot = AsyncMock()
+        with (
+            patch("luke.scheduler.run_agent", side_effect=RuntimeError("killed")),
+            patch("luke.scheduler.db") as mock_db,
+            self._shutting_down(True),
+        ):
+            mock_db.get_behavior_last_run.return_value = "not-a-timestamp"
+            await _run_task(task, mock_bot)
+        mock_db.update_task_last_run.assert_called_once()
+
+    async def test_an_interrupted_cron_just_waits_for_its_next_slot(self) -> None:
+        """Re-arming is a once-task affair. A cron's next slot arrives anyway,
+        and CRON_CATCHUP_GRACE already decides whether it catches up."""
+        mock_db = await self._run(_task(schedule_type="cron"), down=True)
+        mock_db.update_task_last_run.assert_called_once()
+
+    async def test_the_event_is_released_when_the_loop_returns(self) -> None:
+        """Caught by this suite on first run: the loop published a shutdown
+        event that was already set and never took it back, so every subsequent
+        task failure in the same interpreter read as "we killed it" — the
+        misclassification this change exists to remove, pointed the other way.
+        """
+        shutdown = asyncio.Event()
+        shutdown.set()
+        with (
+            patch("luke.scheduler.db") as mock_db,
+            patch("luke.scheduler.memory"),
+        ):
+            mock_db.get_behavior_last_run.return_value = None
+            await asyncio.wait_for(
+                start_scheduler_loop(AsyncMock(), _SEM, shutdown=shutdown), timeout=5.0
+            )
+        assert scheduler.shutting_down() is False
+
+    async def test_the_event_is_released_even_when_the_loop_crashes(self) -> None:
+        """The `finally` case: a loop that dies on the way in must not leave the
+        flag set for whatever runs next."""
+        shutdown = asyncio.Event()
+        shutdown.set()
+        with (
+            patch("luke.scheduler.db") as mock_db,
+            patch("luke.scheduler.memory"),
+        ):
+            mock_db.get_behavior_last_run.side_effect = RuntimeError("db is gone")
+            with pytest.raises(RuntimeError):
+                await start_scheduler_loop(AsyncMock(), _SEM, shutdown=shutdown)
+        assert scheduler.shutting_down() is False
+
+    async def test_shutting_down_reads_the_loops_own_event(self) -> None:
+        """The flag has to be the real shutdown signal, not a second guess at it."""
+        assert scheduler.shutting_down() is False
+        event = asyncio.Event()
+        scheduler._shutdown = event
+        try:
+            assert scheduler.shutting_down() is False
+            event.set()
+            assert scheduler.shutting_down() is True
+        finally:
+            scheduler._shutdown = None
 
 
 # ---------------------------------------------------------------------------
