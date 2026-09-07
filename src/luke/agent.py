@@ -63,10 +63,10 @@ from .config import settings
 from .db_query_gate import REASON as DB_QUERY_GATE_REASON
 from .db_query_gate import blocks_tool_input as blocks_db_query
 from .memory import MEMORY_DIRS, read_frontmatter, read_memory_body, sanitize_memory_id
-from .rating_gate import CURRENT_RUN_SHIPPED as RUN_SHIPPED
 from .rating_gate import REASON as RATING_GATE_REASON
 from .rating_gate import TOOL_NAME as RATING_TOOL_NAME
 from .rating_gate import blocks as blocks_unlanded_rating
+from .rating_gate import publish_shipped as publish_run_shipped
 from .sdk_io import cli_stderr
 
 log: BoundLogger = structlog.get_logger()
@@ -2740,8 +2740,10 @@ async def run_agent(
         if tool_name == RATING_TOOL_NAME:
             # Publish it for the writer. The gate below only ever consumed this
             # to decide a block; the number it describes is worth keeping on
-            # the row itself. See rating_gate.CURRENT_RUN_SHIPPED.
-            RUN_SHIPPED.set(run_shipped)
+            # the row itself. Keyed by goal_id and read-and-cleared by the
+            # writer — a ContextVar cannot cross into the tool handler's task.
+            # See rating_gate.publish_shipped.
+            publish_run_shipped(str(input_data["tool_input"].get("goal_id") or ""), run_shipped)
         if blocks_unlanded_rating(
             tool_name,
             input_data["tool_input"],
@@ -3367,9 +3369,20 @@ async def run_agent(
     allowed = _allowed_tools_for_model(effective_model)
 
     # Fallback model must differ from main model (SDK requirement)
+    #
+    # P4 Build B, 2026-09-07. This nulling is why the fallback has to invert
+    # rather than just be left alone: `agent_fallback_model` is "sonnet", so
+    # the moment cheap_resume makes sonnet the EFFECTIVE model for ordinary
+    # conversational turns, those turns get NO fallback at all — and an
+    # overload that degrades gracefully today would fail outright, mid
+    # exchange, on exactly the turns the change is meant to make cheaper.
+    #
+    # So fall UP. Falling up is correct when the reason we are cheap is spend
+    # rather than capability: the fallback fires only when the cheap model is
+    # unavailable, and at that point opus is better than an error.
     fallback: str | None = settings.agent_fallback_model
     if fallback == effective_model:
-        fallback = None
+        fallback = settings.agent_model if settings.agent_model != effective_model else None
 
     options = ClaudeAgentOptions(
         cwd=str(root),

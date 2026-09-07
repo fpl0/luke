@@ -271,6 +271,77 @@ def _conversation_is_live(chat_id: str, batch: list[db.StoredMessage]) -> bool:
     return False
 
 
+def _cheap_resume_active() -> bool:
+    """The flag AND the brake, checked per turn.
+
+    Two controls on purpose: the setting is the decision and needs a restart,
+    the file is the brake and does not. Either one off means off.
+    """
+    if not settings.cheap_resume_enabled:
+        return False
+    try:
+        return not settings.cheap_resume_off_file.exists()
+    except OSError:
+        # An unreadable brake is a brake. Never fail open into paid behaviour.
+        return False
+
+
+def _apply_ratchet(
+    routed_model: str,
+    prev_model: str | None,
+    *,
+    has_session: bool,
+    conversation_live: bool,
+    cheap_resume: bool,
+) -> tuple[str, bool]:
+    """Decide the model for this turn, and whether a held model decayed.
+
+    The ratchet was built to protect *continuity*, not to be a floor on
+    quality: non-opus models crashed on SDK session resume, so a downgrade
+    mid-exchange answered with no transcript at all
+    (``reflexion-cheap-route-silently-discarded-the-session-2026-08-07``).
+
+    That constraint is gone. The P4 resume canary is green on sonnet at SDK
+    0.2.128 across both arms (mcp, compacted), so continuity no longer costs
+    opus. What the one-way ratchet still does is survive the exchange that
+    justified it: measured 3-14 Aug over 268 turns, **49% of all spend went to
+    turns the classifier itself had already marked low or medium**, and in the
+    9-14 Aug window 29 of 34 cheap-classified turns ran on opus anyway.
+
+    So with ``cheap_resume`` on, the hold becomes a FLOOR::
+
+        continuity  ->  model = max(routed_model, sonnet)
+        otherwise   ->  model = routed_model
+
+    A held opus decays to sonnet, which is the saving. A turn routed haiku
+    rises to sonnet whenever there is a transcript in play, which is the
+    safety property: haiku is never handed a rich session (constraint 1 of the
+    build — opus->sonnet only, never opus->haiku).
+
+    With ``cheap_resume`` off this is byte-for-byte the shipping behaviour: a
+    one-way ratchet that never downgrades within a session.
+
+    Returns ``(model, decayed)``. ``decayed`` is True only when a previously
+    held model was dropped, so the caller can log it and clear the hold.
+    """
+    if not cheap_resume:
+        if prev_model and _MODEL_RANK.get(prev_model, 0) > _MODEL_RANK.get(routed_model, 0):
+            return prev_model, False
+        return routed_model, False
+
+    if not (has_session or conversation_live):
+        # Nothing to continue: no transcript on disk, no exchange in flight.
+        # Holding the previous model here buys nothing at all.
+        return routed_model, bool(
+            prev_model and _MODEL_RANK.get(prev_model, 0) > _MODEL_RANK.get(routed_model, 0)
+        )
+
+    floor = "sonnet"
+    model = routed_model if _MODEL_RANK.get(routed_model, 0) >= _MODEL_RANK[floor] else floor
+    decayed = bool(prev_model and _MODEL_RANK.get(prev_model, 0) > _MODEL_RANK.get(model, 0))
+    return model, decayed
+
+
 async def process(chat_id: str) -> None:
     """Process all pending messages for a chat."""
     lock = _active.setdefault(chat_id, asyncio.Lock())
@@ -330,14 +401,36 @@ async def process(chat_id: str) -> None:
         # conversation-state alone always cleared the old size threshold.
         if routed_model == "haiku" and context.needs_recall(combined_text):
             routed_model = "sonnet"
-        # One-way ratchet: never downgrade within a session
-        prev_model = _session_models.get(chat_id)
-        if prev_model and _MODEL_RANK.get(prev_model, 0) > _MODEL_RANK.get(routed_model, 0):
-            model = prev_model
-        else:
-            model = routed_model
-
+        # The ratchet. A one-way hold on opus today; a sonnet FLOOR once
+        # cheap_resume is on. Both inputs are needed before the decision, and
+        # `_conversation_is_live` reads the DB, so compute each exactly once.
         session_id = db.get_session(chat_id)
+        cheap_resume = _cheap_resume_active()
+        conversation_live = _conversation_is_live(chat_id, messages)
+        prev_model = _session_models.get(chat_id)
+        model, ratchet_decayed = _apply_ratchet(
+            routed_model,
+            prev_model,
+            has_session=bool(session_id),
+            conversation_live=conversation_live,
+            cheap_resume=cheap_resume,
+        )
+        if ratchet_decayed:
+            # Self-contained by design. `agent_run` logs resume without the
+            # model and `agent_start` logs the model without resume, and the
+            # whole reason P4 cost $19/day for a week is that the guard erased
+            # its own evidence. One line that can be read alone.
+            log.info(
+                "ratchet_decayed",
+                chat_id=chat_id,
+                session_id=session_id,
+                prior_model=prev_model,
+                new_model=model,
+                resume=bool(session_id),
+                effort=effort,
+                conversation_live=conversation_live,
+            )
+            _session_models.pop(chat_id, None)
         # Non-opus models crash on session resume (SDK bug), so a cheap route
         # used to silently discard the session and answer with NO transcript —
         # 115 of 132 runs on 2026-08-07. That is how "Strong headache!" got
@@ -357,7 +450,7 @@ async def process(chat_id: str) -> None:
         # log recorded neither branch: zero upgrades, zero cold starts, which
         # read as healthy. A turn answered without its own transcript must say
         # so whatever the reason, or the metric is a lie.
-        if not session_id and _conversation_is_live(chat_id, messages):
+        if not session_id and conversation_live:
             log.warning(
                 "live_turn_without_session",
                 chat_id=chat_id,
@@ -366,7 +459,21 @@ async def process(chat_id: str) -> None:
                 "continuity rests on the conversation-state block alone",
             )
         elif model != "opus" and session_id:
-            if _conversation_is_live(chat_id, messages):
+            if cheap_resume:
+                # Sites 2 and 3 of P4 Build B. Both branches below exist only
+                # because a non-opus model could not resume; the canary is
+                # green on sonnet at SDK 0.2.128 across both arms, so neither
+                # the upgrade nor the discard buys anything. The floor in
+                # `_apply_ratchet` guarantees model >= sonnet whenever a
+                # session exists, so this is never haiku holding a transcript.
+                log.info(
+                    "session_resumed_cheap",
+                    chat_id=chat_id,
+                    model=model,
+                    conversation_live=conversation_live,
+                    detail="resuming on a non-opus model; canary-verified",
+                )
+            elif conversation_live:
                 log.info(
                     "session_continuity_upgrade",
                     chat_id=chat_id,

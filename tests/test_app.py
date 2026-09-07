@@ -1697,3 +1697,123 @@ class TestSessionContinuity:
         saver = MagicMock()
         await self._run("900104", live=True, saver=saver)
         assert saver.called, "a low-effort turn left the conversation-state block stale"
+
+
+# ---------------------------------------------------------------------------
+# P4 Build B — the ratchet becomes a floor
+# ---------------------------------------------------------------------------
+
+
+def _ratchet(routed, prev, *, session=False, live=False, cheap=True):
+    return app_mod._apply_ratchet(
+        routed, prev, has_session=session, conversation_live=live, cheap_resume=cheap
+    )
+
+
+class TestApplyRatchetFlagOff:
+    """With the flag off this must be the shipping one-way ratchet, exactly.
+
+    Build B deploys dormant, so the OFF path is the one that actually runs
+    until a separate dated decision flips it. These are the behaviour-
+    preservation tests, and they are the reason the flag is safe to ship.
+    """
+
+    def test_holds_the_higher_model_within_a_session(self) -> None:
+        assert _ratchet("sonnet", "opus", session=True, cheap=False) == ("opus", False)
+
+    def test_holds_even_with_nothing_to_continue(self) -> None:
+        """The old ratchet is blind to continuity — that is the whole defect."""
+        assert _ratchet("sonnet", "opus", cheap=False) == ("opus", False)
+
+    def test_never_downgrades_a_route_that_is_already_higher(self) -> None:
+        assert _ratchet("opus", "sonnet", session=True, live=True, cheap=False) == ("opus", False)
+
+    def test_no_previous_model_uses_the_route(self) -> None:
+        assert _ratchet("haiku", None, cheap=False) == ("haiku", False)
+
+    def test_off_never_reports_a_decay(self) -> None:
+        """`decayed` drives a log line and a state clear; both must stay quiet."""
+        for routed, prev, sess, live in [
+            ("haiku", "opus", False, False),
+            ("sonnet", "opus", True, False),
+            ("haiku", "sonnet", False, True),
+        ]:
+            assert _ratchet(routed, prev, session=sess, live=live, cheap=False)[1] is False
+
+
+class TestApplyRatchetFlagOn:
+    """The floor: continuity -> max(routed, sonnet); otherwise the route wins.
+
+    Three tests here are deliberate INVERSIONS of the ead71df branch, which
+    held opus whenever there was a session or a live exchange. That predicate
+    protected the 3 turns that were never the point — `session_continuity_
+    upgrade` fired 4 times in 12 days — while 49% of spend went to turns the
+    classifier had already marked low or medium. The canary is green on sonnet
+    at SDK 0.2.128, so continuity no longer costs opus.
+    """
+
+    def test_held_opus_decays_to_sonnet_while_a_session_exists(self) -> None:
+        """INVERTED from the branch, which returned ("opus", False)."""
+        assert _ratchet("sonnet", "opus", session=True) == ("sonnet", True)
+
+    def test_held_opus_decays_to_sonnet_inside_a_live_exchange(self) -> None:
+        """INVERTED. Continuity is preserved by sonnet now, not by opus."""
+        assert _ratchet("sonnet", "opus", live=True) == ("sonnet", True)
+
+    def test_decays_to_the_route_when_there_is_nothing_to_continue(self) -> None:
+        """INVERTED in destination: no floor applies with no transcript in play."""
+        assert _ratchet("haiku", "opus") == ("haiku", True)
+
+    def test_haiku_rises_to_the_floor_when_a_session_exists(self) -> None:
+        """Constraint 1: haiku is never handed a rich transcript."""
+        assert _ratchet("haiku", None, session=True) == ("sonnet", False)
+
+    def test_haiku_rises_to_the_floor_inside_a_live_exchange(self) -> None:
+        assert _ratchet("haiku", None, live=True) == ("sonnet", False)
+
+    def test_haiku_route_is_left_alone_with_no_continuity(self) -> None:
+        """The floor is about protecting a transcript, not a quality minimum."""
+        assert _ratchet("haiku", None) == ("haiku", False)
+
+    def test_opus_route_is_never_pulled_down_to_the_floor(self) -> None:
+        """max(), not a clamp — a high-effort turn still routes high on merit."""
+        assert _ratchet("opus", None, session=True, live=True) == ("opus", False)
+
+    def test_equal_rank_is_not_a_decay(self) -> None:
+        assert _ratchet("sonnet", "sonnet", session=True) == ("sonnet", False)
+
+    def test_unknown_model_name_ranks_lowest_and_rises_to_the_floor(self) -> None:
+        """Defensive: a renamed tier must not pin a session to an unknown model."""
+        assert _ratchet("gpt-whatever", None, session=True) == ("sonnet", False)
+
+    def test_decay_reports_itself_so_the_saving_is_countable(self) -> None:
+        """`ratchet_decayed` is the only self-contained record of the change."""
+        assert _ratchet("haiku", "opus", session=True) == ("sonnet", True)
+
+
+class TestCheapResumeBrake:
+    """Flag AND brake. Either one off means off, and the brake needs no deploy."""
+
+    def test_off_by_default(self) -> None:
+        assert settings.cheap_resume_enabled is False, "Build B must deploy dormant"
+        assert app_mod._cheap_resume_active() is False
+
+    def test_brake_file_overrides_an_enabled_flag(self, tmp_path: Path) -> None:
+        brake = tmp_path / "cheap_resume.off"
+        brake.write_text("")
+        with patch.object(type(settings), "cheap_resume_off_file", property(lambda s: brake)):
+            with patch.object(settings, "cheap_resume_enabled", True):
+                assert app_mod._cheap_resume_active() is False
+            brake.unlink()
+            with patch.object(settings, "cheap_resume_enabled", True):
+                assert app_mod._cheap_resume_active() is True
+
+    def test_an_unreadable_brake_is_a_brake(self) -> None:
+        """Never fail open into paid behaviour."""
+        boom = MagicMock()
+        boom.exists.side_effect = OSError("nope")
+        with (
+            patch.object(type(settings), "cheap_resume_off_file", property(lambda s: boom)),
+            patch.object(settings, "cheap_resume_enabled", True),
+        ):
+            assert app_mod._cheap_resume_active() is False

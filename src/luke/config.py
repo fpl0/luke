@@ -96,6 +96,19 @@ class Settings(BaseSettings):
     behavior_max_turns: int = 100  # behaviors are focused single-purpose tasks
     agent_model: str = "opus"
     agent_fallback_model: str = "sonnet"
+    # P4 Build B, 2026-09-07, marker RATCHET-DESIGN-20260815. Ships OFF.
+    #
+    # When on, the in-session model ratchet stops being a one-way hold on opus
+    # and becomes a FLOOR: inside a live exchange, or with a session on disk,
+    # model = max(routed_model, sonnet). A held opus decays to sonnet; a turn
+    # the classifier routed haiku rises to sonnet, so haiku is never handed a
+    # rich transcript. Measured 3-14 Aug: 49% of spend went to turns the
+    # classifier had already marked low or medium.
+    #
+    # Flipping this is a separate dated decision, gated on the P4 resume canary
+    # being green at the current SDK and 48h of live traffic to measure. The
+    # setting needs a restart; the BRAKE does not — see `cheap_resume_off_file`.
+    cheap_resume_enabled: bool = False
     max_sends_per_run: int = 20  # rate-limit outbound Telegram messages per agent run
     max_sends_per_hour: int = 8  # global hourly cap on autonomous outbound messages
     attention_urgent_reserve: int = 2  # extra hourly slots reserved for urgent behaviors only
@@ -200,6 +213,17 @@ class Settings(BaseSettings):
         if abs(total - 1.0) > 1e-6:
             raise ValueError(f"scoring weights must sum to 1.0, got {total}")
         return self
+
+    @property
+    def cheap_resume_off_file(self) -> Path:
+        """The brake. Its PRESENCE disables cheap resume, checked per turn.
+
+        Deliberately not a cached_property and deliberately not a setting: a
+        setting needs a restart to change, and a restart mid-conversation is
+        the exact failure P2 exists to prevent. Creating this file stops the
+        behaviour on the next turn with no deploy. The P4 canary touches it too.
+        """
+        return self.luke_dir / "cheap_resume.off"
 
     @cached_property
     def workspace_dir(self) -> Path:
