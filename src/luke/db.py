@@ -16,7 +16,7 @@ from pydantic import BaseModel
 from structlog.stdlib import BoundLogger
 
 from .config import settings
-from .rating_gate import CURRENT_RUN_SHIPPED
+from .rating_gate import consume_shipped as _consume_shipped
 
 log: BoundLogger = structlog.get_logger()
 
@@ -1645,13 +1645,13 @@ def log_deep_work_quality(goal_id: str, rating: int) -> None:
     """Record a deep work session quality rating (1-5) for a goal.
 
     `shipped` is not a parameter: the honest value is a property of the RUN,
-    not of anything the rater can assert, so it is read from the contextvar the
+    not of anything the rater can assert, so it is read from the map the
     pre-tool hook publishes. None when no hook ran (direct call, test, a path
     that bypasses the agent) — unknown, which is not the same as False.
     """
     if not 1 <= rating <= 5:
         return
-    shipped = CURRENT_RUN_SHIPPED.get()
+    shipped = _consume_shipped(goal_id)
     conn = _db()
     conn.execute(
         "INSERT INTO deep_work_quality (goal_id, rating, shipped) VALUES (?, ?, ?)",

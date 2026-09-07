@@ -39,23 +39,63 @@ on all nine and trained a reflex click-through. Gating at >=4 fires on three.
 
 from __future__ import annotations
 
-from contextvars import ContextVar
 from typing import Final
 
 TOOL_NAME: Final = "mcp__luke__log_deep_work_quality"
 
 # The run's shipped fact, published so the WRITER can persist it.
 #
-# 2026-09-06. Until tonight this module was handed `shipped` on every rating
+# 2026-09-06. Until then this module was handed `shipped` on every rating
 # and dropped it the moment it decided not to block. `deep_work_calibration.py`
 # then reconstructed reach from the messages table by DATE and printed the
 # caveat in its own output — "nothing links a send to the session that produced
 # it". The fact was computed at the point of truth and guessed at one layer
-# down. A ContextVar rather than a module global because runs are concurrent
-# (two Luke sessions on one trigger is a documented event, 2026-09-03).
+# down.
+#
+# 2026-09-07, marker SHIPPED-NEVER-CROSSED-THE-TASK-BOUNDARY. The 6 Sep fix used
+# a ContextVar, reasoning that a module global would race because two Luke
+# sessions on one trigger is a documented event (2026-09-03). The concurrency
+# concern was real and the remedy defeated the whole mechanism: the PreToolUse
+# hook and the MCP tool handler run in DIFFERENT asyncio tasks, and a Task
+# copies its context at creation, so a value set in the hook is structurally
+# invisible to the writer. Every one of the 514 rows was NULL — including rows
+# written after the code went live — and nothing caught it, because
+# `deep_work_calibration.py` reports an unpopulated column as "predates the
+# column", which is indistinguishable from "the writer is broken".
+#
+# So: a module-level map, which DOES cross task boundaries, keyed by goal_id to
+# keep the isolation the ContextVar was chosen for. Two concurrent sessions
+# rating DIFFERENT goals are now cleanly separated; the residual race is two
+# sessions rating the SAME goal in the same instant, which swaps one boolean.
+# That is strictly better than a mechanism that loses the value every time.
 #
 # None means "no gate hook ran for this call" — honest unknown, never False.
-CURRENT_RUN_SHIPPED: ContextVar[bool | None] = ContextVar("current_run_shipped", default=None)
+_PENDING_SHIPPED: dict[str, bool] = {}
+
+# The hook fires on every rating attempt; the write only follows the ones that
+# are not blocked. Blocked attempts would otherwise leak an entry each, so the
+# map is bounded and evicts oldest-first (dicts preserve insertion order).
+_PENDING_MAX: Final = 64
+
+
+def publish_shipped(goal_id: str, shipped: bool) -> None:
+    """Record the run's shipped fact for the write that is about to happen."""
+    if not goal_id:
+        return
+    _PENDING_SHIPPED.pop(goal_id, None)  # re-insert so eviction order is fresh
+    _PENDING_SHIPPED[goal_id] = shipped
+    while len(_PENDING_SHIPPED) > _PENDING_MAX:
+        _PENDING_SHIPPED.pop(next(iter(_PENDING_SHIPPED)))
+
+
+def consume_shipped(goal_id: str) -> bool | None:
+    """Take the published fact for this goal, or None if no hook published one.
+
+    Read-and-clear: a stale entry must never attach itself to a later rating
+    that ran without a hook.
+    """
+    return _PENDING_SHIPPED.pop(goal_id, None)
+
 
 # Below this, the gate stays out of the way. 3 is the honest rating for a
 # session that did real work nobody has seen yet; 4 is a claim about landing.
