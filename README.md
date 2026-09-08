@@ -1,5 +1,7 @@
 # Luke
 
+> **Archived:** Luke has been superseded by [Theo](https://github.com/fpl0/theo), the new version of this project. Please use Theo for continued development and updates.
+
 A personal AI agent that lives on your Mac, talks to you on Telegram, and remembers everything.
 
 One person, one agent. Luke runs as a single Python process: he keeps memory across conversations,
