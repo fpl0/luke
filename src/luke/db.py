@@ -1136,6 +1136,20 @@ def update_task_last_run(task_id: str, ts: str) -> None:
     _commit(db)
 
 
+def clear_task_last_run(task_id: str) -> None:
+    """Put a once-task back in the due population.
+
+    `_is_due` treats a set `last_run` as "already fired" for a once-task, and
+    the scheduler writes it at LAUNCH, before the run has done anything. So a
+    run we tear down mid-flight cannot be re-armed by merely declining to write
+    last_run in the failure path — the value is already there. Only clearing it
+    actually re-arms.
+    """
+    db = _db()
+    db.execute("UPDATE tasks SET last_run = NULL WHERE id = ?", (task_id,))
+    _commit(db)
+
+
 def update_task_status(task_id: str, status: str) -> None:
     db = _db()
     db.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, task_id))

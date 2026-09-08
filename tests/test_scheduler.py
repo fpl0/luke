@@ -592,12 +592,55 @@ class TestShutdownIsNotAFailure:
     async def test_an_interrupted_once_task_keeps_its_slot(self) -> None:
         """`_is_due` disarms a once-task the moment last_run is set. Writing it
         for a run we cut off is how a one-off send — a citizenship checkpoint,
-        a delegated job's only report — dies without a trace."""
+        a delegated job's only report — dies without a trace.
+
+        Re-arming is an active CLEAR, not a declined write: the scheduler sets
+        last_run at launch, so by the failure path the task is already disarmed.
+        """
         task = _task(schedule_type="once", schedule_value=datetime.now(UTC).isoformat())
         mock_db = await self._run(task, down=True)
         mock_db.update_task_last_run.assert_not_called()
+        mock_db.clear_task_last_run.assert_called_once_with("test-id")
         mock_db.update_task_status.assert_not_called()
         assert mock_db.set_behavior_last_run.call_args[0][0] == "task_rearm:test-id"
+
+    async def test_the_re_arm_actually_puts_it_back_in_the_due_population(self) -> None:
+        """The 8 Sep 2026 bug, reconstructed end to end across BOTH code paths.
+
+        Task 8db8a4a3 launched 09:35, ran deploy.sh, and the deploy restarted
+        the daemon that was running it. The failure path logged
+        `once_task_rearmed_after_interruption` and the task never ran again —
+        because re-arming was implemented as "don't write last_run", while the
+        scheduler's tick loop had already written it at LAUNCH.
+
+        The old test could not see this: it drove `_run_task` alone, with a
+        fixture whose last_run was None. The launch write lives in the tick
+        loop, so the state the failure path actually inherits was never
+        modelled. Assert against `_is_due` — the thing that decides — not
+        against which setter was called.
+        """
+        fired_at = datetime.now(UTC)
+        task = _task(
+            schedule_type="once",
+            schedule_value=(fired_at - timedelta(minutes=1)).isoformat(),
+        )
+        # What the tick loop does at launch, verbatim (scheduler.py, `_is_due`
+        # branch): last_run is stamped BEFORE the agent is handed the prompt.
+        launched: TaskRecord = {**task, "last_run": fired_at.isoformat()}  # type: ignore[typeddict-item]
+        assert not _is_due(launched, fired_at + timedelta(minutes=1)), (
+            "precondition: a launched once-task is disarmed — this is the state "
+            "the interruption handler inherits, and the bug was not knowing it"
+        )
+
+        mock_db = await self._run(task, down=True)
+        mock_db.clear_task_last_run.assert_called_once_with("test-id")
+
+        # Apply the re-arm the handler just performed, then ask the scheduler.
+        rearmed: TaskRecord = {**launched, "last_run": None}  # type: ignore[typeddict-item]
+        assert _is_due(rearmed, fired_at + timedelta(minutes=1)), (
+            "a re-armed once-task must come back on the next tick; if this "
+            "fails the re-arm is a log line and nothing more"
+        )
 
     async def test_the_re_arm_is_capped_at_one_an_hour(self) -> None:
         """The other shape here is a crash loop: restart, fire, die, restart."""

@@ -444,8 +444,15 @@ async def _run_task(task: TaskRecord, bot: Bot) -> None:
         # `_is_due` disarms a once-task the moment last_run is set, so writing
         # it here for a run WE cut off is how a one-off send dies silently: the
         # citizenship checkpoint, a fasting-prep note, a delegated job's only
-        # report. Leaving last_run unset re-arms it for the next tick after the
-        # restart, which is the behaviour a deploy should have had all along.
+        # report. Re-arming means CLEARING last_run, not declining to write it:
+        # the scheduler sets last_run at LAUNCH (see the tick loop below), so by
+        # the time we get here the task is already disarmed and skipping the
+        # write changes nothing. That was the bug — 8 Sep 2026, marker
+        # REARM-WROTE-A-RECEIPT-FOR-NOTHING-20260908. This branch logged
+        # `once_task_rearmed_after_interruption` while the task stayed dead, so
+        # every once-task killed by a deploy died with a recovery line in the
+        # log saying it hadn't. Found by reading the log for a restart Filipe
+        # asked about and noticing 8db8a4a3 never re-ran.
         #
         # Capped to one re-arm an hour per task, because the other shape here is
         # a crash loop: restart, fire, die, restart. An hour is far longer than
@@ -457,6 +464,7 @@ async def _run_task(task: TaskRecord, bot: Bot) -> None:
             and task["schedule_type"] == "once"
             and _rearm_is_due(task_id, interrupted_at)
         ):
+            db.clear_task_last_run(task_id)
             db.set_behavior_last_run(f"task_rearm:{task_id}", interrupted_at)
             log.warning("once_task_rearmed_after_interruption", task_id=task_id)
         else:
