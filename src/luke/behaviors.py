@@ -590,6 +590,36 @@ def _plan_last_updated(path: Path) -> datetime | None:
         return None
 
 
+_STEP_SUMMARY_CHARS = 180
+
+
+def _summarise_step(raw: str) -> str:
+    """Reduce a plan step to a pointer Filipe can read in one breath.
+
+    The alert assumed a step is a short outcome label, which is what the test
+    fixture writes ("ship the next artifact"). Real steps are not: they accrete
+    their whole audit trail inline — struck-through supersessions, markers,
+    commit SHAs, cross-references to addenda. On 2026-09-08 00:17 the first
+    unchecked step of perf-audit-2026-08-01 went out at 1,743 characters, the
+    day after Filipe said the daily message was HUGE and a draft was a dump.
+    Retracted text (``~~...~~``) is the bulk of it and is by definition no
+    longer true, so it can never be news. He is being pointed at a plan, not
+    handed it.
+    """
+    import html
+    import re
+
+    text = re.sub(r"~~.+?~~", "", raw, flags=re.DOTALL)  # retracted ≠ news
+    text = re.sub(r"<[^>]+>", "", text)  # the plan's own HTML, re-escaped below
+    text = re.sub(r"\*\*(.+?)\*\*", r"\1", text, flags=re.DOTALL)  # md leaks literally
+    text = re.sub(r"`([^`]*)`", r"\1", text)
+    text = " ".join(text.split())
+    if len(text) > _STEP_SUMMARY_CHARS:
+        cut = text[:_STEP_SUMMARY_CHARS].rsplit(" ", 1)[0].rstrip(" ,;—-")
+        text = f"{cut}…"
+    return html.escape(text) or "(the step is empty once its struck-out history is dropped)"
+
+
 def _plan_next_step(path: Path) -> str:
     """First unchecked checklist item, for actionable stall alerts."""
     import re
@@ -597,7 +627,7 @@ def _plan_next_step(path: Path) -> str:
     with suppress(OSError):
         m = re.search(r"^- \[ \] (.+)$", path.read_text(encoding="utf-8"), re.MULTILINE)
         if m:
-            return m.group(1).strip()
+            return _summarise_step(m.group(1))
     return "(no unchecked step found — the plan needs steps)"
 
 

@@ -1051,6 +1051,52 @@ class TestEnforcePlanMomentum:
         mock_send.assert_called_once()
         assert "goal-genuinely-idle" in mock_send.call_args.args[2]
 
+    async def test_alert_summarises_a_step_carrying_its_audit_trail(
+        self, test_db: Any, tmp_settings: Any
+    ) -> None:
+        """Regression for 2026-09-08 00:17, marker STEP-IS-NOT-A-LABEL-20260908.
+
+        perf-audit-2026-08-01's first unchecked step is 1.6k of accreted history.
+        It went to Filipe verbatim — struck-through supersessions, markers, SHAs
+        — the day after he said the daily message was HUGE. The alert points at
+        a plan; it does not hand him one.
+        """
+        from datetime import UTC, datetime, timedelta
+
+        from luke.behaviors import enforce_plan_momentum
+
+        plans = tmp_settings.workspace_dir / "plans"
+        plans.mkdir(parents=True, exist_ok=True)
+        updated = (datetime.now(UTC) - timedelta(hours=120)).isoformat()
+        step = (
+            "Stop the one-way ratchet spending opus on turns the classifier already "
+            "marked cheap (P4) — ~~build the safe slice Sat 15 Aug 10:00~~ "
+            "~~Saturday is an experiment, not a build~~ <b>DESIGNED 2026-08-15, marker "
+            "<code>RATCHET-DESIGN-20260815</code>, nothing merged.</b> The premise is "
+            "false but it is encoded at <b>two</b> sites, and decaying the ratchet alone "
+            "is a no-op — <code>session_continuity_upgrade</code> (app.py:368) puts every "
+            "live turn straight back on opus. **Build A DONE 2026-09-04, <code>fd14c94</code>, "
+            "GREEN on all four cells.** See the 05:2x and 4 Sep addenda"
+        )
+        (plans / "perf-audit.md").write_text(
+            f"# perf-audit\n\n**Status:** in_progress\n**Last updated:** {updated}\n"
+            f"**Steps completed:** 1/3\n\n## Steps\n- [x] done\n- [ ] {step}\n"
+        )
+        self._write_liveness(alive_hours_ago=[float(h) for h in range(121, 0, -1)])
+        with patch("luke.behaviors.send_long_message", new_callable=AsyncMock) as mock_send:
+            assert await enforce_plan_momentum(AsyncMock()) == 1
+        text = mock_send.call_args.args[2]
+
+        assert len(text) < 500, f"stall alert is {len(text)} chars: {text}"
+        assert "Stop the one-way ratchet" in text  # still says what the next step is
+        assert "perf-audit" in text  # and which plan to look in
+        # What made it unreadable, neither half of which is news:
+        assert "build the safe slice" not in text  # retracted text can never be news
+        assert "Build A DONE" not in text  # trailing audit trail, past the cap
+        assert "**" not in text  # markdown that renders literally in Telegram
+        # Markers and SHAs are NOT stripped by rule — a regex for them would fit
+        # this one step's shape. The length cap is the general defence.
+
     async def test_many_stalled_plans_send_one_message(
         self, test_db: Any, tmp_settings: Any
     ) -> None:
